@@ -374,7 +374,9 @@ def _geometry_points_to_json(points: list[Optional[tuple[float, float]]]) -> lis
 # --------------------------------------------------------------------------
 
 
-def build_elements(con, manifest: catalog.Manifest, target_set: str, out: Out) -> tuple[list[dict], dict]:
+def build_elements(
+    con, manifest: catalog.Manifest, target_set: str, out: Out, include_areas_count: bool = False
+) -> tuple[list[dict], dict]:
     """Returns (elements, extra_stats)."""
     if out.count:
         counts = fetch_counts(con, target_set)
@@ -385,10 +387,19 @@ def build_elements(con, manifest: catalog.Manifest, target_set: str, out: Out) -
                 "nodes": str(counts["nodes"]),
                 "ways": str(counts["ways"]),
                 "relations": str(counts["relations"]),
-                "areas": str(counts["areas"]),
                 "total": str(counts["total"]),
             },
         }
+        # Overpass prints `areas` only when the program involved areas (or
+        # the set holds some); the reference omits it otherwise.
+        if include_areas_count or counts["areas"]:
+            el["tags"] = {
+                "nodes": el["tags"]["nodes"],
+                "ways": el["tags"]["ways"],
+                "relations": el["tags"]["relations"],
+                "areas": str(counts["areas"]),
+                "total": el["tags"]["total"],
+            }
         return [el], {}
 
     rows = fetch_out_rows(con, target_set, out.order, out.limit)

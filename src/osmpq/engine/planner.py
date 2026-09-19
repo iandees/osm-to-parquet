@@ -74,6 +74,10 @@ class Context:
     elements: list = field(default_factory=list)
     files_read: int = 0
     warnings: list = field(default_factory=list)
+    # True when the program mentions areas anywhere (area queries, (area)/
+    # (pivot) filters, is_in, map_to_area): Overpass then adds an `areas`
+    # tag to every `out count` element, and omits it otherwise.
+    areas_used: bool = False
     _counter: "count" = field(default_factory=lambda: count(1))
 
     def fresh_name(self, prefix: str) -> str:
@@ -326,7 +330,9 @@ def execute_out(ctx: Context, o: Out) -> None:
     # implemented entirely in render.build_elements/_row_to_element; the
     # M0-era rejection here (this statement's only remaining line) is lifted
     # as part of that delivery, same as check_settings' csv rejection above.
-    elements, _extra = render.build_elements(ctx.con, ctx.manifest, o.input_set, o)
+    elements, _extra = render.build_elements(
+        ctx.con, ctx.manifest, o.input_set, o, include_areas_count=ctx.areas_used
+    )
     ctx.elements.extend(elements)
 
 
@@ -353,11 +359,30 @@ def execute_statement(ctx: Context, stmt: Statement) -> None:
         raise UnsupportedError(f"unrecognized statement {type(stmt).__name__}")
 
 
+def _program_uses_areas(statements) -> bool:
+    for stmt in statements:
+        if isinstance(stmt, (IsIn, MapToArea)):
+            return True
+        if isinstance(stmt, Query):
+            if "area" in stmt.types or any(isinstance(f, (AreaFilter, PivotFilter)) for f in stmt.filters):
+                return True
+        for attr in ("statements", "body", "then", "otherwise"):
+            inner = getattr(stmt, attr, None)
+            if inner and _program_uses_areas(inner):
+                return True
+        for attr in ("first", "second"):
+            inner = getattr(stmt, attr, None)
+            if inner is not None and _program_uses_areas([inner]):
+                return True
+    return False
+
+
 def run_program(con, manifest: catalog.Manifest, program) -> Context:
     _load_hooks()
     check_settings(program.settings)
     promoted_keys = set(manifest.promoted_keys)
-    ctx = Context(con=con, manifest=manifest, promoted_keys=promoted_keys, global_bbox=program.settings.bbox)
+    ctx = Context(con=con, manifest=manifest, promoted_keys=promoted_keys, global_bbox=program.settings.bbox,
+                  areas_used=_program_uses_areas(program.statements))
     setops.ensure_empty_set(con, "_")
     for stmt in program.statements:
         execute_statement(ctx, stmt)
