@@ -151,6 +151,8 @@ class Engine:
         # stale counts.
         file_stats = catalog.FileStats()
         stats_token = catalog.FILE_STATS.set(file_stats)
+        delta_stats = catalog.DeltaStats()
+        delta_stats_token = catalog.DELTA_STATS.set(delta_stats)
         try:
             self._setup_connection(con, settings)
 
@@ -206,6 +208,11 @@ class Engine:
                 "files_read": ctx.files_read,
                 "files_considered": files_considered,
                 "elements": len(ctx.elements),
+                # docs/m2-contracts.md section 4: 0/0 for a manifest with no
+                # delta tiers (or a query that touched none), always present
+                # so callers don't need to branch on manifest_version.
+                "delta_rows": delta_stats.delta_rows,
+                "shadowed": delta_stats.shadowed,
             }
             if ctx.warnings:
                 stats["warnings"] = ctx.warnings
@@ -226,6 +233,7 @@ class Engine:
         finally:
             con.close()
             catalog.FILE_STATS.reset(stats_token)
+            catalog.DELTA_STATS.reset(delta_stats_token)
 
     # -- internals --------------------------------------------------------
 

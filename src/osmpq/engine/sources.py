@@ -23,6 +23,260 @@ def _quote_list(paths: list[str]) -> str:
     return "[" + ",".join("'" + p.replace("'", "''") + "'" for p in paths) + "]"
 
 
+def _q1(s: str) -> str:
+    return s.replace("'", "''")
+
+
+def _quote_str_list(values: list[str]) -> str:
+    """A SQL `IN (...)` operand list of string literals, e.g. for `cell IN
+    (...)`/`type IN (...)`. Empty input -> `(NULL)`, which matches nothing
+    (a caller should generally avoid calling with an empty list in the
+    first place, but this keeps the emitted SQL well-formed either way)."""
+    if not values:
+        return "(NULL)"
+    return "(" + ",".join("'" + _q1(v) + "'" for v in values) + ")"
+
+
+# --------------------------------------------------------------------------
+# Manifest v3 delta read path (docs/m2-contracts.md section 4): tier
+# precedence hour > day > week > base, cell-scoped delta candidates, the
+# shadow set, base-minus-shadow union delta-candidates-minus-deleted. One
+# implementation (`current_rows`, plus `spatial_delta_layer` and
+# `byid_current_rows` below) that every spatial/cell-scoped/by-id read path
+# in this module and in recurse.py/render.py goes through, so "current rows
+# of a table in cells C" or "current rows of a table for a set of ids"
+# means the same SQL everywhere. When `manifest.delta_tiers()` is empty
+# (manifest v1/v2, or a v3 manifest with `deltas: {}`), every one of these
+# functions degrades to exactly the pre-M2 SQL with zero extra files read
+# and zero extra queries executed -- the "no extra scans" requirement.
+# --------------------------------------------------------------------------
+
+
+def spatial_delta_layer(con, manifest: catalog.Manifest, table: str, cells: list[str]) -> Optional[dict]:
+    """Materializes the delta candidates + shadow set for `table` restricted
+    to `cells` (contract section 4 steps 1-2) as two fresh TEMP TABLEs, or
+    None when there are no delta tiers or `cells` is empty (nothing to add
+    -- an element can only be a delta candidate for a cell scan if that
+    scan's own `cells_for_bbox` result includes the cell it now lives in,
+    same convention `cells_for_bbox` already uses for base presence).
+
+    Returns ``{"cand": <TEMP TABLE, raw delta-file schema (base schema +
+    deleted/prev_cell/seq), one ranked row per id, cell IN cells>,
+    "shadow": <TEMP TABLE(id)>, "files": <extra files read>}``.
+
+    Rank: `hour` > `day` > `week` (``manifest.delta_tiers()``'s order),
+    picked with ``QUALIFY row_number() OVER (PARTITION BY id ORDER BY
+    __rank DESC) = 1``. Shadow set: every candidate's id, plus every id in
+    each present tier's `tombstones.parquet` whose `prev_cell` is in
+    `cells` (regardless of that tombstone's own tier rank -- a stale
+    tombstone still correctly shadows base per the contract's "newest tier
+    wins" note, since the union only ever adds ids, never removes them).
+
+    Updates `catalog.DELTA_STATS.delta_rows` with the candidate count (the
+    caller is responsible for adding the "shadowed" count once it knows how
+    many *base* rows that shadow set actually removed, since that depends
+    on the caller's own predicate)."""
+    tiers = manifest.delta_tiers()
+    if not tiers or not cells:
+        return None
+    cell_list_sql = _quote_str_list(cells)
+    files = 0
+    cand_parts = []
+    tomb_parts = []
+    for tier in tiers:
+        sp = tier["files"].get(table, {}).get("spatial")
+        if sp:
+            files += 1
+            cand_parts.append(
+                f"SELECT *, {tier['rank']} AS __rank FROM read_parquet('{_q1(sp)}') "
+                f"WHERE cell IN {cell_list_sql}"
+            )
+        tp = tier.get("tombstones")
+        if tp:
+            files += 1
+            tomb_parts.append(
+                f"SELECT id FROM read_parquet('{_q1(tp)}') "
+                f"WHERE type = '{table}' AND prev_cell IN {cell_list_sql}"
+            )
+    if not cand_parts:
+        return None
+
+    cand_tbl = idset.fresh_table_name("dcand")
+    con.execute(
+        f"CREATE TEMP TABLE {cand_tbl} AS "
+        f"SELECT * EXCLUDE (__rank) FROM (\n{chr(10).join(('  ' + p) for p in _interleave_union(cand_parts))}\n) __raw "
+        f"QUALIFY row_number() OVER (PARTITION BY id ORDER BY __rank DESC) = 1"
+    )
+    shadow_tbl = idset.fresh_table_name("dshadow")
+    shadow_parts = [f"SELECT id FROM {cand_tbl}"] + tomb_parts
+    con.execute(
+        f"CREATE TEMP TABLE {shadow_tbl} AS "
+        f"SELECT DISTINCT id FROM (\n{chr(10).join(('  ' + p) for p in _interleave_union(shadow_parts))}\n) __s"
+    )
+
+    n_cand = con.execute(f"SELECT count(*) FROM {cand_tbl}").fetchone()[0]
+    stats = catalog.DELTA_STATS.get()
+    if stats is not None:
+        stats.delta_rows += n_cand
+    return {"cand": cand_tbl, "shadow": shadow_tbl, "files": files}
+
+
+def _interleave_union(parts: list[str]) -> list[str]:
+    if len(parts) <= 1:
+        return list(parts)
+    out = [parts[0]]
+    for p in parts[1:]:
+        out.append("UNION ALL BY NAME")
+        out.append(p)
+    return out
+
+
+def current_rows(
+    con,
+    manifest: catalog.Manifest,
+    table: str,
+    cells: list[str],
+    base_files: list[str],
+    cols: dict[str, str],
+    where_sql: str,
+) -> tuple[str, int]:
+    """The shared "current rows of `table` in `cells`" builder (contract
+    section 4): base rows of `base_files` minus the shadow set, unioned
+    with not-deleted delta candidate rows -- both filtered by the *same*
+    `where_sql` (safe because a delta spatial row has exactly `table`'s
+    base schema plus `deleted`/`prev_cell`/`seq`, contract section 3, so
+    any predicate over base's columns -- bbox, tags, ids -- means the same
+    thing against a delta row). `cols` is a `schema.project()`-style dict
+    of canonical-column -> source-expression, using bare (unprefixed)
+    column names shared by both the base Parquet files and the delta
+    candidate TEMP TABLE.
+
+    Returns ``(select_sql, extra_files_read)``. With no delta tiers (or
+    `cells` empty), this is exactly:
+
+        SELECT {project(cols)}
+        FROM read_parquet(base_files, hive_partitioning=true, union_by_name=true)
+        WHERE {where_sql}
+
+    -- byte-identical to the pre-M2 SQL, 0 extra files, 0 extra queries.
+    When `base_files` is empty but delta tiers exist, only the delta side
+    is emitted (a bbox/cell whose base file(s) got pruned to nothing can
+    still hold newly-created elements in the delta)."""
+    layer = spatial_delta_layer(con, manifest, table, cells)
+    if layer is None:
+        if not base_files:
+            return empty_set_sql(), 0
+        sql = (
+            f"SELECT {project(cols)}\n"
+            f"FROM read_parquet({_quote_list(base_files)}, hive_partitioning=true, union_by_name=true)\n"
+            f"WHERE {where_sql}"
+        )
+        return sql, 0
+
+    parts = []
+    if base_files:
+        base_from = f"read_parquet({_quote_list(base_files)}, hive_partitioning=true, union_by_name=true)"
+        parts.append(
+            f"SELECT {project(cols)}\nFROM {base_from}\n"
+            f"WHERE ({where_sql}) AND id NOT IN (SELECT id FROM {layer['shadow']})"
+        )
+        n_shadowed = con.execute(
+            f"SELECT count(*) FROM {base_from} "
+            f"WHERE ({where_sql}) AND id IN (SELECT id FROM {layer['shadow']})"
+        ).fetchone()[0]
+        stats = catalog.DELTA_STATS.get()
+        if stats is not None:
+            stats.shadowed += n_shadowed
+    parts.append(f"SELECT {project(cols)}\nFROM {layer['cand']}\nWHERE NOT deleted AND ({where_sql})")
+    return "\nUNION ALL\n".join(parts), layer["files"]
+
+
+def byid_current_rows(
+    con,
+    manifest: catalog.Manifest,
+    element_type: str,
+    base_files: list[str],
+    cols: dict[str, str],
+    id_pred_sql: str,
+    tag_where_sql: str,
+) -> tuple[str, int]:
+    """Same idea as `current_rows`, for a by-id lookup instead of a
+    cell-scoped scan (contract section 4's "by-id lookups... the same
+    precedence using the byid delta files"). No cell/tombstone consultation
+    is needed here: a by-id lookup already names the exact ids it wants, so
+    the shadow set is simply "ids for which any present tier has a byid
+    delta row" -- a tombstone for a deleted id shows up as a `deleted=true`
+    row in that tier's own byid file (byid rows are keyed only by id, never
+    by cell), not just in `tombstones.parquet` (which exists to let a
+    *cell-scoped* scan shadow an old cell without downloading every tier's
+    full byid file).
+
+    `id_pred_sql` is a predicate on the bare `id` column (e.g. from
+    `idset.id_predicate` or a `id IN (SELECT ...)` subquery) restricting
+    both which byid delta rows are read and which base rows are kept;
+    `tag_where_sql` is applied to both base and delta-candidate rows,
+    same as `current_rows`'s `where_sql`.
+
+    Returns ``(select_sql, extra_files_read)``; degrades to the pre-M2
+    byid SQL (0 extra files/queries) when there are no delta tiers."""
+    tiers = manifest.delta_tiers()
+    if not tiers:
+        if not base_files:
+            return empty_set_sql(), 0
+        sql = (
+            f"SELECT {project(cols)}\n"
+            f"FROM read_parquet({_quote_list(base_files)}, union_by_name=true)\n"
+            f"WHERE ({id_pred_sql}) AND ({tag_where_sql})"
+        )
+        return sql, 0
+
+    files = 0
+    cand_parts = []
+    for tier in tiers:
+        bp = tier["files"].get(element_type, {}).get("byid")
+        if not bp:
+            continue
+        files += 1
+        cand_parts.append(
+            f"SELECT *, {tier['rank']} AS __rank FROM read_parquet('{_q1(bp)}') WHERE {id_pred_sql}"
+        )
+    if not cand_parts:
+        if not base_files:
+            return empty_set_sql(), 0
+        sql = (
+            f"SELECT {project(cols)}\n"
+            f"FROM read_parquet({_quote_list(base_files)}, union_by_name=true)\n"
+            f"WHERE ({id_pred_sql}) AND ({tag_where_sql})"
+        )
+        return sql, files
+
+    cand_tbl = idset.fresh_table_name("dbyid")
+    con.execute(
+        f"CREATE TEMP TABLE {cand_tbl} AS "
+        f"SELECT * EXCLUDE (__rank) FROM (\n{chr(10).join(('  ' + p) for p in _interleave_union(cand_parts))}\n) __raw "
+        f"QUALIFY row_number() OVER (PARTITION BY id ORDER BY __rank DESC) = 1"
+    )
+    n_cand = con.execute(f"SELECT count(*) FROM {cand_tbl}").fetchone()[0]
+    stats = catalog.DELTA_STATS.get()
+    if stats is not None:
+        stats.delta_rows += n_cand
+
+    parts = []
+    if base_files:
+        base_from = f"read_parquet({_quote_list(base_files)}, union_by_name=true)"
+        parts.append(
+            f"SELECT {project(cols)}\nFROM {base_from}\n"
+            f"WHERE ({id_pred_sql}) AND ({tag_where_sql}) AND id NOT IN (SELECT id FROM {cand_tbl})"
+        )
+        n_shadowed = con.execute(
+            f"SELECT count(*) FROM {base_from} WHERE ({id_pred_sql}) AND id IN (SELECT id FROM {cand_tbl})"
+        ).fetchone()[0]
+        if stats is not None:
+            stats.shadowed += n_shadowed
+    parts.append(f"SELECT {project(cols)}\nFROM {cand_tbl}\nWHERE NOT deleted AND ({tag_where_sql})")
+    return "\nUNION ALL\n".join(parts), files
+
+
 def _node_files(manifest: catalog.Manifest, cells: list[str], partition: str) -> list[str]:
     tc = manifest.table_cells("node")
     out = []
@@ -68,7 +322,7 @@ def build_node_spatial_select(
         # carry the min/max of lon_e7/lat_e7, so the bbox tuple order here
         # is (xmin=lon_min, ymin=lat_min, xmax=lon_max, ymax=lat_max).
         files = catalog.prune_files_by_bbox(manifest, "node", files, (we, se, ee, ne))
-    if not files:
+    if not files and not manifest.delta_tiers():
         return empty_set_sql(), 0
 
     where = []
@@ -96,12 +350,8 @@ def build_node_spatial_select(
         "user": '"user"',
         "hilbert": "hilbert",
     }
-    sql = (
-        f"SELECT {project(cols)}\n"
-        f"FROM read_parquet({_quote_list(files)}, hive_partitioning=true, union_by_name=true)\n"
-        f"WHERE {where_sql}"
-    )
-    return sql, len(files)
+    sql, extra_files = current_rows(con, manifest, "node", cells, files, cols, where_sql)
+    return sql, len(files) + extra_files
 
 
 def build_way_spatial_select(
@@ -117,7 +367,7 @@ def build_way_spatial_select(
     if bbox is not None:
         se, we, ne, ee = to_e7(bbox[0]), to_e7(bbox[1]), to_e7(bbox[2]), to_e7(bbox[3])
         files = catalog.prune_files_by_bbox(manifest, "way", files, (we, se, ee, ne))
-    if not files:
+    if not files and not manifest.delta_tiers():
         return empty_set_sql(), 0
 
     where = []
@@ -160,12 +410,8 @@ def build_way_spatial_select(
         "geometry": "geometry",
         "hilbert": "hilbert",
     }
-    sql = (
-        f"SELECT {project(cols)}\n"
-        f"FROM read_parquet({_quote_list(files)}, hive_partitioning=true, union_by_name=true)\n"
-        f"WHERE {where_sql}"
-    )
-    return sql, len(files)
+    sql, extra_files = current_rows(con, manifest, "way", cells, files, cols, where_sql)
+    return sql, len(files) + extra_files
 
 
 def _relation_bbox_exact_filter(con, manifest: catalog.Manifest, cand_sql: str, bbox: BBox) -> tuple[str, int]:
@@ -261,7 +507,7 @@ def build_relation_spatial_select(
     if bbox is not None:
         se, we, ne, ee = to_e7(bbox[0]), to_e7(bbox[1]), to_e7(bbox[2]), to_e7(bbox[3])
         files = catalog.prune_files_by_bbox(manifest, "relation", files, (we, se, ee, ne))
-    if not files:
+    if not files and not manifest.delta_tiers():
         return empty_set_sql(), 0
 
     where = []
@@ -297,12 +543,8 @@ def build_relation_spatial_select(
         "geometry": "NULL::GEOMETRY",
         "hilbert": "hilbert",
     }
-    sql = (
-        f"SELECT {project(cols)}\n"
-        f"FROM read_parquet({_quote_list(files)}, hive_partitioning=true, union_by_name=true)\n"
-        f"WHERE {where_sql}"
-    )
-    nfiles = len(files)
+    sql, extra_files = current_rows(con, manifest, "relation", cells, files, cols, where_sql)
+    nfiles = len(files) + extra_files
     if bbox is not None:
         # The coarse test above is the union-of-members AABB (contract
         # section 4); it can pass while no individual member actually
@@ -394,18 +636,14 @@ def build_byid_select(
     lo, hi = idset.id_range(ids)
     parts = catalog.byid_parts_for_range(manifest, element_type, lo, hi)
     files = [manifest.path(p["path"]) for p in parts]
-    if not files:
+    tiers = manifest.delta_tiers()
+    if not files and not tiers:
         return empty_set_sql(), 0
 
-    where = [idset.id_predicate(con, "id", ids), tagsql.tag_filters_sql(tag_filters, promoted_keys)]
-    where_sql = " AND ".join(f"({w})" for w in where)
+    id_pred = idset.id_predicate(con, "id", ids)
+    tag_where = tagsql.tag_filters_sql(tag_filters, promoted_keys)
     cols = _byid_cols(element_type)
-    sql = (
-        f"SELECT {project(cols)}\n"
-        f"FROM read_parquet({_quote_list(files)}, union_by_name=true)\n"
-        f"WHERE {where_sql}"
-    )
-    return sql, len(files)
+    return byid_current_rows(con, manifest, element_type, files, cols, id_pred, tag_where)
 
 
 def _union_bbox_e7(con, selects: list[str]) -> Optional[BBox]:
@@ -478,7 +716,7 @@ def build_way_bbox_semijoin_select(
     s, w, n, e = bbox
     se, we, ne, ee = to_e7(s), to_e7(w), to_e7(n), to_e7(e)
     files = catalog.prune_files_by_bbox(manifest, "way", files, (we, se, ee, ne))
-    if not files:
+    if not files and not manifest.delta_tiers():
         return empty_set_sql(), 0
 
     bbox_where = f"xmax_e7 >= {we} AND xmin_e7 <= {ee} AND ymax_e7 >= {se} AND ymin_e7 <= {ne}"
@@ -502,18 +740,21 @@ def build_way_bbox_semijoin_select(
         "geometry": "geometry",
         "hilbert": "hilbert",
     }
+    # design.md 3.1's `__waycand`/`__waymatch` CTEs, but its source is now
+    # `current_rows` (base ⊕ deltas for these cells) instead of a plain
+    # `read_parquet` -- so a way created or re-noded in a delta tier, whose
+    # bbox falls inside these cells, is a candidate for the refs semi-join
+    # too (docs/m2-contracts.md section 4).
+    cand_sql, extra_files = current_rows(con, manifest, "way", cells, files, cols, f"({bbox_where}) AND ({tag_where})")
     sql = (
-        f"WITH __waycand AS (\n"
-        f"  SELECT * FROM read_parquet({_quote_list(files)}, hive_partitioning=true, union_by_name=true)\n"
-        f"  WHERE ({bbox_where}) AND ({tag_where})\n"
-        f"),\n"
+        f"WITH __waycand AS (\n{cand_sql}\n),\n"
         f"__waymatch AS (\n"
         f"  SELECT DISTINCT c.id FROM __waycand c, UNNEST(c.refs) AS t(ref)\n"
         f"  JOIN {node_ids_table} n ON n.id = t.ref\n"
         f")\n"
-        f"SELECT {project(cols)} FROM __waycand WHERE id IN (SELECT id FROM __waymatch)"
+        f"SELECT * FROM __waycand WHERE id IN (SELECT id FROM __waymatch)"
     )
-    return sql, len(files)
+    return sql, len(files) + extra_files
 
 
 def build_way_hydrate_via_bbox_select(
@@ -560,40 +801,39 @@ def build_way_hydrate_via_bbox_select(
             s, w, n, e = bbox
             se, we, ne, ee = to_e7(s), to_e7(w), to_e7(n), to_e7(e)
             way_files = catalog.prune_files_by_bbox(manifest, "way", way_files, (we, se, ee, ne))
-            if way_files:
+            if way_files or manifest.delta_tiers():
                 bbox_where = (
-                    f"w.xmax_e7 >= {we} AND w.xmin_e7 <= {ee} "
-                    f"AND w.ymax_e7 >= {se} AND w.ymin_e7 <= {ne}"
+                    f"xmax_e7 >= {we} AND xmin_e7 <= {ee} "
+                    f"AND ymax_e7 >= {se} AND ymin_e7 <= {ne}"
                 )
-                files_total += len(way_files)
-                found_table = idset.fresh_table_name("bboxwayhits")
                 cols = {
                     "type": "'way'",
-                    "id": "w.id",
-                    "cell": "w.cell",
-                    "refs": "w.refs",
-                    "tags": "w.tags",
-                    "version": "w.version",
-                    "changeset": "w.changeset",
-                    "timestamp": 'w."timestamp"',
-                    "uid": "w.uid",
-                    "user": 'w."user"',
-                    "xmin_e7": "w.xmin_e7",
-                    "ymin_e7": "w.ymin_e7",
-                    "xmax_e7": "w.xmax_e7",
-                    "ymax_e7": "w.ymax_e7",
-                    "geometry": "w.geometry",
-                    "hilbert": "w.hilbert",
+                    "id": "id",
+                    "cell": "cell",
+                    "refs": "refs",
+                    "tags": "tags",
+                    "version": "version",
+                    "changeset": "changeset",
+                    "timestamp": "timestamp",
+                    "uid": "uid",
+                    "user": '"user"',
+                    "xmin_e7": "xmin_e7",
+                    "ymin_e7": "ymin_e7",
+                    "xmax_e7": "xmax_e7",
+                    "ymax_e7": "ymax_e7",
+                    "geometry": "geometry",
+                    "hilbert": "hilbert",
                 }
-                tag_where = tagsql.tag_filters_sql(tag_filters or [], promoted_keys, prefix="w.")
-                con.execute(
-                    f"CREATE TEMP TABLE {found_table} AS\n"
-                    f"SELECT {project(cols)}\n"
-                    f"FROM read_parquet({_quote_list(way_files)}, hive_partitioning=true, union_by_name=true) w\n"
-                    f"JOIN (SELECT DISTINCT id FROM {way_ids_table}) ids ON w.id = ids.id\n"
-                    f"WHERE ({bbox_where}) AND ({tag_where})"
+                tag_where = tagsql.tag_filters_sql(tag_filters or [], promoted_keys)
+                id_pred = f"id IN (SELECT DISTINCT id FROM {way_ids_table})"
+                cand_sql, extra = current_rows(
+                    con, manifest, "way", cells, way_files, cols, f"({bbox_where}) AND ({tag_where}) AND ({id_pred})"
                 )
-                selects.append(f"SELECT * FROM {found_table}")
+                files_total += len(way_files) + extra
+                if cand_sql:
+                    found_table = idset.fresh_table_name("bboxwayhits")
+                    con.execute(f"CREATE TEMP TABLE {found_table} AS {cand_sql}")
+                    selects.append(f"SELECT * FROM {found_table}")
 
     if found_table is not None:
         remainder_sql = (
@@ -608,7 +848,7 @@ def build_way_hydrate_via_bbox_select(
     if n_remaining:
         lo, hi = con.execute(f"SELECT min(id), max(id) FROM {remainder_table}").fetchone()
         byid_sql, nfiles = build_byid_select_from_ids_query(
-            manifest, "way", f"SELECT id FROM {remainder_table}", lo, hi, tag_filters or [], promoted_keys
+            con, manifest, "way", f"SELECT id FROM {remainder_table}", lo, hi, tag_filters or [], promoted_keys
         )
         files_total += nfiles
         if byid_sql:
@@ -691,20 +931,24 @@ def build_spatial_hydrate_via_cell_select(
     needed_cells = [c for c in known_cells if c in tc]
     if needed_cells:
         files = _spatial_files_for_type(manifest, element_type, needed_cells)
-        if files:
-            files_total += len(files)
-            found_table = idset.fresh_table_name(f"{element_type}cellhits")
-            tag_where = tagsql.tag_filters_sql(tag_filters, promoted_keys, prefix="t.")
-            cols = _spatial_cols_for_type(element_type, prefix="t.")
-            con.execute(
-                f"CREATE TEMP TABLE {found_table} AS\n"
-                f"SELECT {project(cols)}\n"
-                f"FROM read_parquet({_quote_list(files)}, hive_partitioning=true, union_by_name=true) t\n"
-                f"JOIN (SELECT DISTINCT id, cell FROM {id_cell_table} WHERE cell IS NOT NULL) ids\n"
-                f"  ON t.cell = ids.cell AND t.id = ids.id\n"
-                f"WHERE {tag_where}"
+        if files or manifest.delta_tiers():
+            tag_where = tagsql.tag_filters_sql(tag_filters, promoted_keys)
+            id_pred = f"id IN (SELECT DISTINCT id FROM {id_cell_table} WHERE cell IS NOT NULL)"
+            cols = _spatial_cols_for_type(element_type, prefix="")
+            # docs/m2-contracts.md section 4: the (cell, id) hint came from
+            # a base index (member index) or from an already delta-aware
+            # spatial hop (build_way_bbox_semijoin_select), so `needed_cells`
+            # is the element's *current* cell either way -- `current_rows`
+            # picks up any delta candidate for these ids that lives in one
+            # of those cells, with the base row shadowed if superseded.
+            cand_sql, extra = current_rows(
+                con, manifest, element_type, needed_cells, files, cols, f"({id_pred}) AND ({tag_where})"
             )
-            selects.append(f"SELECT * FROM {found_table}")
+            files_total += len(files) + extra
+            if cand_sql:
+                found_table = idset.fresh_table_name(f"{element_type}cellhits")
+                con.execute(f"CREATE TEMP TABLE {found_table} AS {cand_sql}")
+                selects.append(f"SELECT * FROM {found_table}")
 
     if found_table is not None:
         remainder_sql = (
@@ -719,7 +963,7 @@ def build_spatial_hydrate_via_cell_select(
     if n_remaining:
         lo, hi = con.execute(f"SELECT min(id), max(id) FROM {remainder_table}").fetchone()
         byid_sql, nfiles = build_byid_select_from_ids_query(
-            manifest, element_type, f"SELECT id FROM {remainder_table}", lo, hi, tag_filters, promoted_keys
+            con, manifest, element_type, f"SELECT id FROM {remainder_table}", lo, hi, tag_filters, promoted_keys
         )
         files_total += nfiles
         if byid_sql:
@@ -777,32 +1021,31 @@ def build_node_hydrate_via_bbox_select(
             s, w, n, e = bbox
             se, we, ne, ee = to_e7(s), to_e7(w), to_e7(n), to_e7(e)
             node_files = catalog.prune_files_by_bbox(manifest, "node", node_files, (we, se, ee, ne))
-            if node_files:
-                files_total += len(node_files)
-                found_table = idset.fresh_table_name("bboxnodehits")
+            if node_files or manifest.delta_tiers():
                 cols = {
                     "type": "'node'",
-                    "id": "n.id",
-                    "cell": "n.cell",
-                    "lat_e7": "n.lat_e7",
-                    "lon_e7": "n.lon_e7",
-                    "tags": "n.tags",
-                    "version": "n.version",
-                    "changeset": "n.changeset",
-                    "timestamp": 'n."timestamp"',
-                    "uid": "n.uid",
-                    "user": 'n."user"',
-                    "hilbert": "n.hilbert",
+                    "id": "id",
+                    "cell": "cell",
+                    "lat_e7": "lat_e7",
+                    "lon_e7": "lon_e7",
+                    "tags": "tags",
+                    "version": "version",
+                    "changeset": "changeset",
+                    "timestamp": "timestamp",
+                    "uid": "uid",
+                    "user": '"user"',
+                    "hilbert": "hilbert",
                 }
-                tag_where = tagsql.tag_filters_sql(tag_filters or [], promoted_keys, prefix="n.")
-                con.execute(
-                    f"CREATE TEMP TABLE {found_table} AS\n"
-                    f"SELECT {project(cols)}\n"
-                    f"FROM read_parquet({_quote_list(node_files)}, hive_partitioning=true, union_by_name=true) n\n"
-                    f"JOIN (SELECT DISTINCT id FROM {node_ids_table}) ids ON n.id = ids.id\n"
-                    f"WHERE {tag_where}"
+                tag_where = tagsql.tag_filters_sql(tag_filters or [], promoted_keys)
+                id_pred = f"id IN (SELECT DISTINCT id FROM {node_ids_table})"
+                cand_sql, extra = current_rows(
+                    con, manifest, "node", cells, node_files, cols, f"({id_pred}) AND ({tag_where})"
                 )
-                selects.append(f"SELECT * FROM {found_table}")
+                files_total += len(node_files) + extra
+                if cand_sql:
+                    found_table = idset.fresh_table_name("bboxnodehits")
+                    con.execute(f"CREATE TEMP TABLE {found_table} AS {cand_sql}")
+                    selects.append(f"SELECT * FROM {found_table}")
 
     if found_table is not None:
         remainder_sql = (
@@ -817,7 +1060,7 @@ def build_node_hydrate_via_bbox_select(
     if n_remaining:
         lo, hi = con.execute(f"SELECT min(id), max(id) FROM {remainder_table}").fetchone()
         byid_sql, nfiles = build_byid_select_from_ids_query(
-            manifest, "node", f"SELECT id FROM {remainder_table}", lo, hi, tag_filters or [], promoted_keys
+            con, manifest, "node", f"SELECT id FROM {remainder_table}", lo, hi, tag_filters or [], promoted_keys
         )
         files_total += nfiles
         if byid_sql:
@@ -829,6 +1072,7 @@ def build_node_hydrate_via_bbox_select(
 
 
 def build_byid_select_from_ids_query(
+    con,
     manifest: catalog.Manifest,
     element_type: str,
     id_subquery_sql: str,
@@ -842,21 +1086,86 @@ def build_byid_select_from_ids_query(
     `element_type`) instead of a Python list -- used by recurse.py so a `>`,
     `<`, `>>`, `<<` or inline recurse filter never pulls ids into Python at
     all. `lo`/`hi` (from a SQL aggregate on that same relation, not a Python
-    id scan) pick which byid parts can contain them."""
+    id scan) pick which byid parts can contain them. `con` is needed (added
+    for M2) to materialize the delta candidate/shadow TEMP TABLEs when the
+    manifest has delta tiers -- see `byid_current_rows`."""
     parts = catalog.byid_parts_for_range(manifest, element_type, lo, hi)
     files = [manifest.path(p["path"]) for p in parts]
-    if not files:
+    tiers = manifest.delta_tiers()
+    if not files and not tiers:
         return empty_set_sql(), 0
 
-    where = [f"id IN ({id_subquery_sql})", tagsql.tag_filters_sql(tag_filters, promoted_keys)]
-    where_sql = " AND ".join(f"({w})" for w in where)
+    id_pred = f"id IN ({id_subquery_sql})"
+    tag_where = tagsql.tag_filters_sql(tag_filters, promoted_keys)
     cols = _byid_cols(element_type)
-    sql = (
-        f"SELECT {project(cols)}\n"
-        f"FROM read_parquet({_quote_list(files)}, union_by_name=true)\n"
-        f"WHERE {where_sql}"
+    return byid_current_rows(con, manifest, element_type, files, cols, id_pred, tag_where)
+
+
+# --------------------------------------------------------------------------
+# node_way/member index augmentation (docs/m2-contracts.md section 4): the
+# base indexes don't know about ways/relations created or re-noded/
+# re-membered since the base, so the index-based fallback of `<` (and
+# (bn)/(bw)/(br)) must also scan the delta way/relation byid files.
+# --------------------------------------------------------------------------
+
+
+def delta_way_ids_by_ref(con, manifest: catalog.Manifest, node_ids_source_sql: str) -> Optional[str]:
+    """(type='way', id, cell=NULL) TEMP TABLE of every way whose *current*
+    (highest-tier-rank, not-deleted) delta refs contain a node id produced
+    by `node_ids_source_sql` (a ``SELECT id FROM ...``) -- the delta-aware
+    complement to the `node_way` index scan in `recurse.backward_new_ids_table`.
+    None when there are no delta tiers with a way byid file."""
+    tiers = manifest.delta_tiers()
+    parts = [
+        f"SELECT *, {tier['rank']} AS __rank FROM read_parquet('{_q1(bp)}')"
+        for tier in tiers
+        if (bp := tier["files"].get("way", {}).get("byid"))
+    ]
+    if not parts:
+        return None
+    name = idset.fresh_table_name("deltawayref")
+    con.execute(
+        f"CREATE TEMP TABLE {name} AS "
+        f"SELECT DISTINCT 'way' AS type, c.id AS id, NULL::VARCHAR AS cell FROM (\n"
+        f"  SELECT * EXCLUDE (__rank) FROM (\n{chr(10).join(('    ' + p) for p in _interleave_union(parts))}\n) __raw\n"
+        f"  QUALIFY row_number() OVER (PARTITION BY id ORDER BY __rank DESC) = 1\n"
+        f") c, UNNEST(c.refs) AS t(ref)\n"
+        f"WHERE NOT c.deleted AND ref IN ({node_ids_source_sql})"
     )
-    return sql, len(files)
+    return name
+
+
+def delta_relation_ids_by_member(
+    con,
+    manifest: catalog.Manifest,
+    member_type_char: str,
+    member_ids_source_sql: str,
+    role: Optional[str] = None,
+) -> Optional[str]:
+    """Same idea for `member_index`: (type='relation', id, cell) of every
+    relation whose current delta members include a member of type
+    `member_type_char` ('n'/'w'/'r') from `member_ids_source_sql`. `cell`
+    is the relation's own current cell (from the delta row), same as the
+    base member index's `parent_cell`."""
+    tiers = manifest.delta_tiers()
+    parts = [
+        f"SELECT *, {tier['rank']} AS __rank FROM read_parquet('{_q1(bp)}')"
+        for tier in tiers
+        if (bp := tier["files"].get("relation", {}).get("byid"))
+    ]
+    if not parts:
+        return None
+    role_clause = f" AND m.role = '{_q1(role)}'" if role is not None else ""
+    name = idset.fresh_table_name("deltarelmember")
+    con.execute(
+        f"CREATE TEMP TABLE {name} AS "
+        f"SELECT DISTINCT 'relation' AS type, c.id AS id, c.cell AS cell FROM (\n"
+        f"  SELECT * EXCLUDE (__rank) FROM (\n{chr(10).join(('    ' + p) for p in _interleave_union(parts))}\n) __raw\n"
+        f"  QUALIFY row_number() OVER (PARTITION BY id ORDER BY __rank DESC) = 1\n"
+        f") c, UNNEST(c.members) AS t(m)\n"
+        f"WHERE NOT c.deleted AND m.type = '{member_type_char}' AND m.ref IN ({member_ids_source_sql}){role_clause}"
+    )
+    return name
 
 
 # --------------------------------------------------------------------------

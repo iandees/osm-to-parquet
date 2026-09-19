@@ -143,6 +143,65 @@ class Manifest:
         when absent (v1, or a v2 manifest built without it)."""
         return dict(self.data.get("rowgroup_index", {}))
 
+    @property
+    def replication_source(self) -> Optional[str]:
+        """Manifest v3's `replication_source` (docs/m2-contracts.md section
+        1): the Osmosis-style replication directory URL the updater reads
+        diffs from. None for v1/v2 or a v3 manifest without it."""
+        return self.data.get("replication_source")
+
+    def delta_tiers(self) -> list[dict]:
+        """Manifest v3's `deltas` (docs/m2-contracts.md sections 3-4),
+        as a list in precedence order (hour > day > week -- highest rank
+        first), each element:
+
+            {"name": "hour", "rank": 3, "version": 17,
+             "seq_from": ..., "seq_to": ..., "timestamp": ..., "rows": {...},
+             "files": {"node": {"spatial": <abspath>, "byid": <abspath>},
+                       "way": {...}, "relation": {...}},
+             "tombstones": <abspath>}
+
+        Every path is already resolved through `self.path` (joined with
+        `self.root`), so callers never touch `join_root` themselves. A tier
+        absent from the manifest (contract: "a tier that is empty is absent
+        from deltas") is simply missing from this list. Empty for manifest
+        v1/v2, or a v3 manifest with no `deltas` key/an empty one -- so
+        every read-path helper that starts with ``if not
+        manifest.delta_tiers(): <old code, unchanged>`` costs nothing and
+        emits identical SQL for those manifests (docs/m2-contracts.md
+        section 4's "no extra scans" requirement)."""
+        if self.manifest_version < 3:
+            return []
+        deltas = self.data.get("deltas") or {}
+        out: list[dict] = []
+        for name, rank in (("hour", 3), ("day", 2), ("week", 1)):
+            tier = deltas.get(name)
+            if not tier:
+                continue
+            files = tier.get("files", {}) or {}
+            resolved_files: dict[str, dict[str, str]] = {}
+            for t in ("node", "way", "relation"):
+                tf = files.get(t) or {}
+                resolved_files[t] = {k: self.path(v) for k, v in tf.items() if v}
+            tomb = files.get("tombstones")
+            out.append(
+                {
+                    "name": name,
+                    "rank": rank,
+                    "version": tier.get("version"),
+                    "seq_from": tier.get("seq_from"),
+                    "seq_to": tier.get("seq_to"),
+                    "timestamp": tier.get("timestamp"),
+                    "rows": dict(tier.get("rows", {})),
+                    "files": resolved_files,
+                    "tombstones": self.path(tomb) if tomb else None,
+                }
+            )
+        return out
+
+    def has_deltas(self) -> bool:
+        return bool(self.delta_tiers())
+
     def table_cells(self, table: str) -> dict:
         return self.data.get("tables", {}).get(table, {}).get("cells", {})
 
@@ -355,6 +414,26 @@ class FileStats:
 #: its `finally` restores whatever was there before (None, normally).
 FILE_STATS: "contextvars.ContextVar[Optional[FileStats]]" = contextvars.ContextVar(
     "osmpq_file_stats", default=None
+)
+
+
+@dataclass
+class DeltaStats:
+    """Per-`Engine.run()` accumulator for docs/m2-contracts.md section 4's
+    `Result.stats["delta_rows"]`/`["shadowed"]`: `delta_rows` is the number
+    of ranked delta candidate rows considered across every cell-scoped or
+    by-id read this run touched; `shadowed` is the number of base rows
+    those candidates (plus tombstones) caused to be excluded. Kept in a
+    ContextVar for the same reason `FILE_STATS` is (see its docstring):
+    `Manifest`/`Engine` are reused across concurrent `run()` calls, so
+    per-run counters can't live there."""
+
+    delta_rows: int = 0
+    shadowed: int = 0
+
+
+DELTA_STATS: "contextvars.ContextVar[Optional[DeltaStats]]" = contextvars.ContextVar(
+    "osmpq_delta_stats", default=None
 )
 
 

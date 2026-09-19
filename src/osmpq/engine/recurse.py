@@ -140,6 +140,10 @@ def backward_new_ids_table(con, manifest: catalog.Manifest, source_table: str,
                 if way_rows_sql is not None:
                     files_total += nfiles_w
             if way_rows_sql is not None:
+                # design.md 3.1 / m2-contracts.md section 4: this path
+                # already reads way rows through `sources.current_rows`
+                # (base ⊕ deltas for the cells covering these nodes' own
+                # bbox), so it needs nothing extra here.
                 parts.append(f"SELECT type, id, cell FROM ({way_rows_sql}) __wr")
             else:
                 files = [manifest.path(p["path"]) for p in catalog.index_parts_for_range(manifest, "node_way", lo, hi)]
@@ -149,6 +153,13 @@ def backward_new_ids_table(con, manifest: catalog.Manifest, source_table: str,
                         f"FROM read_parquet({_quote_list(files)}) idx "
                         f"JOIN {source_table} s ON idx.node_id = s.id AND s.type = 'node'"
                     )
+                # m2-contracts.md section 4: the base node_way index doesn't
+                # know about ways created/re-noded since the base -- scan
+                # the delta way byid files for refs containing these nodes.
+                delta_way_tbl = sources.delta_way_ids_by_ref(con, manifest, f"SELECT id FROM {node_ids_tbl}")
+                if delta_way_tbl is not None:
+                    files_total += 1
+                    parts.append(f"SELECT type, id, cell FROM {delta_way_tbl}")
 
     member_files = [manifest.path(p["path"]) for p in manifest.index_parts("member")]
     if member_files:
@@ -171,6 +182,24 @@ def backward_new_ids_table(con, manifest: catalog.Manifest, source_table: str,
                 f"  ON idx.member_id = s.id AND s.type = CASE idx.member_type {type_case} END "
                 f"WHERE idx.member_type IN ({type_in}){role_clause}"
             )
+
+    # m2-contracts.md section 4: the base member index doesn't know about
+    # relations created/re-membered since the base -- scan the delta
+    # relation byid files too, per source member type (the index scan
+    # above already covers every requested type in one pass; the delta one
+    # is per-char since it filters on a single member type at a time).
+    member_type_char = {"node": "n", "way": "w", "relation": "r"}
+    for t, c in member_type_char.items():
+        if restrict_source_types is not None and t not in restrict_source_types:
+            continue
+        _, _, n_t = idset.sql_type_range(con, source_table, t)
+        if not n_t:
+            continue
+        ids_sql = f"SELECT id FROM {source_table} WHERE type = '{t}'"
+        delta_rel_tbl = sources.delta_relation_ids_by_member(con, manifest, c, ids_sql, role=role)
+        if delta_rel_tbl is not None:
+            files_total += 1
+            parts.append(f"SELECT type, id, cell FROM {delta_rel_tbl}")
 
     if not parts:
         return None, files_total
@@ -219,7 +248,7 @@ def hydrate_ids_table(con, manifest: catalog.Manifest, id_table: str, tag_filter
             )
         else:
             id_subquery = f"SELECT id FROM {id_table} WHERE type = '{t}'"
-            sql, nfiles = sources.build_byid_select_from_ids_query(manifest, t, id_subquery, lo, hi, tag_filters, promoted_keys)
+            sql, nfiles = sources.build_byid_select_from_ids_query(con, manifest, t, id_subquery, lo, hi, tag_filters, promoted_keys)
         files_total += nfiles
         if sql:
             selects.append(sql)

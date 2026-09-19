@@ -123,18 +123,59 @@ def hydrate_way_geometry(con, manifest: catalog.Manifest, rows: list[dict]) -> N
         return
     tc = manifest.table_cells("way")
     needed_cells = sorted({r["cell"] for r in missing if r["cell"] in tc})
-    if not needed_cells:
-        return
-    files = [manifest.path(tc[c]["path"]) for c in needed_cells]
-    pairs_table = idset.register_pairs_table(con, [(r["cell"], r["id"]) for r in missing])
-    resolved = {
-        wid: wkt
-        for wid, wkt in con.execute(
-            f"SELECT t.id, ST_AsText(t.geometry) FROM read_parquet({_quote_list(files)}) t "
-            f"JOIN {pairs_table} p ON t.cell = p.cell AND t.id = p.id"
-        ).fetchall()
-        if wkt
-    }
+    resolved: dict[int, str] = {}
+    if needed_cells:
+        files = [manifest.path(tc[c]["path"]) for c in needed_cells]
+        pairs_table = idset.register_pairs_table(con, [(r["cell"], r["id"]) for r in missing])
+        resolved = {
+            wid: wkt
+            for wid, wkt in con.execute(
+                f"SELECT t.id, ST_AsText(t.geometry) FROM read_parquet({_quote_list(files)}) t "
+                f"JOIN {pairs_table} p ON t.cell = p.cell AND t.id = p.id"
+            ).fetchall()
+            if wkt
+        }
+
+    # docs/m2-contracts.md section 4: these rows came from a byid lookup
+    # (no `geometry` column there, contract section 4 of m0), so the join
+    # above only ever reads *base* spatial files by (cell, id). A way
+    # that's been re-noded (or moved cell) in a delta tier needs its
+    # current geometry instead -- the byid delta files carry no geometry
+    # either (same as base byid), so pull it from the delta *spatial*
+    # files, keyed by id alone (not by the possibly-stale `cell` hint on
+    # `r`), tier-ranked, and let it override whatever the base join found.
+    tiers = manifest.delta_tiers()
+    if tiers:
+        ids = [r["id"] for r in missing]
+        ids_tbl = idset.register_ids_table(con, ids)
+        # Keep `geometry` a plain passthrough column (no ST_* call) inside
+        # each per-tier SELECT: an empty tier's way spatial file (0 rows
+        # for "way" this tier) can come back with a plain BLOB physical
+        # type for `geometry` instead of GEOMETRY (DuckDB has nothing to
+        # infer the GeoParquet type from with zero rows), and calling
+        # `ST_AsText` on that BLOB directly fails to bind. `UNION ALL BY
+        # NAME` across tiers promotes BLOB to GEOMETRY by column name once
+        # at least one tier's rows are typed GEOMETRY, so `ST_AsText` only
+        # ever runs after the union, on the settled/ranked result.
+        cand_parts = [
+            f"SELECT id, geometry, deleted, {tier['rank']} AS __rank "
+            f"FROM read_parquet('{tier['files']['way']['spatial']}') "
+            f"WHERE id IN (SELECT id FROM {ids_tbl})"
+            for tier in tiers
+            if tier["files"].get("way", {}).get("spatial")
+        ]
+        if cand_parts:
+            union_sql = "\nUNION ALL BY NAME\n".join(cand_parts)
+            best = con.execute(
+                f"SELECT id, ST_AsText(geometry) AS wkt FROM (\n"
+                f"  SELECT * FROM ({union_sql}) __c\n"
+                f"  QUALIFY row_number() OVER (PARTITION BY id ORDER BY __rank DESC) = 1\n"
+                f") WHERE NOT deleted"
+            ).fetchall()
+            for wid, wkt in best:
+                if wkt:
+                    resolved[wid] = wkt
+
     for r in missing:
         if r["id"] in resolved:
             r["geometry_wkt"] = resolved[r["id"]]

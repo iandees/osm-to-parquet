@@ -199,6 +199,45 @@ class FixtureInfo:
     # -- see build()'s v2 cell-placement adjustments. Same ids as v1.
     root_promoted_way_ids: list = field(default_factory=list)
     root_promoted_relation_ids: list = field(default_factory=list)
+    # -- manifest_version=3 only (delta tiers, docs/m2-contracts.md) -------
+    manifest_replication_source: str = ""
+    delta_week_version: int = 0
+    delta_day_version: int = 0
+    delta_hour_version: int = 0
+    # week modifies this tagged node's tags; day re-modifies it (day wins).
+    delta_modified_node_id: int = 0
+    delta_modified_node_week_tags: dict = field(default_factory=dict)
+    delta_modified_node_day_tags: dict = field(default_factory=dict)
+    # week moves this untagged node to a different leaf; hour then deletes
+    # it outright (hour tombstone beats week's payload).
+    delta_moved_deleted_node_id: int = 0
+    delta_moved_deleted_node_from_cell: str = ""
+    delta_moved_deleted_node_to_cell: str = ""
+    # week moves this *other* untagged node to a different leaf and nothing
+    # touches it again -- for "moved node shows only in the new cell".
+    delta_moved_only_node_id: int = 0
+    delta_moved_only_node_from_cell: str = ""
+    delta_moved_only_node_to_cell: str = ""
+    # week deletes this way; `delta_deleted_way_surviving_partner_way_id`
+    # shares one node (ref) with it, to prove the node itself survives.
+    delta_deleted_way_id: int = 0
+    delta_deleted_way_cell: str = ""
+    delta_deleted_way_surviving_partner_way_id: int = 0
+    delta_deleted_way_shared_node_id: int = 0
+    # week creates this new way, spanning two leaves -> placed at an
+    # allowed ancestor cell, same promotion rule as spanning_way_id.
+    delta_new_way_id: int = 0
+    delta_new_way_cell: str = ""
+    delta_new_way_refs: list = field(default_factory=list)
+    # day creates this new relation, whose member way is delta_new_way_id.
+    delta_new_relation_id: int = 0
+    delta_new_relation_cell: str = ""
+    delta_new_relation_way_member_id: int = 0
+    delta_new_relation_node_member_id: int = 0
+    # hour modifies this way's refs (geometry changes) and bumps version.
+    delta_modified_refs_way_id: int = 0
+    delta_modified_refs_way_new_refs: list = field(default_factory=list)
+    delta_modified_refs_way_new_version: int = 0
 
 
 def build(
@@ -213,7 +252,7 @@ def build(
     region for the ancestor-depth rule, metadata on untagged nodes
     (including one deliberately all-NULL), and the row-group index side
     files, per docs/m1-contracts.md sections 2/4/5."""
-    if manifest_version not in (1, 2):
+    if manifest_version not in (1, 2, 3):
         raise ValueError(f"unsupported manifest_version {manifest_version!r}")
     root = Path(root_dir)
     root.mkdir(parents=True, exist_ok=True)
@@ -341,7 +380,7 @@ def build(
     # a part of the quadtree v1 never uses, precisely so the same queries
     # against v1 and v2 fixtures built from everything above stay
     # equivalent (test_engine_v2.py).
-    if manifest_version == 2:
+    if manifest_version >= 2:
         trap_leaf_bbox = {c: cell_bbox(c) for c in V2_TRAP_LEAVES}
         info.trap_leaf_bbox = trap_leaf_bbox
         trap_with_meta_id = alloc()
@@ -388,7 +427,7 @@ def build(
 
     # way TRAP_WAY_ID (v2 only): straddles trap leaves "30000"/"30001" (two
     # children of "3000", depth 4) -- see the V2_TRAP_LEAVES comment above.
-    if manifest_version == 2:
+    if manifest_version >= 2:
         ways.append({
             "id": TRAP_WAY_ID,
             "refs": [info.trap_node_with_meta_id, info.trap_node_without_meta_id],
@@ -519,7 +558,7 @@ def build(
     # cell (a depth-4 ancestor with no equivalent under v1's 3-leaf-deep
     # topology) doesn't exist in this fixture at all, only in the v2 trap
     # region.
-    if manifest_version == 2:
+    if manifest_version >= 2:
         for w in ways:
             if w["cell"] == "00":
                 w["cell"] = "root"
@@ -534,7 +573,7 @@ def build(
     info.total_bbox = (min(all_lats), min(all_lons), max(all_lats), max(all_lons))
 
     # ---------------------------------------------------------- write files
-    manifest_leaf_cells = list(LEAVES) + (list(V2_TRAP_LEAVES) if manifest_version == 2 else [])
+    manifest_leaf_cells = list(LEAVES) + (list(V2_TRAP_LEAVES) if manifest_version >= 2 else [])
     manifest: dict = {
         "manifest_version": manifest_version,
         "generation": GEN,
@@ -550,7 +589,7 @@ def build(
         "byid": {"node": [], "way": [], "relation": []},
         "index": {"node_way": [], "member": []},
     }
-    if manifest_version == 2:
+    if manifest_version >= 2:
         manifest["ancestor_depths"] = list(V2_ANCESTOR_DEPTHS)
         manifest["max_depth"] = V2_MAX_DEPTH
         manifest["producer"] = {"raw": "osmpq raw-py", "build": "osmpq 0.0.1 (tests/fixtures/make_fixture.py)"}
@@ -823,7 +862,7 @@ def build(
     # computed from the files' own footers with pyarrow (not recomputed
     # from the Python row lists above), exactly as the real Python build
     # stage is expected to do it.
-    if manifest_version == 2:
+    if manifest_version >= 2:
         rg_rows: dict[str, list[dict]] = {"node": [], "way": [], "relation": []}
         for cell, parts in manifest["tables"]["node"]["cells"].items():
             for tag_key, entry in parts.items():
@@ -866,6 +905,498 @@ def build(
             "relations": len(relations),
             "leaf_cells": len(manifest_leaf_cells),
             "bytes": {"spatial": 0, "byid": 0, "index": 0},
+        }
+
+    # ---------------------------------------------------- delta tiers (v3)
+    # docs/m2-contracts.md sections 3-4: three tiers (week, day, hour) on
+    # top of the v2 base above (same node/way/relation ids/tags/geometry),
+    # exercising exactly the scenarios M2 asks for: a plain tag modify with
+    # tier precedence (day beats week), a moved element (prev_cell != cell,
+    # tombstone) later fully deleted (hour tombstone beats week's payload),
+    # a separately-moved element that stays live (moved node visible only
+    # in its new cell), a deleted way (tombstone, spatial row at
+    # cell=prev_cell with NULL payload) whose surviving partner way still
+    # reaches their shared node via `>`, a brand-new way spanning two
+    # leaves (placed at an allowed ancestor, like `spanning_way_id`), a
+    # brand-new relation whose member is that new way, and a way whose
+    # refs change (geometry change + version bump).
+    if manifest_version == 3:
+        REPLICATION_SOURCE = "https://download.openstreetmap.fr/replication/north-america/us-midwest/minute"
+        info.manifest_replication_source = REPLICATION_SOURCE
+
+        info.delta_week_version = 1
+        info.delta_day_version = 1
+        info.delta_hour_version = 1
+
+        info.delta_modified_node_id = info.cafe_node_id  # node 1
+        info.delta_modified_node_week_tags = {
+            "amenity": "cafe", "name": "Aroma Cafe", "note": "renovating (week)",
+        }
+        info.delta_modified_node_day_tags = {
+            "amenity": "cafe", "name": "Aroma Cafe", "note": "reopened (day)",
+        }
+
+        info.delta_moved_deleted_node_id = info.untagged_node_in_cafe_cell  # leaf000_extra_ids[0]
+        info.delta_moved_deleted_node_from_cell = "000"
+        info.delta_moved_deleted_node_to_cell = "001"
+
+        move_only_node_id = leaf001_ids[6]
+        info.delta_moved_only_node_id = move_only_node_id
+        info.delta_moved_only_node_from_cell = "001"
+        info.delta_moved_only_node_to_cell = "002"
+
+        info.delta_deleted_way_id = 107
+        info.delta_deleted_way_cell = "001"
+        info.delta_deleted_way_surviving_partner_way_id = 106  # shares leaf001_ids[4]
+        info.delta_deleted_way_shared_node_id = leaf001_ids[4]
+
+        info.delta_new_way_id = 9001
+        info.delta_new_way_cell = "root"  # spans leaf "000" and leaf "002", like way 110
+        info.delta_new_way_refs = [info.cafe_node_id, leaf002_ids[0]]
+
+        info.delta_new_relation_id = 9002
+        info.delta_new_relation_cell = "root"
+        info.delta_new_relation_way_member_id = info.delta_new_way_id
+        info.delta_new_relation_node_member_id = info.cafe_node_id
+
+        info.delta_modified_refs_way_id = 102
+        modified_way_extra_node = leaf000_extra_ids[2]  # unused elsewhere
+        info.delta_modified_refs_way_new_refs = [1, 4, 8, modified_way_extra_node]
+        info.delta_modified_refs_way_new_version = 99
+
+        # -- generic row -> SQL builders --------------------------------
+        def meta_literal_sql(version, changeset, ts, uid, user):
+            return (
+                f"{version} AS version, {changeset} AS changeset, "
+                f"TIMESTAMP '{ts}' AS \"timestamp\", {uid} AS uid, '{user}' AS \"user\""
+            )
+
+        def meta_literal_null_sql():
+            return (
+                'NULL::INTEGER AS version, NULL::BIGINT AS changeset, '
+                'NULL::TIMESTAMP AS "timestamp", NULL::INTEGER AS uid, NULL::VARCHAR AS "user"'
+            )
+
+        def cell_sql_of(c):
+            return f"'{c}'" if c else "NULL::VARCHAR"
+
+        def node_spatial_row_sql(row):
+            if row["deleted"]:
+                payload = (
+                    "NULL::INTEGER AS lat_e7, NULL::INTEGER AS lon_e7, "
+                    f"NULL::MAP(VARCHAR, VARCHAR) AS tags, {promoted_cols_sql(None)}, "
+                    f"{meta_literal_null_sql()}, NULL::UBIGINT AS hilbert"
+                )
+            else:
+                lat_e7, lon_e7 = to_e7(row["lat"]), to_e7(row["lon"])
+                h = lonlat_to_hilbert(row["lon"], row["lat"])
+                payload = (
+                    f"{lat_e7} AS lat_e7, {lon_e7} AS lon_e7, {tags_literal(row['tags'])} AS tags, "
+                    f"{promoted_cols_sql(row['tags'])}, "
+                    f"{meta_literal_sql(row['version'], row['changeset'], row['timestamp'], row['uid'], row['user'])}, "
+                    f"{h}::UBIGINT AS hilbert"
+                )
+            return (
+                f"SELECT {row['id']} AS id, {cell_sql_of(row['cell'])} AS cell, {payload}, "
+                f"{str(row['deleted']).upper()} AS deleted, {cell_sql_of(row['prev_cell'])} AS prev_cell, "
+                f"{row['seq']} AS seq"
+            )
+
+        def node_byid_row_sql(row):
+            if row["deleted"]:
+                payload = (
+                    "NULL::INTEGER AS lat_e7, NULL::INTEGER AS lon_e7, "
+                    f"NULL::MAP(VARCHAR, VARCHAR) AS tags, {promoted_cols_sql(None)}, {meta_literal_null_sql()}"
+                )
+            else:
+                lat_e7, lon_e7 = to_e7(row["lat"]), to_e7(row["lon"])
+                payload = (
+                    f"{lat_e7} AS lat_e7, {lon_e7} AS lon_e7, {tags_literal(row['tags'])} AS tags, "
+                    f"{promoted_cols_sql(row['tags'])}, "
+                    f"{meta_literal_sql(row['version'], row['changeset'], row['timestamp'], row['uid'], row['user'])}"
+                )
+            return (
+                f"SELECT {row['id']} AS id, {payload}, {cell_sql_of(row['cell'])} AS cell, "
+                f"{str(row['deleted']).upper()} AS deleted, {cell_sql_of(row['prev_cell'])} AS prev_cell, "
+                f"{row['seq']} AS seq"
+            )
+
+        def _way_is_closed_area(refs, tags):
+            is_closed = len(refs) >= 4 and refs[0] == refs[-1]
+            tags = tags or {}
+            has_area_no = tags.get("area") == "no"
+            has_linear_tag = ("highway" in tags or "barrier" in tags) and tags.get("area") != "yes"
+            is_area = bool(is_closed and not has_area_no and not has_linear_tag)
+            return is_closed, is_area
+
+        def way_spatial_row_sql(row):
+            if row["deleted"]:
+                payload = (
+                    "NULL::BIGINT[] AS refs, NULL::MAP(VARCHAR, VARCHAR) AS tags, "
+                    f"{promoted_cols_sql(None)}, {meta_literal_null_sql()}, "
+                    "NULL::INTEGER AS xmin_e7, NULL::INTEGER AS ymin_e7, "
+                    "NULL::INTEGER AS xmax_e7, NULL::INTEGER AS ymax_e7, "
+                    "NULL::GEOMETRY AS geometry, NULL::BOOLEAN AS is_closed, NULL::BOOLEAN AS is_area, "
+                    "NULL::INTEGER AS centroid_lat_e7, NULL::INTEGER AS centroid_lon_e7, NULL::UBIGINT AS hilbert"
+                )
+            else:
+                wkt, (xmin, ymin, xmax, ymax) = way_geometry_and_bbox(row["refs"])
+                geom_expr = f"ST_GeomFromText('{wkt}')" if wkt else "NULL::GEOMETRY"
+                if xmin is not None:
+                    xmin_e7, ymin_e7, xmax_e7, ymax_e7 = to_e7(xmin), to_e7(ymin), to_e7(xmax), to_e7(ymax)
+                    centroid_lat_e7 = to_e7((ymin + ymax) / 2)
+                    centroid_lon_e7 = to_e7((xmin + xmax) / 2)
+                    h = bbox_e7_center_hilbert(xmin_e7, ymin_e7, xmax_e7, ymax_e7)
+                else:
+                    xmin_e7 = ymin_e7 = xmax_e7 = ymax_e7 = "NULL::INTEGER"
+                    centroid_lat_e7 = centroid_lon_e7 = "NULL::INTEGER"
+                    h = 0
+                refs_literal = "[" + ", ".join(str(r) for r in row["refs"]) + "]::BIGINT[]"
+                is_closed, is_area = _way_is_closed_area(row["refs"], row["tags"])
+                payload = (
+                    f"{refs_literal} AS refs, {tags_literal(row['tags'])} AS tags, "
+                    f"{promoted_cols_sql(row['tags'])}, "
+                    f"{meta_literal_sql(row['version'], row['changeset'], row['timestamp'], row['uid'], row['user'])}, "
+                    f"{xmin_e7} AS xmin_e7, {ymin_e7} AS ymin_e7, {xmax_e7} AS xmax_e7, {ymax_e7} AS ymax_e7, "
+                    f"{geom_expr} AS geometry, {str(is_closed).upper()} AS is_closed, "
+                    f"{str(is_area).upper()} AS is_area, "
+                    f"{centroid_lat_e7} AS centroid_lat_e7, {centroid_lon_e7} AS centroid_lon_e7, "
+                    f"{h}::UBIGINT AS hilbert"
+                )
+            return (
+                f"SELECT {row['id']} AS id, {cell_sql_of(row['cell'])} AS cell, {payload}, "
+                f"{str(row['deleted']).upper()} AS deleted, {cell_sql_of(row['prev_cell'])} AS prev_cell, "
+                f"{row['seq']} AS seq"
+            )
+
+        def way_byid_row_sql(row):
+            if row["deleted"]:
+                payload = (
+                    "NULL::BIGINT[] AS refs, NULL::MAP(VARCHAR, VARCHAR) AS tags, "
+                    f"{promoted_cols_sql(None)}, {meta_literal_null_sql()}, "
+                    "NULL::INTEGER AS xmin_e7, NULL::INTEGER AS ymin_e7, "
+                    "NULL::INTEGER AS xmax_e7, NULL::INTEGER AS ymax_e7, "
+                    "NULL::BOOLEAN AS is_closed, NULL::BOOLEAN AS is_area"
+                )
+            else:
+                _wkt, (xmin, ymin, xmax, ymax) = way_geometry_and_bbox(row["refs"])
+                if xmin is not None:
+                    xmin_e7, ymin_e7, xmax_e7, ymax_e7 = to_e7(xmin), to_e7(ymin), to_e7(xmax), to_e7(ymax)
+                else:
+                    xmin_e7 = ymin_e7 = xmax_e7 = ymax_e7 = "NULL::INTEGER"
+                refs_literal = "[" + ", ".join(str(r) for r in row["refs"]) + "]::BIGINT[]"
+                is_closed, is_area = _way_is_closed_area(row["refs"], row["tags"])
+                payload = (
+                    f"{refs_literal} AS refs, {tags_literal(row['tags'])} AS tags, "
+                    f"{promoted_cols_sql(row['tags'])}, "
+                    f"{meta_literal_sql(row['version'], row['changeset'], row['timestamp'], row['uid'], row['user'])}, "
+                    f"{xmin_e7} AS xmin_e7, {ymin_e7} AS ymin_e7, {xmax_e7} AS xmax_e7, {ymax_e7} AS ymax_e7, "
+                    f"{str(is_closed).upper()} AS is_closed, {str(is_area).upper()} AS is_area"
+                )
+            return (
+                f"SELECT {row['id']} AS id, {payload}, {cell_sql_of(row['cell'])} AS cell, "
+                f"{str(row['deleted']).upper()} AS deleted, {cell_sql_of(row['prev_cell'])} AS prev_cell, "
+                f"{row['seq']} AS seq"
+            )
+
+        def relation_spatial_row_sql(row):
+            if row["deleted"]:
+                payload = (
+                    "NULL::STRUCT(type VARCHAR, ref BIGINT, role VARCHAR)[] AS members, "
+                    "NULL::MAP(VARCHAR, VARCHAR) AS tags, "
+                    f"{promoted_cols_sql(None)}, {meta_literal_null_sql()}, "
+                    "NULL::INTEGER AS xmin_e7, NULL::INTEGER AS ymin_e7, "
+                    "NULL::INTEGER AS xmax_e7, NULL::INTEGER AS ymax_e7, "
+                    "NULL::GEOMETRY AS geometry, NULL::INTEGER AS centroid_lat_e7, "
+                    "NULL::INTEGER AS centroid_lon_e7, NULL::UBIGINT AS hilbert"
+                )
+            else:
+                members_literal = (
+                    "[" + ", ".join(
+                        f"{{'type': '{m['type']}', 'ref': {m['ref']}, 'role': '{m['role']}'}}"
+                        for m in row["members"]
+                    ) + "]::STRUCT(type VARCHAR, ref BIGINT, role VARCHAR)[]"
+                )
+                xmin, ymin, xmax, ymax = row["bbox"]
+                if xmin is not None:
+                    xmin_e7, ymin_e7, xmax_e7, ymax_e7 = to_e7(xmin), to_e7(ymin), to_e7(xmax), to_e7(ymax)
+                    centroid_lat_e7 = to_e7((ymin + ymax) / 2)
+                    centroid_lon_e7 = to_e7((xmin + xmax) / 2)
+                    h = bbox_e7_center_hilbert(xmin_e7, ymin_e7, xmax_e7, ymax_e7)
+                else:
+                    xmin_e7 = ymin_e7 = xmax_e7 = ymax_e7 = "NULL::INTEGER"
+                    centroid_lat_e7 = centroid_lon_e7 = "NULL::INTEGER"
+                    h = 0
+                payload = (
+                    f"{members_literal} AS members, {tags_literal(row['tags'])} AS tags, "
+                    f"{promoted_cols_sql(row['tags'])}, "
+                    f"{meta_literal_sql(row['version'], row['changeset'], row['timestamp'], row['uid'], row['user'])}, "
+                    f"{xmin_e7} AS xmin_e7, {ymin_e7} AS ymin_e7, {xmax_e7} AS xmax_e7, {ymax_e7} AS ymax_e7, "
+                    f"NULL::GEOMETRY AS geometry, {centroid_lat_e7} AS centroid_lat_e7, "
+                    f"{centroid_lon_e7} AS centroid_lon_e7, {h}::UBIGINT AS hilbert"
+                )
+            return (
+                f"SELECT {row['id']} AS id, {cell_sql_of(row['cell'])} AS cell, {payload}, "
+                f"{str(row['deleted']).upper()} AS deleted, {cell_sql_of(row['prev_cell'])} AS prev_cell, "
+                f"{row['seq']} AS seq"
+            )
+
+        def relation_byid_row_sql(row):
+            if row["deleted"]:
+                payload = (
+                    "NULL::STRUCT(type VARCHAR, ref BIGINT, role VARCHAR)[] AS members, "
+                    "NULL::MAP(VARCHAR, VARCHAR) AS tags, "
+                    f"{promoted_cols_sql(None)}, {meta_literal_null_sql()}, "
+                    "NULL::INTEGER AS xmin_e7, NULL::INTEGER AS ymin_e7, "
+                    "NULL::INTEGER AS xmax_e7, NULL::INTEGER AS ymax_e7"
+                )
+            else:
+                members_literal = (
+                    "[" + ", ".join(
+                        f"{{'type': '{m['type']}', 'ref': {m['ref']}, 'role': '{m['role']}'}}"
+                        for m in row["members"]
+                    ) + "]::STRUCT(type VARCHAR, ref BIGINT, role VARCHAR)[]"
+                )
+                xmin, ymin, xmax, ymax = row["bbox"]
+                if xmin is not None:
+                    xmin_e7, ymin_e7, xmax_e7, ymax_e7 = to_e7(xmin), to_e7(ymin), to_e7(xmax), to_e7(ymax)
+                else:
+                    xmin_e7 = ymin_e7 = xmax_e7 = ymax_e7 = "NULL::INTEGER"
+                payload = (
+                    f"{members_literal} AS members, {tags_literal(row['tags'])} AS tags, "
+                    f"{promoted_cols_sql(row['tags'])}, "
+                    f"{meta_literal_sql(row['version'], row['changeset'], row['timestamp'], row['uid'], row['user'])}, "
+                    f"{xmin_e7} AS xmin_e7, {ymin_e7} AS ymin_e7, {xmax_e7} AS xmax_e7, {ymax_e7} AS ymax_e7"
+                )
+            return (
+                f"SELECT {row['id']} AS id, {payload}, {cell_sql_of(row['cell'])} AS cell, "
+                f"{str(row['deleted']).upper()} AS deleted, {cell_sql_of(row['prev_cell'])} AS prev_cell, "
+                f"{row['seq']} AS seq"
+            )
+
+        def tombstone_row_sql(t, id_, prev_cell, seq):
+            return f"SELECT '{t}' AS type, {id_} AS id, '{prev_cell}' AS prev_cell, {seq} AS seq"
+
+        _EMPTY_NODE_SPATIAL = (
+            "SELECT NULL::BIGINT AS id, NULL::VARCHAR AS cell, NULL::INTEGER AS lat_e7, "
+            "NULL::INTEGER AS lon_e7, NULL::MAP(VARCHAR, VARCHAR) AS tags, "
+            + promoted_cols_sql(None) + ", " + meta_literal_null_sql()
+            + ", NULL::UBIGINT AS hilbert, NULL::BOOLEAN AS deleted, "
+            "NULL::VARCHAR AS prev_cell, NULL::BIGINT AS seq WHERE FALSE"
+        )
+        _EMPTY_NODE_BYID = (
+            "SELECT NULL::BIGINT AS id, NULL::INTEGER AS lat_e7, NULL::INTEGER AS lon_e7, "
+            "NULL::MAP(VARCHAR, VARCHAR) AS tags, " + promoted_cols_sql(None) + ", "
+            + meta_literal_null_sql() + ", NULL::VARCHAR AS cell, NULL::BOOLEAN AS deleted, "
+            "NULL::VARCHAR AS prev_cell, NULL::BIGINT AS seq WHERE FALSE"
+        )
+        _EMPTY_WAY_SPATIAL = (
+            "SELECT NULL::BIGINT AS id, NULL::VARCHAR AS cell, NULL::BIGINT[] AS refs, "
+            "NULL::MAP(VARCHAR, VARCHAR) AS tags, " + promoted_cols_sql(None) + ", "
+            + meta_literal_null_sql() + ", NULL::INTEGER AS xmin_e7, NULL::INTEGER AS ymin_e7, "
+            "NULL::INTEGER AS xmax_e7, NULL::INTEGER AS ymax_e7, NULL::GEOMETRY AS geometry, "
+            "NULL::BOOLEAN AS is_closed, NULL::BOOLEAN AS is_area, NULL::INTEGER AS centroid_lat_e7, "
+            "NULL::INTEGER AS centroid_lon_e7, NULL::UBIGINT AS hilbert, NULL::BOOLEAN AS deleted, "
+            "NULL::VARCHAR AS prev_cell, NULL::BIGINT AS seq WHERE FALSE"
+        )
+        _EMPTY_WAY_BYID = (
+            "SELECT NULL::BIGINT AS id, NULL::BIGINT[] AS refs, NULL::MAP(VARCHAR, VARCHAR) AS tags, "
+            + promoted_cols_sql(None) + ", " + meta_literal_null_sql()
+            + ", NULL::INTEGER AS xmin_e7, NULL::INTEGER AS ymin_e7, NULL::INTEGER AS xmax_e7, "
+            "NULL::INTEGER AS ymax_e7, NULL::BOOLEAN AS is_closed, NULL::BOOLEAN AS is_area, "
+            "NULL::VARCHAR AS cell, NULL::BOOLEAN AS deleted, NULL::VARCHAR AS prev_cell, "
+            "NULL::BIGINT AS seq WHERE FALSE"
+        )
+        _EMPTY_REL_SPATIAL = (
+            "SELECT NULL::BIGINT AS id, NULL::VARCHAR AS cell, "
+            "NULL::STRUCT(type VARCHAR, ref BIGINT, role VARCHAR)[] AS members, "
+            "NULL::MAP(VARCHAR, VARCHAR) AS tags, " + promoted_cols_sql(None) + ", "
+            + meta_literal_null_sql() + ", NULL::INTEGER AS xmin_e7, NULL::INTEGER AS ymin_e7, "
+            "NULL::INTEGER AS xmax_e7, NULL::INTEGER AS ymax_e7, NULL::GEOMETRY AS geometry, "
+            "NULL::INTEGER AS centroid_lat_e7, NULL::INTEGER AS centroid_lon_e7, NULL::UBIGINT AS hilbert, "
+            "NULL::BOOLEAN AS deleted, NULL::VARCHAR AS prev_cell, NULL::BIGINT AS seq WHERE FALSE"
+        )
+        _EMPTY_REL_BYID = (
+            "SELECT NULL::BIGINT AS id, NULL::STRUCT(type VARCHAR, ref BIGINT, role VARCHAR)[] AS members, "
+            "NULL::MAP(VARCHAR, VARCHAR) AS tags, " + promoted_cols_sql(None) + ", "
+            + meta_literal_null_sql() + ", NULL::INTEGER AS xmin_e7, NULL::INTEGER AS ymin_e7, "
+            "NULL::INTEGER AS xmax_e7, NULL::INTEGER AS ymax_e7, NULL::VARCHAR AS cell, "
+            "NULL::BOOLEAN AS deleted, NULL::VARCHAR AS prev_cell, NULL::BIGINT AS seq WHERE FALSE"
+        )
+        _EMPTY_TOMBSTONES = (
+            "SELECT NULL::VARCHAR AS type, NULL::BIGINT AS id, NULL::VARCHAR AS prev_cell, "
+            "NULL::BIGINT AS seq WHERE FALSE"
+        )
+
+        def write_delta_tier(tier_name, version, node_rows, way_rows, relation_rows, tombstones):
+            tier_dir = f"delta/{GEN}/{tier_name}/{version}"
+
+            def write(rel_path, row_sqls, empty_sql):
+                out_path = root / rel_path
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                sql = " UNION ALL ".join(row_sqls) if row_sqls else empty_sql
+                con.execute(f"COPY ({sql}) TO '{out_path}' (FORMAT PARQUET)")
+
+            paths = {
+                "node": {
+                    "spatial": f"{tier_dir}/node.spatial.parquet",
+                    "byid": f"{tier_dir}/node.byid.parquet",
+                },
+                "way": {
+                    "spatial": f"{tier_dir}/way.spatial.parquet",
+                    "byid": f"{tier_dir}/way.byid.parquet",
+                },
+                "relation": {
+                    "spatial": f"{tier_dir}/relation.spatial.parquet",
+                    "byid": f"{tier_dir}/relation.byid.parquet",
+                },
+                "tombstones": f"{tier_dir}/tombstones.parquet",
+            }
+            write(paths["node"]["spatial"], [node_spatial_row_sql(r) for r in node_rows], _EMPTY_NODE_SPATIAL)
+            write(paths["node"]["byid"], [node_byid_row_sql(r) for r in node_rows], _EMPTY_NODE_BYID)
+            write(paths["way"]["spatial"], [way_spatial_row_sql(r) for r in way_rows], _EMPTY_WAY_SPATIAL)
+            write(paths["way"]["byid"], [way_byid_row_sql(r) for r in way_rows], _EMPTY_WAY_BYID)
+            write(paths["relation"]["spatial"], [relation_spatial_row_sql(r) for r in relation_rows], _EMPTY_REL_SPATIAL)
+            write(paths["relation"]["byid"], [relation_byid_row_sql(r) for r in relation_rows], _EMPTY_REL_BYID)
+            write(
+                paths["tombstones"],
+                [tombstone_row_sql(t["type"], t["id"], t["prev_cell"], t["seq"]) for t in tombstones],
+                _EMPTY_TOMBSTONES,
+            )
+            return paths, {
+                "node": len(node_rows), "way": len(way_rows), "relation": len(relation_rows),
+            }
+
+        # -- week tier ----------------------------------------------------
+        week_seq_from, week_seq_to = 2, 100
+        week_ts = "2026-09-19T06:00:00Z"
+        week_node_rows = [
+            {
+                "id": info.delta_modified_node_id, "deleted": False, "cell": "000", "prev_cell": "000",
+                "seq": week_seq_to, "lat": node_by_id[info.delta_modified_node_id]["lat"],
+                "lon": node_by_id[info.delta_modified_node_id]["lon"],
+                "tags": info.delta_modified_node_week_tags,
+                "version": 3, "changeset": 90001, "timestamp": "2026-09-19 06:00:00", "uid": 501, "user": "tester1",
+            },
+            {
+                "id": info.delta_moved_deleted_node_id, "deleted": False,
+                "cell": info.delta_moved_deleted_node_to_cell, "prev_cell": info.delta_moved_deleted_node_from_cell,
+                "seq": week_seq_to, "lat": _inset_point(leaf_bbox[info.delta_moved_deleted_node_to_cell], 0.5, 0.5)[1],
+                "lon": _inset_point(leaf_bbox[info.delta_moved_deleted_node_to_cell], 0.5, 0.5)[0],
+                "tags": None, "version": 2, "changeset": 90002, "timestamp": "2026-09-19 06:00:00",
+                "uid": 501, "user": "tester1",
+            },
+            {
+                "id": info.delta_moved_only_node_id, "deleted": False,
+                "cell": info.delta_moved_only_node_to_cell, "prev_cell": info.delta_moved_only_node_from_cell,
+                "seq": week_seq_to, "lat": _inset_point(leaf_bbox[info.delta_moved_only_node_to_cell], 0.6, 0.4)[1],
+                "lon": _inset_point(leaf_bbox[info.delta_moved_only_node_to_cell], 0.6, 0.4)[0],
+                "tags": None, "version": 2, "changeset": 90003, "timestamp": "2026-09-19 06:00:00",
+                "uid": 501, "user": "tester1",
+            },
+        ]
+        week_way_rows = [
+            {
+                "id": info.delta_deleted_way_id, "deleted": True, "cell": info.delta_deleted_way_cell,
+                "prev_cell": info.delta_deleted_way_cell, "seq": week_seq_to,
+            },
+            {
+                "id": info.delta_new_way_id, "deleted": False, "cell": info.delta_new_way_cell, "prev_cell": None,
+                "seq": week_seq_to, "refs": info.delta_new_way_refs, "tags": {"highway": "path"},
+                "version": 1, "changeset": 90004, "timestamp": "2026-09-19 06:00:00", "uid": 501, "user": "tester1",
+            },
+        ]
+        week_tombstones = [
+            {"type": "node", "id": info.delta_moved_deleted_node_id,
+             "prev_cell": info.delta_moved_deleted_node_from_cell, "seq": week_seq_to},
+            {"type": "node", "id": info.delta_moved_only_node_id,
+             "prev_cell": info.delta_moved_only_node_from_cell, "seq": week_seq_to},
+            {"type": "way", "id": info.delta_deleted_way_id,
+             "prev_cell": info.delta_deleted_way_cell, "seq": week_seq_to},
+        ]
+        week_paths, week_rows_count = write_delta_tier(
+            "week", info.delta_week_version, week_node_rows, week_way_rows, [], week_tombstones
+        )
+
+        # -- day tier -------------------------------------------------------
+        day_seq_from, day_seq_to = week_seq_to + 1, 500
+        day_ts = "2026-09-19T12:00:00Z"
+        new_way_wkt, new_way_bbox = way_geometry_and_bbox(info.delta_new_way_refs)
+        day_node_rows = [
+            {
+                "id": info.delta_modified_node_id, "deleted": False, "cell": "000", "prev_cell": "000",
+                "seq": day_seq_to, "lat": node_by_id[info.delta_modified_node_id]["lat"],
+                "lon": node_by_id[info.delta_modified_node_id]["lon"],
+                "tags": info.delta_modified_node_day_tags,
+                "version": 4, "changeset": 90101, "timestamp": "2026-09-19 12:00:00", "uid": 502, "user": "tester2",
+            },
+        ]
+        day_relation_rows = [
+            {
+                "id": info.delta_new_relation_id, "deleted": False, "cell": info.delta_new_relation_cell,
+                "prev_cell": None, "seq": day_seq_to,
+                "members": [
+                    {"type": "w", "ref": info.delta_new_relation_way_member_id, "role": "outer"},
+                    {"type": "n", "ref": info.delta_new_relation_node_member_id, "role": "label"},
+                ],
+                "tags": {"type": "multipolygon", "leisure": "park", "name": "New Park (day)"},
+                "version": 1, "changeset": 90102, "timestamp": "2026-09-19 12:00:00", "uid": 502, "user": "tester2",
+                "bbox": (
+                    min(new_way_bbox[0], node_by_id[info.delta_new_relation_node_member_id]["lon"]),
+                    min(new_way_bbox[1], node_by_id[info.delta_new_relation_node_member_id]["lat"]),
+                    max(new_way_bbox[2], node_by_id[info.delta_new_relation_node_member_id]["lon"]),
+                    max(new_way_bbox[3], node_by_id[info.delta_new_relation_node_member_id]["lat"]),
+                ) if new_way_bbox[0] is not None else (None, None, None, None),
+            },
+        ]
+        day_paths, day_rows_count = write_delta_tier(
+            "day", info.delta_day_version, day_node_rows, [], day_relation_rows, []
+        )
+
+        # -- hour tier ------------------------------------------------------
+        hour_seq_from, hour_seq_to = day_seq_to + 1, 520
+        hour_ts = "2026-09-19T12:45:00Z"
+        hour_node_rows = [
+            {
+                "id": info.delta_moved_deleted_node_id, "deleted": True,
+                "cell": info.delta_moved_deleted_node_to_cell, "prev_cell": info.delta_moved_deleted_node_to_cell,
+                "seq": hour_seq_to,
+            },
+        ]
+        hour_way_rows = [
+            {
+                "id": info.delta_modified_refs_way_id, "deleted": False, "cell": "000", "prev_cell": "000",
+                "seq": hour_seq_to, "refs": info.delta_modified_refs_way_new_refs,
+                "tags": next(w for w in ways if w["id"] == info.delta_modified_refs_way_id)["tags"],
+                "version": info.delta_modified_refs_way_new_version, "changeset": 90201,
+                "timestamp": "2026-09-19 12:45:00", "uid": 503, "user": "tester3",
+            },
+        ]
+        hour_tombstones = [
+            {"type": "node", "id": info.delta_moved_deleted_node_id,
+             "prev_cell": info.delta_moved_deleted_node_to_cell, "seq": hour_seq_to},
+        ]
+        hour_paths, hour_rows_count = write_delta_tier(
+            "hour", info.delta_hour_version, hour_node_rows, hour_way_rows, [], hour_tombstones
+        )
+
+        manifest["manifest_version"] = 3
+        manifest["replication_source"] = REPLICATION_SOURCE
+        manifest["replication_sequence"] = hour_seq_to
+        manifest["timestamp_osm_base"] = hour_ts
+        manifest["deltas"] = {
+            "week": {
+                "version": info.delta_week_version, "seq_from": week_seq_from, "seq_to": week_seq_to,
+                "timestamp": week_ts, "rows": week_rows_count, "files": week_paths,
+            },
+            "day": {
+                "version": info.delta_day_version, "seq_from": day_seq_from, "seq_to": day_seq_to,
+                "timestamp": day_ts, "rows": day_rows_count, "files": day_paths,
+            },
+            "hour": {
+                "version": info.delta_hour_version, "seq_from": hour_seq_from, "seq_to": hour_seq_to,
+                "timestamp": hour_ts, "rows": hour_rows_count, "files": hour_paths,
+            },
         }
 
     # -------------------------------------------------------------- manifest
