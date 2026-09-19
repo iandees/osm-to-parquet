@@ -63,6 +63,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
             memory_limit=args.memory_limit,
             tmpdir=args.tmpdir,
             mode=_copy_mode(args),
+            extent=args.extent,
         )
         build_from_raw(opts)
         return 0
@@ -183,6 +184,9 @@ def main(argv: list[str] | None = None) -> int:
     p_build.add_argument("input", help="PBF path, or a raw/ dir when --raw is given")
     p_build.add_argument("root")
     p_build.add_argument("--bbox", type=_parse_bbox, default=None, help="S,W,N,E (ignored with --raw)")
+    p_build.add_argument("--extent", type=_parse_bbox, default=None,
+                         help="S,W,N,E intended coverage recorded in the manifest (with --raw); "
+                              "defaults to the data bbox, which is wider than the cut bbox for extracts")
     p_build.add_argument("--generation", default=None)
     p_build.add_argument("--max-nodes-per-cell", type=int, default=1_000_000, help="ignored with --raw")
     p_build.add_argument("--max-depth", type=int, default=cells_mod.DEFAULT_MAX_DEPTH_V2, help="ignored with --raw")

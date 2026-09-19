@@ -108,6 +108,10 @@ class BuildFromRawOptions:
     memory_limit: Optional[str] = None
     tmpdir: Optional[str] = None
     mode: str = "link"  # link|copy|move
+    extent: Optional[tuple[float, float, float, float]] = None  # (S, W, N, E): the intended
+    # coverage of a regional dataset; the updater keeps new elements inside it. Defaults to the
+    # data bbox from raw/summary.json, which is wider than the cut bbox for extracts because a
+    # kept way keeps all of its nodes.
 
 
 def build_from_raw(opts: BuildFromRawOptions) -> manifest_mod.Manifest:
@@ -205,7 +209,7 @@ def build_from_raw(opts: BuildFromRawOptions) -> manifest_mod.Manifest:
     else:
         timestamp_osm_base = "1970-01-01T00:00:00Z"
 
-    extent = raw_summary.get("extent") or [0.0, 0.0, 0.0, 0.0]
+    extent = list(opts.extent) if opts.extent else (raw_summary.get("extent") or [0.0, 0.0, 0.0, 0.0])
 
     n_nodes = sum(p["rows"] for p in node_byid_manifest)
     n_tagged_nodes = sum(
