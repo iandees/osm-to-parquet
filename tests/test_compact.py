@@ -186,7 +186,7 @@ def _spatial_node_paths(man: dict, root: Path) -> list[str]:
 def test_compact_writes_new_generation_with_empty_deltas(built_root, compacted):
     assert compacted["generation"] != "g0001"
     assert compacted["deltas"] == {}
-    assert compacted["manifest_version"] == 3
+    assert compacted["manifest_version"] == 4  # base is v4 (areas) since M3
 
 
 def test_validate_passes_on_compacted_generation(built_root, compacted):

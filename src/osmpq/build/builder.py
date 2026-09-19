@@ -59,6 +59,7 @@ class BuildOptions:
     memory_limit: Optional[str] = None
     tmpdir: Optional[str] = None
     mode: str = "link"  # link|copy|move, for placing the intermediate raw/ files
+    run_areas: bool = True  # docs/m3-contracts.md section 4.3: run `osmpq areas` at the end
 
 
 def build(opts: BuildOptions) -> manifest_mod.Manifest:
@@ -88,6 +89,7 @@ def build(opts: BuildOptions) -> manifest_mod.Manifest:
         memory_limit=opts.memory_limit,
         tmpdir=str(tmpdir / "build-from-raw-tmp"),
         mode=opts.mode,
+        run_areas=opts.run_areas,
     )
     return build_from_raw(from_raw_opts)
 
@@ -108,6 +110,7 @@ class BuildFromRawOptions:
     memory_limit: Optional[str] = None
     tmpdir: Optional[str] = None
     mode: str = "link"  # link|copy|move
+    run_areas: bool = True  # docs/m3-contracts.md section 4.3: run `osmpq areas` at the end
     extent: Optional[tuple[float, float, float, float]] = None  # (S, W, N, E): the intended
     # coverage of a regional dataset; the updater keeps new elements inside it. Defaults to the
     # data bbox from raw/summary.json, which is wider than the cut bbox for extracts because a
@@ -243,12 +246,31 @@ def build_from_raw(opts: BuildFromRawOptions) -> manifest_mod.Manifest:
             "bytes": bytes_by_kind,
         },
     )
-    manifest_mod.write_manifest(opts.root, man, gen_number)
-    _log(f"wrote manifest/{gen_number}.json and manifest/LATEST")
-    _log(f"done in {time.time()-t_start:.1f}s total")
     con.close()
     if db_path.exists():
         db_path.unlink()
+
+    if opts.run_areas:
+        # docs/m3-contracts.md section 4.3: `osmpq build` derives areas at
+        # the end unless `--no-areas`. Folded into this build's single
+        # manifest (v4) rather than writing a second one, so manifest
+        # numbering stays "one build, one manifest".
+        from osmpq.build import areas as areas_mod
+        from osmpq.engine import catalog
+
+        areas_tmpdir = tmpdir / "areas-tmp"
+        areas_tmpdir.mkdir(parents=True, exist_ok=True)
+        acon = areas_mod._connect(opts.threads, opts.memory_limit, areas_tmpdir)
+        cat_manifest = catalog.Manifest(root=str(opts.root), data=man.to_dict())
+        man.areas = areas_mod.build_areas_for_manifest(acon, Path(opts.root), cat_manifest, promoted_keys)
+        acon.close()
+        man.manifest_version = 4
+        man.stats["areas"] = man.areas["index"]["rows"]
+        _log(f"derived {man.stats['areas']} area(s) across {len(man.areas['cells'])} cell(s)")
+
+    manifest_mod.write_manifest(opts.root, man, gen_number)
+    _log(f"wrote manifest/{gen_number}.json and manifest/LATEST")
+    _log(f"done in {time.time()-t_start:.1f}s total")
     return man
 
 

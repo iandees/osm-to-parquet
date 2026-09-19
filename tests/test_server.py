@@ -82,7 +82,9 @@ def test_interpreter_parse_error_400(client):
 
 
 def test_interpreter_unsupported_400(client):
-    resp = client.get("/api/interpreter", params={"data": "[out:json];area[name=Foo];out;"})
+    # `[date:"..."]` (attic, M4) is still rejected by `planner.check_settings`;
+    # picked as a still-unsupported construct to exercise the generic 400 path.
+    resp = client.get("/api/interpreter", params={"data": '[out:json][date:"2020-01-01T00:00:00Z"];node[amenity=cafe];out;'})
     assert resp.status_code == 400
     assert "text/html" in resp.headers["content-type"]
 

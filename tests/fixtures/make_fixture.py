@@ -27,6 +27,8 @@ import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
+from osmpq.build.areas import build_areas_for_manifest  # noqa: E402
+from osmpq.engine.catalog import Manifest as EngineManifest  # noqa: E402
 from osmpq.engine.catalog import cell_bbox  # noqa: E402
 from osmpq.engine.hilbert import bbox_e7_center_hilbert, lonlat_to_hilbert  # noqa: E402
 
@@ -247,6 +249,34 @@ class FixtureInfo:
     delta_new_way_no_base_cell: str = ""
     delta_new_way_no_base_cell_bbox: tuple = None
     delta_new_way_no_base_cell_refs: list = field(default_factory=list)
+    # -- manifest_version=4 only (areas, docs/m3-contracts.md section 4) ---
+    # A named park, fully inside leaf "000": way area -> id = way_id +
+    # 2400000000.
+    area_park_way_id: int = 0
+    area_park_area_id: int = 0
+    area_park_inside_node_id: int = 0
+    area_park_outside_node_id: int = 0
+    area_park_crossing_way_id: int = 0
+    area_park_relation_id: int = 0
+    # A `landuse` way (no name) spanning leaves "000"/"002", like
+    # `spanning_way_id` -- exercises v2 loose placement for an area.
+    area_landuse_way_id: int = 0
+    area_landuse_area_id: int = 0
+    # `closed_way_id` (101, tags={"building": "yes"} only) is the
+    # bare-building-exclusion fixture: is_area=true, no qualifying key ->
+    # no area is derived for it.
+    # A multipolygon relation with an inner ring (hole): outer/inner member
+    # ways, a point strictly inside the hole (must NOT match the area) and
+    # one inside the outer ring but outside the hole (must match).
+    area_multipolygon_relation_id: int = 0
+    area_multipolygon_area_id: int = 0
+    area_multipolygon_outer_way_id: int = 0
+    area_multipolygon_inner_way_id: int = 0
+    area_hole_point: tuple = None  # (lat, lon), inside the hole -> not in the area
+    area_ring_point: tuple = None  # (lat, lon), inside the ring but outside the hole -> in the area
+    # A `type=boundary` relation (single outer ring, no hole).
+    area_boundary_relation_id: int = 0
+    area_boundary_area_id: int = 0
 
 
 def build(
@@ -260,8 +290,13 @@ def build(
     cell-placement adjustments" block below), a brand-new disjoint trap
     region for the ancestor-depth rule, metadata on untagged nodes
     (including one deliberately all-NULL), and the row-group index side
-    files, per docs/m1-contracts.md sections 2/4/5."""
-    if manifest_version not in (1, 2, 3):
+    files, per docs/m1-contracts.md sections 2/4/5. `manifest_version=4`:
+    the v2 base (no delta tiers) plus area-worthy ways/relations, with
+    `index/areas.parquet` derived by the real `osmpq.build.areas` code
+    against the fixture's own on-disk layout (docs/m3-contracts.md section
+    4.5) -- not fabricated by hand, so these tests also exercise
+    derivation itself."""
+    if manifest_version not in (1, 2, 3, 4):
         raise ValueError(f"unsupported manifest_version {manifest_version!r}")
     root = Path(root_dir)
     root.mkdir(parents=True, exist_ok=True)
@@ -445,6 +480,96 @@ def build(
         })
         info.trap_way_id = TRAP_WAY_ID
 
+    # ----------------------------------------- v4 area-worthy ways (4.5)
+    if manifest_version >= 4:
+        park_ring_ids = [alloc() for _ in range(4)]
+        park_bbox = leaf_bbox["000"]
+        park_coords = [(0.05, 0.05), (0.05, 0.30), (0.30, 0.30), (0.30, 0.05)]
+        for nid, (flat, flon) in zip(park_ring_ids, park_coords):
+            lon, lat = _inset_point(park_bbox, frac_lat=flat, frac_lon=flon)
+            nodes.append({"id": nid, "lon": lon, "lat": lat, "cell": "000", "tags": None})
+        park_way_id = alloc()
+        ways.append({
+            "id": park_way_id,
+            "refs": park_ring_ids + [park_ring_ids[0]],
+            "tags": {"leisure": "park", "name": "Fixture Park"},
+            "cell": "000",
+        })
+        info.area_park_way_id = park_way_id
+
+        park_inside_id, park_outside_id = alloc(), alloc()
+        pin_lon, pin_lat = _inset_point(park_bbox, frac_lat=0.15, frac_lon=0.15)
+        pout_lon, pout_lat = _inset_point(park_bbox, frac_lat=0.90, frac_lon=0.90)
+        nodes.append({"id": park_inside_id, "lon": pin_lon, "lat": pin_lat, "cell": "000", "tags": None})
+        nodes.append({"id": park_outside_id, "lon": pout_lon, "lat": pout_lat, "cell": "000", "tags": None})
+        info.area_park_inside_node_id = park_inside_id
+        info.area_park_outside_node_id = park_outside_id
+
+        # A way crossing the park (for `way(area.a)`): one endpoint inside
+        # the park ring, one outside it.
+        park_way_cross_id = alloc()
+        ways.append({
+            "id": park_way_cross_id, "refs": [park_inside_id, park_outside_id],
+            "tags": {"highway": "path"}, "cell": "000",
+        })
+        info.area_park_crossing_way_id = park_way_cross_id
+
+        # landuse way (no `name`, still qualifies via `landuse`) spanning
+        # leaves "000"/"002", like `spanning_way_id` -- exercises v2 loose
+        # placement for an area.
+        lu_a, lu_b, lu_c, lu_d = alloc(), alloc(), alloc(), alloc()
+        a_lon, a_lat = _inset_point(leaf_bbox["000"], 0.80, 0.80)
+        b_lon, b_lat = _inset_point(leaf_bbox["000"], 0.80, 0.90)
+        c_lon, c_lat = _inset_point(leaf_bbox["002"], 0.20, 0.20)
+        d_lon, d_lat = _inset_point(leaf_bbox["002"], 0.20, 0.10)
+        nodes.append({"id": lu_a, "lon": a_lon, "lat": a_lat, "cell": "000", "tags": None})
+        nodes.append({"id": lu_b, "lon": b_lon, "lat": b_lat, "cell": "000", "tags": None})
+        nodes.append({"id": lu_c, "lon": c_lon, "lat": c_lat, "cell": "002", "tags": None})
+        nodes.append({"id": lu_d, "lon": d_lon, "lat": d_lat, "cell": "002", "tags": None})
+        landuse_way_id = alloc()
+        ways.append({
+            "id": landuse_way_id,
+            "refs": [lu_a, lu_b, lu_c, lu_d, lu_a],
+            "tags": {"landuse": "forest"},
+            "cell": "00",  # promoted to "root" by the v2 cell-placement block below, like way 110
+        })
+        info.area_landuse_way_id = landuse_way_id
+
+        # Multipolygon-with-a-hole: an outer ring and a smaller inner ring
+        # fully inside it, both untagged (only the *relation*'s tags matter
+        # for 4.1's multipolygon rule).
+        outer_ids = [alloc() for _ in range(4)]
+        outer_coords = [(0.40, 0.40), (0.40, 0.65), (0.65, 0.65), (0.65, 0.40)]
+        for nid, (flat, flon) in zip(outer_ids, outer_coords):
+            lon, lat = _inset_point(leaf_bbox["000"], frac_lat=flat, frac_lon=flon)
+            nodes.append({"id": nid, "lon": lon, "lat": lat, "cell": "000", "tags": None})
+        outer_way_id = alloc()
+        ways.append({"id": outer_way_id, "refs": outer_ids + [outer_ids[0]], "tags": {}, "cell": "000"})
+        info.area_multipolygon_outer_way_id = outer_way_id
+
+        inner_ids = [alloc() for _ in range(4)]
+        inner_coords = [(0.48, 0.48), (0.48, 0.57), (0.57, 0.57), (0.57, 0.48)]
+        for nid, (flat, flon) in zip(inner_ids, inner_coords):
+            lon, lat = _inset_point(leaf_bbox["000"], frac_lat=flat, frac_lon=flon)
+            nodes.append({"id": nid, "lon": lon, "lat": lat, "cell": "000", "tags": None})
+        inner_way_id = alloc()
+        ways.append({"id": inner_way_id, "refs": inner_ids + [inner_ids[0]], "tags": {}, "cell": "000"})
+        info.area_multipolygon_inner_way_id = inner_way_id
+
+        hole_lon, hole_lat = _inset_point(leaf_bbox["000"], frac_lat=0.525, frac_lon=0.525)
+        info.area_hole_point = (hole_lat, hole_lon)
+        ring_lon, ring_lat = _inset_point(leaf_bbox["000"], frac_lat=0.44, frac_lon=0.44)
+        info.area_ring_point = (ring_lat, ring_lon)
+
+        # A `type=boundary` relation (single outer ring, no hole).
+        boundary_ids = [alloc() for _ in range(4)]
+        boundary_coords = [(0.70, 0.70), (0.70, 0.92), (0.92, 0.92), (0.92, 0.70)]
+        for nid, (flat, flon) in zip(boundary_ids, boundary_coords):
+            lon, lat = _inset_point(leaf_bbox["000"], frac_lat=flat, frac_lon=flon)
+            nodes.append({"id": nid, "lon": lon, "lat": lat, "cell": "000", "tags": None})
+        boundary_way_id = alloc()
+        ways.append({"id": boundary_way_id, "refs": boundary_ids + [boundary_ids[0]], "tags": {}, "cell": "000"})
+
     info.open_way_ids = [w["id"] for w in ways if w["id"] != 101]
     info.all_way_ids = [w["id"] for w in ways]
 
@@ -525,6 +650,39 @@ def build(
         "members": [{"type": "w", "ref": 112, "role": "outer"}],
         "tags": {"type": "multipolygon", "leisure": "park"},
     })
+    # v4 area-worthy relations (4.5): a multipolygon with a hole, and a
+    # `type=boundary` relation.
+    if manifest_version >= 4:
+        multipolygon_relation_id = 208
+        relations.append({
+            "id": multipolygon_relation_id, "cell": "000",
+            "members": [
+                {"type": "w", "ref": info.area_multipolygon_outer_way_id, "role": "outer"},
+                {"type": "w", "ref": info.area_multipolygon_inner_way_id, "role": "inner"},
+            ],
+            "tags": {"type": "multipolygon", "name": "Fixture Multipolygon Hole"},
+        })
+        info.area_multipolygon_relation_id = multipolygon_relation_id
+
+        boundary_relation_id = 209
+        relations.append({
+            "id": boundary_relation_id, "cell": "000",
+            "members": [{"type": "w", "ref": boundary_way_id, "role": "outer"}],
+            "tags": {"type": "boundary", "boundary": "administrative", "admin_level": "8",
+                     "name": "Fixture Boundary"},
+        })
+        info.area_boundary_relation_id = boundary_relation_id
+
+        # A `route=bus` relation whose only member node sits inside the
+        # park -- for `rel[route=bus](area.a)` (corpus 38).
+        park_relation_id = 210
+        relations.append({
+            "id": park_relation_id, "cell": "000",
+            "members": [{"type": "n", "ref": info.area_park_inside_node_id, "role": "stop"}],
+            "tags": {"route": "bus", "name": "Fixture Park Bus Route"},
+        })
+        info.area_park_relation_id = park_relation_id
+
     info.all_relation_ids = [r["id"] for r in relations]
 
     def relation_bbox(members: list[dict]):
@@ -1474,6 +1632,23 @@ def build(
                 "timestamp": hour_ts, "rows": hour_rows_count, "files": hour_paths, "cells": hour_cells,
             },
         }
+
+    # ----------------------------------------------------- areas (v4, 4.5)
+    # Derived by the real `osmpq.build.areas` code against the on-disk
+    # layout just written above -- not fabricated by hand -- so these
+    # tests exercise derivation itself (ring assembly incl. the hole, the
+    # way-area rule, and the bare-building exclusion).
+    if manifest_version == 4:
+        from osmpq.build.areas import RELATION_ID_OFFSET, WAY_ID_OFFSET
+
+        cat_manifest = EngineManifest(root=str(root), data=manifest)
+        areas_field = build_areas_for_manifest(con, root, cat_manifest, PROMOTED_KEYS)
+        manifest["areas"] = areas_field
+        manifest["stats"]["areas"] = areas_field["index"]["rows"]
+        info.area_park_area_id = info.area_park_way_id + WAY_ID_OFFSET
+        info.area_landuse_area_id = info.area_landuse_way_id + WAY_ID_OFFSET
+        info.area_multipolygon_area_id = info.area_multipolygon_relation_id + RELATION_ID_OFFSET
+        info.area_boundary_area_id = info.area_boundary_relation_id + RELATION_ID_OFFSET
 
     # -------------------------------------------------------------- manifest
     manifest_dir = root / "manifest"

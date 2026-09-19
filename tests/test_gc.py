@@ -72,6 +72,11 @@ def _referenced_files(root: Path, manifest_number: int) -> set[str]:
             out.add(p["path"])
     for p in man.get("rowgroup_index", {}).values():
         out.add(p)
+    areas = man.get("areas") or {}
+    if areas.get("index"):
+        out.add(areas["index"]["path"])
+    for entry in areas.get("cells", {}).values():
+        out.add(entry["path"])
     return out
 
 

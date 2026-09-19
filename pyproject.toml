@@ -21,6 +21,7 @@ dependencies = [
   # -- it only worked in this sandbox because the system Python already
   # had it installed some other way.
   "osmium",
+  "shapely>=2",
 ]
 
 [project.optional-dependencies]

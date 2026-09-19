@@ -213,7 +213,25 @@ class Manifest:
         return bool(self.delta_tiers())
 
     def table_cells(self, table: str) -> dict:
+        if table == "area":
+            # docs/m3-contracts.md section 4.2: areas are a top-level
+            # `areas: {"index": {...}, "cells": {...}}` manifest field
+            # (additive, not under `tables`), mirroring `tables.relation`'s
+            # `cells` shape only. Absent on a v1-v3 manifest, or a v4
+            # manifest `osmpq areas` hasn't populated yet -- both mean "no
+            # area cells" (empty dict), same as any other absent table.
+            return self.data.get("areas", {}).get("cells", {})
         return self.data.get("tables", {}).get(table, {}).get("cells", {})
+
+    @property
+    def area_index(self) -> Optional[dict]:
+        """The single `index/<gen>/areas.parquet` manifest entry
+        ({"path", "rows", "bytes"}), or None when areas are absent
+        (docs/m3-contracts.md section 4.2)."""
+        return self.data.get("areas", {}).get("index")
+
+    def has_areas(self) -> bool:
+        return bool(self.data.get("areas", {}).get("index"))
 
     def byid_parts(self, table: str) -> list[dict]:
         return list(self.data.get("byid", {}).get(table, []))
@@ -354,7 +372,7 @@ def cells_for_bbox(manifest: Manifest, table: str, bbox: Optional[BBox]) -> list
         return sorted(present)
     leaves = leaves_intersecting(manifest, bbox)
     wanted: set[str] = set()
-    if manifest.manifest_version >= 2 and table in ("way", "relation"):
+    if manifest.manifest_version >= 2 and table in ("way", "relation", "area"):
         depths = set(manifest.ancestor_depths)
         depths.add(0)
         for leaf in leaves:

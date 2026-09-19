@@ -34,6 +34,14 @@ def _referenced_paths(man: dict) -> set[str]:
             paths.add(p["path"])
     for p in (man.get("rowgroup_index") or {}).values():
         paths.add(p)
+    # docs/m3-contracts.md section 4.2: manifest v4 `areas` (index file +
+    # per-cell spatial files) is referenced like any other table.
+    areas = man.get("areas") or {}
+    if areas.get("index"):
+        paths.add(areas["index"]["path"])
+    for entry in (areas.get("cells") or {}).values():
+        if "path" in entry:
+            paths.add(entry["path"])
     for tier_info in (man.get("deltas") or {}).values():
         for kind, val in (tier_info.get("files") or {}).items():
             if isinstance(val, dict):

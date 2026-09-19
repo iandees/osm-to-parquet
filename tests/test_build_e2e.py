@@ -123,7 +123,7 @@ def test_raw_way_cells_obey_v2_placement_rule(rawdir, con):
 
 
 def test_manifest_is_v2_with_expected_fields(man):
-    assert man.manifest_version == 2
+    assert man.manifest_version == 4  # v4 since M3: areas derived at the end of build
     assert man.ancestor_depths == [0, 3, 6, 9, 12]
     assert man.max_depth == 13
     assert set(man.rowgroup_index) == {"node", "way", "relation"}
@@ -302,7 +302,7 @@ def test_cli_manifest_command_runs(built_root, capsys):
     out = capsys.readouterr().out
     assert "generation:" in out
     assert "leaf_cells:" in out
-    assert "manifest_version: 2" in out
+    assert "manifest_version: 4" in out
 
 
 def test_cli_validate_command_passes(built_root):
@@ -335,7 +335,7 @@ def test_m0_form_build_still_works(tmp_path_factory):
     )
     build(opts)
     man = manifest_mod.load_latest(str(root))
-    assert man.manifest_version == 2
+    assert man.manifest_version == 4  # v4 since M3: areas derived at the end of build
     assert man.producer.get("raw") == "osmpq raw-py"
     ok, summary = validate(str(root))
     assert ok, "\n".join(summary)

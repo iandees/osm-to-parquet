@@ -255,7 +255,7 @@ def _rows(con, path: str, cols: str = "*", where: Optional[str] = None) -> list[
 
 def test_first_run_upgrades_manifest_to_v3(root, run1):
     man = manifest_mod.load_latest(str(root))
-    assert man.manifest_version == 3
+    assert man.manifest_version == 4  # built roots are v4 (areas) since M3; deltas are additive
     assert man.replication_source == "https://fake.example/repl"
     assert man.replication_sequence == 1
     assert man.timestamp_osm_base == "2026-01-01T10:30:00Z"

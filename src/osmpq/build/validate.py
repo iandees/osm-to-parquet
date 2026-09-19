@@ -127,6 +127,55 @@ def validate(root: str) -> tuple[bool, list[str]]:
                         )
     info.append(f"checked {len(spatial_way_paths)} way + {len(spatial_relation_paths)} relation spatial files for cell placement")
 
+    # ---- 4b. areas (docs/m3-contracts.md section 4.2): spatial cell files,
+    # sorted (hilbert, id) like way/relation, and cell-contains-bbox / depth
+    # rule; the index file, sorted by id. ----------------------------------
+    if man.areas and man.areas.get("index"):
+        area_cells = man.areas.get("cells", {})
+        for cell, entry in area_cells.items():
+            rel_path = entry["path"]
+            full = root_path / rel_path
+            if not full.exists():
+                continue
+            bad = con.execute(f"""
+                SELECT count(*) FROM (
+                    SELECT hilbert, id, lag(hilbert) OVER () AS ph, lag(id) OVER () AS pid
+                    FROM read_parquet('{_esc(full)}')
+                ) WHERE ph IS NOT NULL AND (hilbert < ph OR (hilbert = ph AND id < pid))
+            """).fetchone()[0]
+            if bad:
+                problems.append(f"area spatial file not sorted by (hilbert, id): {rel_path} ({bad} out-of-order rows)")
+            rows = con.execute(
+                f"SELECT ymin_e7, xmin_e7, ymax_e7, xmax_e7 FROM read_parquet('{_esc(full)}') WHERE xmin_e7 IS NOT NULL"
+            ).fetchall()
+            for ymin, xmin, ymax, xmax in rows:
+                south, west, north, east = ymin / 1e7, xmin / 1e7, ymax / 1e7, xmax / 1e7
+                c_south, c_west, c_north, c_east = cells_mod.cell_bbox(cell)
+                if not (south >= c_south and west >= c_west and north <= c_north and east <= c_east):
+                    problems.append(f"area cell {cell} does not contain its bbox in {rel_path}")
+                    continue
+                if is_v2:
+                    depth = 0 if cell == cells_mod.ROOT else len(cell)
+                    if cell not in leaf_set and depth not in ancestor_depths:
+                        problems.append(
+                            f"area cell {cell} in {rel_path} is neither a leaf nor at an allowed ancestor depth {sorted(ancestor_depths)}"
+                        )
+        index_path = root_path / man.areas["index"]["path"]
+        if index_path.exists():
+            # Sorted, not *strictly* sorted: `id` (way_id + 2400000000 /
+            # relation_id + 3600000000, docs/m3-contracts.md section 4.1)
+            # is not guaranteed unique -- a way id >= ~1.2 billion (routine
+            # in modern OSM) can coincide with a relation's id plus its own
+            # offset, the same ambiguity real Overpass's own scheme has.
+            bad_idx = con.execute(f"""
+                SELECT count(*) FROM (
+                    SELECT id, lag(id) OVER () AS prev FROM read_parquet('{_esc(index_path)}')
+                ) WHERE prev IS NOT NULL AND id < prev
+            """).fetchone()[0]
+            if bad_idx:
+                problems.append(f"index/areas.parquet not sorted by id ({bad_idx} out-of-order rows)")
+        info.append(f"checked {len(area_cells)} area spatial file(s) + the area index")
+
     # ---- 5. row-group index coverage --------------------------------------------
     if is_v2 and man.rowgroup_index:
         import pyarrow.parquet as pq
@@ -199,4 +248,10 @@ def _paths_and_rows(man: manifest_mod.Manifest) -> list[tuple[str, int | None]]:
             out.append((p["path"], p.get("rows")))
     for path in man.rowgroup_index.values():
         out.append((path, None))
+    if man.areas:
+        index_entry = man.areas.get("index")
+        if index_entry:
+            out.append((index_entry["path"], index_entry.get("rows")))
+        for entry in man.areas.get("cells", {}).values():
+            out.append((entry["path"], entry.get("rows")))
     return out

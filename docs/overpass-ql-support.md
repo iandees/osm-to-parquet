@@ -95,3 +95,23 @@ T2 = milestone 3, T3 = milestone 5, T4 = attic (milestone 4), N = not planned.
 | `/api/status`, `/api/timestamp`, `/api/kill_my_queries` | T2 | |
 | Overpass XML query language (`<osm-script>`) | N | Could be added as a converter to the same AST later |
 | overpass turbo shortcuts (`{{bbox}}`, `{{geocodeArea}}`) | N | Expanded client-side by overpass turbo, not by the server |
+
+## Documented divergences
+
+- **`area` derivation vs. `areas.osm3s`** (docs/m3-contracts.md section
+  4.1): an area is derived from every `type=multipolygon`/`type=boundary`
+  relation whose member ways assemble into at least one valid ring, and
+  from every closed way with `is_area = true` that carries at least one of
+  `name`, `ref`, `admin_level`, `boundary`, `place`, `postal_code`,
+  `addr:postcode`, `landuse`, `natural`, `leisure`, `amenity`, `tourism`,
+  `historic`, `military`, `aeroway`, `water`, `area`. A closed way with
+  `is_area = true` but **none** of those keys (overwhelmingly bare
+  buildings -- `building=yes` and nothing else, of which the planet has on
+  the order of 600 million) gets **no** area of its own; Overpass's own
+  `areas.osm3s` recipe applies a similar exclusion for the same reason
+  (the area table would otherwise be dominated by uninteresting building
+  outlines). A relation needs no such qualifying key: any
+  multipolygon/boundary relation with a resolvable ring gets an area
+  regardless of its own tags (e.g. a multipolygon relation wrapping a bare
+  `building=yes` way still gets an area, even though that way would not on
+  its own).
