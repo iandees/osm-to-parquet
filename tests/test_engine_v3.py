@@ -112,6 +112,72 @@ def test_delta_tiers_precedence_order_hour_day_week():
     assert manifest.has_deltas() is True
 
 
+def test_delta_tiers_exposes_cells_per_type():
+    files_with_cells = _tier_files(7)
+    manifest = _hand_built_v3_manifest({
+        "week": {"version": 7, "seq_from": 1, "seq_to": 10, "timestamp": "2026-09-01T00:00:00Z",
+                  "rows": {"node": 1, "way": 1, "relation": 0}, "files": files_with_cells,
+                  "cells": {"node": ["000"], "way": ["000", "301"]}},
+    })
+    tiers = manifest.delta_tiers()
+    assert tiers[0]["cells"] == {"node": ["000"], "way": ["000", "301"], "relation": []}
+
+
+def test_delta_present_cells_unions_across_tiers():
+    manifest = _hand_built_v3_manifest({
+        "week": {"version": 1, "seq_from": 1, "seq_to": 5, "timestamp": "t",
+                  "rows": {}, "files": _tier_files(1), "cells": {"way": ["301"]}},
+        "day": {"version": 2, "seq_from": 6, "seq_to": 9, "timestamp": "t",
+                 "rows": {}, "files": _tier_files(2), "cells": {"way": ["302", "301"]}},
+    })
+    assert catalog.delta_present_cells(manifest, "way") == {"301", "302"}
+    assert catalog.delta_present_cells(manifest, "node") == set()
+
+
+def test_cells_for_bbox_finds_delta_only_cell_with_no_declared_leaf():
+    # "301" has no leaf declared beneath it anywhere in `leaf_cells` (unlike
+    # a base ancestor cell, which is always reachable by descending from
+    # one of its own real leaves) -- only `delta_present_cells` says it
+    # exists, so `cells_for_bbox` must check it directly against its own
+    # quadkey bbox instead of via the leaf-then-ancestor walk.
+    data = {
+        "manifest_version": 3, "generation": "g0001",
+        "leaf_cells": ["00000", "00001"],  # nothing under "301" at all
+        "ancestor_depths": [0, 3, 6, 9, 12], "max_depth": 13,
+        "tables": {"node": {"cells": {}}, "way": {"cells": {}}, "relation": {"cells": {}}},
+        "byid": {"node": [], "way": [], "relation": []},
+        "index": {"node_way": [], "member": []},
+        "deltas": {
+            "week": {"version": 1, "seq_from": 1, "seq_to": 1, "timestamp": "t", "rows": {},
+                      "files": _tier_files(1), "cells": {"way": ["301"]}},
+        },
+    }
+    manifest = catalog.Manifest(root="/nonexistent", data=data)
+    bbox = catalog.cell_bbox("301")
+    # A bbox strictly inside "301", away from any edge shared with a
+    # sibling cell.
+    s, w, n, e = bbox
+    inset = (s + (n - s) * 0.4, w + (e - w) * 0.4, s + (n - s) * 0.6, w + (e - w) * 0.6)
+    assert catalog.cells_for_bbox(manifest, "way", inset) == ["301"]
+    # A bbox far away (over the real leaves) must not spuriously match it.
+    assert "301" not in catalog.cells_for_bbox(manifest, "way", catalog.cell_bbox("00000"))
+
+
+def test_cells_for_bbox_unaffected_when_no_delta_tiers():
+    # Exactly test_engine_v2.py's v1 manifest, unaffected by the delta
+    # union (delta_present_cells is empty for a v1/v2 manifest).
+    data = {
+        "manifest_version": 1, "generation": "g0001", "leaf_cells": ["00000", "00001"],
+        "tables": {"node": {"cells": {}}, "way": {"cells": {
+            "root": {"path": "w-root.parquet"}, "0": {"path": "w-0.parquet"},
+        }}, "relation": {"cells": {}}},
+        "byid": {"node": [], "way": [], "relation": []},
+        "index": {"node_way": [], "member": []},
+    }
+    manifest = catalog.Manifest(root="/nonexistent", data=data)
+    assert catalog.cells_for_bbox(manifest, "way", catalog.cell_bbox("00000")) == ["0", "root"]
+
+
 # --------------------------------------------------------------------------
 # sources.current_rows / byid_current_rows: no-tier path is byte-identical
 # to the pre-M2 SQL shape (docs/m2-contracts.md section 4's "no extra
@@ -267,6 +333,24 @@ def test_new_way_spanning_two_leaves_queryable_by_id(engine_v3, fixture_v3):
     assert el["type"] == "way"
     assert el["nodes"] == fixture_v3.delta_new_way_refs
     assert "geometry" in el and len(el["geometry"]) == 2
+
+
+def test_new_way_at_cell_with_no_base_file_found_by_bbox(engine_v3, fixture_v3):
+    # docs/m2-contracts.md follow-up: the updater can place a brand-new
+    # element at an allowed ancestor/leaf cell the base has never written
+    # a file for; `deltas.<tier>.cells` is what lets a bbox query discover
+    # it before the next compaction (cells_for_bbox/delta_present_cells).
+    manifest = catalog.load_manifest(fixture_v3.root)
+    assert fixture_v3.delta_new_way_no_base_cell not in manifest.table_cells("way")
+    assert fixture_v3.delta_new_way_no_base_cell in catalog.delta_present_cells(manifest, "way")
+
+    b = bbox_args(fixture_v3.delta_new_way_no_base_cell_bbox)
+    r = engine_v3.run(f"[out:json];way({b});out ids;")
+    assert ids_of(r.elements) == [fixture_v3.delta_new_way_no_base_cell_id]
+
+    r2 = engine_v3.run(f"[out:json];way({fixture_v3.delta_new_way_no_base_cell_id});out;")
+    assert len(r2.elements) == 1
+    assert r2.elements[0]["tags"] == {"building": "yes"}
 
 
 def test_new_way_reachable_backward_from_its_node(engine_v3, fixture_v3):

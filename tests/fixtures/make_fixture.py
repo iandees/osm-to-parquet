@@ -238,6 +238,15 @@ class FixtureInfo:
     delta_modified_refs_way_id: int = 0
     delta_modified_refs_way_new_refs: list = field(default_factory=list)
     delta_modified_refs_way_new_version: int = 0
+    # week creates this way at an *allowed ancestor cell the base has no
+    # file for at all* (depth 3, a sibling of TRAP_WAY_CELL with no leaves
+    # declared beneath it) -- docs/m2-contracts.md follow-up: the updater
+    # can place a new element somewhere the base has never written to, and
+    # a bbox query must still find it via `deltas.<tier>.cells`.
+    delta_new_way_no_base_cell_id: int = 0
+    delta_new_way_no_base_cell: str = ""
+    delta_new_way_no_base_cell_bbox: tuple = None
+    delta_new_way_no_base_cell_refs: list = field(default_factory=list)
 
 
 def build(
@@ -964,6 +973,29 @@ def build(
         info.delta_modified_refs_way_new_refs = [1, 4, 8, modified_way_extra_node]
         info.delta_modified_refs_way_new_version = 99
 
+        # A depth-3 ancestor cell with *no* declared leaves beneath it at
+        # all (unlike TRAP_WAY_CELL="300", which sits above the real
+        # V2_TRAP_LEAVES) and no base way file either -- the base has
+        # never written anything there. Two synthetic node ids (not part
+        # of the base fixture, only used here to give this one delta way a
+        # real, resolvable bbox/geometry) sit inside it.
+        NO_BASE_CELL = "301"
+        no_base_cell_bbox = cell_bbox(NO_BASE_CELL)
+        no_base_node_a_id, no_base_node_b_id = 9201, 9202
+        na_lon, na_lat = _inset_point(no_base_cell_bbox, 0.3, 0.3)
+        nb_lon, nb_lat = _inset_point(no_base_cell_bbox, 0.7, 0.7)
+        node_by_id[no_base_node_a_id] = {"id": no_base_node_a_id, "lon": na_lon, "lat": na_lat,
+                                          "cell": NO_BASE_CELL, "tags": None}
+        node_by_id[no_base_node_b_id] = {"id": no_base_node_b_id, "lon": nb_lon, "lat": nb_lat,
+                                          "cell": NO_BASE_CELL, "tags": None}
+        info.delta_new_way_no_base_cell_id = 9203
+        info.delta_new_way_no_base_cell = NO_BASE_CELL
+        info.delta_new_way_no_base_cell_bbox = no_base_cell_bbox
+        info.delta_new_way_no_base_cell_refs = [no_base_node_a_id, no_base_node_b_id]
+        assert NO_BASE_CELL not in manifest["tables"]["way"]["cells"], (
+            "fixture bug: NO_BASE_CELL must have no base way file"
+        )
+
         # -- generic row -> SQL builders --------------------------------
         def meta_literal_sql(version, changeset, ts, uid, user):
             return (
@@ -1003,17 +1035,26 @@ def build(
             )
 
         def node_byid_row_sql(row):
+            # M1's real byid node parts carry a stored `hilbert` (docs/
+            # m1-contracts.md section 3), unlike this engine's own byid
+            # reads, which recompute it via the `opq_node_hilbert` UDF
+            # (`sources._byid_cols`) and so never look at a stored column
+            # -- write it anyway, for fixture realism and so a reader that
+            # *does* use the stored column also works.
             if row["deleted"]:
                 payload = (
                     "NULL::INTEGER AS lat_e7, NULL::INTEGER AS lon_e7, "
-                    f"NULL::MAP(VARCHAR, VARCHAR) AS tags, {promoted_cols_sql(None)}, {meta_literal_null_sql()}"
+                    f"NULL::MAP(VARCHAR, VARCHAR) AS tags, {promoted_cols_sql(None)}, {meta_literal_null_sql()}, "
+                    "NULL::UBIGINT AS hilbert"
                 )
             else:
                 lat_e7, lon_e7 = to_e7(row["lat"]), to_e7(row["lon"])
+                h = lonlat_to_hilbert(row["lon"], row["lat"])
                 payload = (
                     f"{lat_e7} AS lat_e7, {lon_e7} AS lon_e7, {tags_literal(row['tags'])} AS tags, "
                     f"{promoted_cols_sql(row['tags'])}, "
-                    f"{meta_literal_sql(row['version'], row['changeset'], row['timestamp'], row['uid'], row['user'])}"
+                    f"{meta_literal_sql(row['version'], row['changeset'], row['timestamp'], row['uid'], row['user'])}, "
+                    f"{h}::UBIGINT AS hilbert"
                 )
             return (
                 f"SELECT {row['id']} AS id, {payload}, {cell_sql_of(row['cell'])} AS cell, "
@@ -1070,20 +1111,26 @@ def build(
             )
 
         def way_byid_row_sql(row):
+            # See node_byid_row_sql's comment: M1's real byid way parts
+            # carry a stored `hilbert` too; this engine recomputes it via
+            # `opq_bbox_hilbert` on read (`sources._byid_cols`) and never
+            # looks at the stored column, but write it for realism anyway.
             if row["deleted"]:
                 payload = (
                     "NULL::BIGINT[] AS refs, NULL::MAP(VARCHAR, VARCHAR) AS tags, "
                     f"{promoted_cols_sql(None)}, {meta_literal_null_sql()}, "
                     "NULL::INTEGER AS xmin_e7, NULL::INTEGER AS ymin_e7, "
                     "NULL::INTEGER AS xmax_e7, NULL::INTEGER AS ymax_e7, "
-                    "NULL::BOOLEAN AS is_closed, NULL::BOOLEAN AS is_area"
+                    "NULL::BOOLEAN AS is_closed, NULL::BOOLEAN AS is_area, NULL::UBIGINT AS hilbert"
                 )
             else:
                 _wkt, (xmin, ymin, xmax, ymax) = way_geometry_and_bbox(row["refs"])
                 if xmin is not None:
                     xmin_e7, ymin_e7, xmax_e7, ymax_e7 = to_e7(xmin), to_e7(ymin), to_e7(xmax), to_e7(ymax)
+                    h = bbox_e7_center_hilbert(xmin_e7, ymin_e7, xmax_e7, ymax_e7)
                 else:
                     xmin_e7 = ymin_e7 = xmax_e7 = ymax_e7 = "NULL::INTEGER"
+                    h = 0
                 refs_literal = "[" + ", ".join(str(r) for r in row["refs"]) + "]::BIGINT[]"
                 is_closed, is_area = _way_is_closed_area(row["refs"], row["tags"])
                 payload = (
@@ -1091,7 +1138,8 @@ def build(
                     f"{promoted_cols_sql(row['tags'])}, "
                     f"{meta_literal_sql(row['version'], row['changeset'], row['timestamp'], row['uid'], row['user'])}, "
                     f"{xmin_e7} AS xmin_e7, {ymin_e7} AS ymin_e7, {xmax_e7} AS xmax_e7, {ymax_e7} AS ymax_e7, "
-                    f"{str(is_closed).upper()} AS is_closed, {str(is_area).upper()} AS is_area"
+                    f"{str(is_closed).upper()} AS is_closed, {str(is_area).upper()} AS is_area, "
+                    f"{h}::UBIGINT AS hilbert"
                 )
             return (
                 f"SELECT {row['id']} AS id, {payload}, {cell_sql_of(row['cell'])} AS cell, "
@@ -1187,8 +1235,8 @@ def build(
         _EMPTY_NODE_BYID = (
             "SELECT NULL::BIGINT AS id, NULL::INTEGER AS lat_e7, NULL::INTEGER AS lon_e7, "
             "NULL::MAP(VARCHAR, VARCHAR) AS tags, " + promoted_cols_sql(None) + ", "
-            + meta_literal_null_sql() + ", NULL::VARCHAR AS cell, NULL::BOOLEAN AS deleted, "
-            "NULL::VARCHAR AS prev_cell, NULL::BIGINT AS seq WHERE FALSE"
+            + meta_literal_null_sql() + ", NULL::UBIGINT AS hilbert, NULL::VARCHAR AS cell, "
+            "NULL::BOOLEAN AS deleted, NULL::VARCHAR AS prev_cell, NULL::BIGINT AS seq WHERE FALSE"
         )
         _EMPTY_WAY_SPATIAL = (
             "SELECT NULL::BIGINT AS id, NULL::VARCHAR AS cell, NULL::BIGINT[] AS refs, "
@@ -1204,8 +1252,8 @@ def build(
             + promoted_cols_sql(None) + ", " + meta_literal_null_sql()
             + ", NULL::INTEGER AS xmin_e7, NULL::INTEGER AS ymin_e7, NULL::INTEGER AS xmax_e7, "
             "NULL::INTEGER AS ymax_e7, NULL::BOOLEAN AS is_closed, NULL::BOOLEAN AS is_area, "
-            "NULL::VARCHAR AS cell, NULL::BOOLEAN AS deleted, NULL::VARCHAR AS prev_cell, "
-            "NULL::BIGINT AS seq WHERE FALSE"
+            "NULL::UBIGINT AS hilbert, NULL::VARCHAR AS cell, NULL::BOOLEAN AS deleted, "
+            "NULL::VARCHAR AS prev_cell, NULL::BIGINT AS seq WHERE FALSE"
         )
         _EMPTY_REL_SPATIAL = (
             "SELECT NULL::BIGINT AS id, NULL::VARCHAR AS cell, "
@@ -1263,9 +1311,14 @@ def build(
                 [tombstone_row_sql(t["type"], t["id"], t["prev_cell"], t["seq"]) for t in tombstones],
                 _EMPTY_TOMBSTONES,
             )
+            cells = {
+                "node": sorted({r["cell"] for r in node_rows if r.get("cell")}),
+                "way": sorted({r["cell"] for r in way_rows if r.get("cell")}),
+                "relation": sorted({r["cell"] for r in relation_rows if r.get("cell")}),
+            }
             return paths, {
                 "node": len(node_rows), "way": len(way_rows), "relation": len(relation_rows),
-            }
+            }, cells
 
         # -- week tier ----------------------------------------------------
         week_seq_from, week_seq_to = 2, 100
@@ -1294,6 +1347,20 @@ def build(
                 "tags": None, "version": 2, "changeset": 90003, "timestamp": "2026-09-19 06:00:00",
                 "uid": 501, "user": "tester1",
             },
+            {
+                "id": no_base_node_a_id, "deleted": False, "cell": NO_BASE_CELL, "prev_cell": None,
+                "seq": week_seq_to, "lat": node_by_id[no_base_node_a_id]["lat"],
+                "lon": node_by_id[no_base_node_a_id]["lon"],
+                "tags": None, "version": 1, "changeset": 90005, "timestamp": "2026-09-19 06:00:00",
+                "uid": 501, "user": "tester1",
+            },
+            {
+                "id": no_base_node_b_id, "deleted": False, "cell": NO_BASE_CELL, "prev_cell": None,
+                "seq": week_seq_to, "lat": node_by_id[no_base_node_b_id]["lat"],
+                "lon": node_by_id[no_base_node_b_id]["lon"],
+                "tags": None, "version": 1, "changeset": 90005, "timestamp": "2026-09-19 06:00:00",
+                "uid": 501, "user": "tester1",
+            },
         ]
         week_way_rows = [
             {
@@ -1305,6 +1372,15 @@ def build(
                 "seq": week_seq_to, "refs": info.delta_new_way_refs, "tags": {"highway": "path"},
                 "version": 1, "changeset": 90004, "timestamp": "2026-09-19 06:00:00", "uid": 501, "user": "tester1",
             },
+            {
+                # Placed at NO_BASE_CELL ("301"): an allowed ancestor depth
+                # (3) the base has never written a way file for -- proves
+                # `cells_for_bbox`/`delta_present_cells` can discover a
+                # cell that exists only via `deltas.<tier>.cells`.
+                "id": info.delta_new_way_no_base_cell_id, "deleted": False, "cell": NO_BASE_CELL, "prev_cell": None,
+                "seq": week_seq_to, "refs": info.delta_new_way_no_base_cell_refs, "tags": {"building": "yes"},
+                "version": 1, "changeset": 90006, "timestamp": "2026-09-19 06:00:00", "uid": 501, "user": "tester1",
+            },
         ]
         week_tombstones = [
             {"type": "node", "id": info.delta_moved_deleted_node_id,
@@ -1314,7 +1390,7 @@ def build(
             {"type": "way", "id": info.delta_deleted_way_id,
              "prev_cell": info.delta_deleted_way_cell, "seq": week_seq_to},
         ]
-        week_paths, week_rows_count = write_delta_tier(
+        week_paths, week_rows_count, week_cells = write_delta_tier(
             "week", info.delta_week_version, week_node_rows, week_way_rows, [], week_tombstones
         )
 
@@ -1349,7 +1425,7 @@ def build(
                 ) if new_way_bbox[0] is not None else (None, None, None, None),
             },
         ]
-        day_paths, day_rows_count = write_delta_tier(
+        day_paths, day_rows_count, day_cells = write_delta_tier(
             "day", info.delta_day_version, day_node_rows, [], day_relation_rows, []
         )
 
@@ -1376,7 +1452,7 @@ def build(
             {"type": "node", "id": info.delta_moved_deleted_node_id,
              "prev_cell": info.delta_moved_deleted_node_to_cell, "seq": hour_seq_to},
         ]
-        hour_paths, hour_rows_count = write_delta_tier(
+        hour_paths, hour_rows_count, hour_cells = write_delta_tier(
             "hour", info.delta_hour_version, hour_node_rows, hour_way_rows, [], hour_tombstones
         )
 
@@ -1387,15 +1463,15 @@ def build(
         manifest["deltas"] = {
             "week": {
                 "version": info.delta_week_version, "seq_from": week_seq_from, "seq_to": week_seq_to,
-                "timestamp": week_ts, "rows": week_rows_count, "files": week_paths,
+                "timestamp": week_ts, "rows": week_rows_count, "files": week_paths, "cells": week_cells,
             },
             "day": {
                 "version": info.delta_day_version, "seq_from": day_seq_from, "seq_to": day_seq_to,
-                "timestamp": day_ts, "rows": day_rows_count, "files": day_paths,
+                "timestamp": day_ts, "rows": day_rows_count, "files": day_paths, "cells": day_cells,
             },
             "hour": {
                 "version": info.delta_hour_version, "seq_from": hour_seq_from, "seq_to": hour_seq_to,
-                "timestamp": hour_ts, "rows": hour_rows_count, "files": hour_paths,
+                "timestamp": hour_ts, "rows": hour_rows_count, "files": hour_paths, "cells": hour_cells,
             },
         }
 

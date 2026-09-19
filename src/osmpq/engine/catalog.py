@@ -159,7 +159,15 @@ class Manifest:
              "seq_from": ..., "seq_to": ..., "timestamp": ..., "rows": {...},
              "files": {"node": {"spatial": <abspath>, "byid": <abspath>},
                        "way": {...}, "relation": {...}},
-             "tombstones": <abspath>}
+             "tombstones": <abspath>,
+             "cells": {"node": [...], "way": [...], "relation": [...]}}
+
+        `cells` (added for the "new cell, no base file yet" follow-up) is
+        the updater/compactor-declared `deltas.<tier>.cells`: sorted lists
+        of cell keys that have at least one row in that tier's `<type>
+        .spatial.parquet`. Missing/absent per type or altogether (an
+        older or hand-built manifest) is just `[]` -- see
+        `delta_present_cells`.
 
         Every path is already resolved through `self.path` (joined with
         `self.root`), so callers never touch `join_root` themselves. A tier
@@ -184,6 +192,7 @@ class Manifest:
                 tf = files.get(t) or {}
                 resolved_files[t] = {k: self.path(v) for k, v in tf.items() if v}
             tomb = files.get("tombstones")
+            cells = tier.get("cells") or {}
             out.append(
                 {
                     "name": name,
@@ -195,6 +204,7 @@ class Manifest:
                     "rows": dict(tier.get("rows", {})),
                     "files": resolved_files,
                     "tombstones": self.path(tomb) if tomb else None,
+                    "cells": {t: list(cells.get(t, [])) for t in ("node", "way", "relation")},
                 }
             )
         return out
@@ -290,10 +300,34 @@ def _ancestor_at_depth(leaf_key: str, depth: int) -> str:
     return leaf_key[:depth]
 
 
+def delta_present_cells(manifest: Manifest, table: str) -> set[str]:
+    """Union, over every present delta tier, of the cell keys that tier's
+    manifest entry declares for `table` (`deltas.<tier>.cells.<table>`,
+    docs/m2-contracts.md section 3/4 follow-up): sorted lists of cells that
+    have at least one row in that tier's `<table>.spatial.parquet`, written
+    by the updater/compactor alongside the tier. Empty when there are no
+    delta tiers, or none declare `cells` (an older/hand-built manifest --
+    treated the same as "no extra cells", not an error).
+
+    This is what lets a query discover an element the updater placed in an
+    allowed cell (a leaf, or an ancestor at one of `ancestor_depths`) that
+    the *base* has no file for yet -- new data waiting for the next
+    compaction. Cheap: pure Python set-union over already-loaded manifest
+    JSON, no I/O."""
+    out: set[str] = set()
+    for tier in manifest.delta_tiers():
+        out.update(tier.get("cells", {}).get(table, []))
+    return out
+
+
 def cells_for_bbox(manifest: Manifest, table: str, bbox: Optional[BBox]) -> list[str]:
-    """Contract section 2 (v1) / m1-contracts.md section 2 and 6 (v2):
-    leaves intersecting bbox, plus ancestors, filtered to cells present for
-    `table`. bbox=None means "everything".
+    """Contract section 2 (v1) / m1-contracts.md section 2 and 6 (v2) /
+    m2-contracts.md section 4: leaves intersecting bbox, plus ancestors,
+    filtered to cells present for `table` -- where "present" is the base's
+    own cells *plus* every cell any delta tier declares rows for
+    (`delta_present_cells`), so a query's candidate cell list already
+    includes cells the base has no file for yet. bbox=None means
+    "everything".
 
     - Manifest v1 (or v2 for the `node` table, which is leaf-only by
       construction regardless of version -- section 2: nodes always live in
@@ -303,10 +337,21 @@ def cells_for_bbox(manifest: Manifest, table: str, bbox: Optional[BBox]) -> list
     - Manifest v2, `way`/`relation`: every intersecting leaf itself (an
       element can be stored exactly at a leaf), plus -- for each such leaf
       -- only the ancestors whose depth is in `ancestor_depths` (root, depth
-      0, is always included even if the manifest's list omits it)."""
-    present = manifest.table_cells(table)
+      0, is always included even if the manifest's list omits it).
+    - A cell that is present *only* via a delta tier's declaration may have
+      no leaf of its own beneath it in `manifest.leaf_cells` at all (e.g. a
+      brand-new way placed straight at an allowed ancestor cell no base
+      leaf has been split under), so it can never be reached by the
+      leaf-then-ancestor walk above; such cells are checked directly
+      against their own quadkey bbox instead. Skipped whenever nothing is
+      delta-only (every v1/v2 manifest, and any v3 manifest whose deltas
+      don't introduce a new cell), so this costs nothing in the common
+      case and never changes a manifest-without-deltas' output."""
+    base_present = manifest.table_cells(table)
+    present = set(base_present.keys())
+    present |= delta_present_cells(manifest, table)
     if bbox is None:
-        return sorted(present.keys())
+        return sorted(present)
     leaves = leaves_intersecting(manifest, bbox)
     wanted: set[str] = set()
     if manifest.manifest_version >= 2 and table in ("way", "relation"):
@@ -320,6 +365,10 @@ def cells_for_bbox(manifest: Manifest, table: str, bbox: Optional[BBox]) -> list
     else:
         for leaf in leaves:
             wanted.update(ancestors_and_self(leaf))
+    delta_only = present - set(base_present.keys())
+    for c in delta_only:
+        if c not in wanted and bbox_intersects(bbox, cell_bbox(c)):
+            wanted.add(c)
     return sorted(c for c in wanted if c in present)
 
 
