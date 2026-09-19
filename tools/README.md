@@ -84,6 +84,10 @@ row).
 
 - If the query is `out count`, the two `count` tag dicts are compared
   directly.
+- If the query is `timeline(...)` (any element has `"type": "timeline"`),
+  the two element lists are compared as a *multiset of tag dicts*, ignoring
+  the synthetic per-query `id` the reference numbers timeline entries with
+  (docs/m4-contracts.md section 7) -- see `compare_timeline()`.
 - Otherwise, elements are keyed by `(type, id)`. The harness compares:
   - the *set* of keys (missing = in reference but not local, extra =
     the reverse),
@@ -94,6 +98,41 @@ row).
 - An Overpass error response (an HTML parse-error body, or a 200 with a
   `remark`) is treated as a `FAIL` with that message, on whichever side
   produced it.
+
+### `[diff:]` / `[adiff:]` corpus entries
+
+A corpus query containing `[diff:` or `[adiff:` is graded differently
+(docs/m4-contracts.md section 7): the reference rejects `[out:json]` in
+diff/adiff mode with a static error, so both sides are asked for
+`[out:xml]` instead (`force_out_xml()`), regardless of what the entry
+declared or what `[out:json]`-forcing would otherwise do. The two XML
+responses are parsed into action lists (`parse_diff_actions()`: one
+`{"action": "create"|"modify"|"delete", "type", "id", "old", "new"}` dict
+per `<action>`, `old`/`new` element dicts in the same shape
+`parse_elements()` produces from JSON) and compared with
+`compare_diff_actions()`:
+
+- the *set* of `(action, type, id)` triples, the same missing/extra
+  treatment as the element-key comparison above;
+- for every triple present on both sides, its `old` and `new` element (when
+  present -- absent for `create`'s `old` and a genuine deletion's `new`;
+  a still-`visible` stub `<new>`/`<old>` the reference sometimes prints
+  under recursion is a normal element dict with empty tags and
+  `nodes: None`) compared with the same tolerances as the JSON path
+  (`compare_elements()`: tags as dicts, node lat/lon and way `nodes` id
+  lists, `geometry` point lists to the same tolerances).
+
+### Attic queries and `--date`
+
+`--date` exists to pin corpus 01-49 (which know nothing about attic
+settings) to the dataset's base timestamp on the reference side. A corpus
+entry that already carries its own attic time setting -- `[date:]`,
+`retro(...)`, `timeline(...)`, `[diff:]`/`[adiff:]` -- must not also get
+`--date` injected, since it already names the instant(s) it wants
+(`should_apply_date()` in `difftest.py` skips the insertion for these; a
+plain `(changed:a,b)` query keeps getting `--date`, unchanged from
+M0-M3). Corpus 50-58 (docs/m4-contracts.md section 7) exercise this: run
+them with `--date` set to anything and they are unaffected.
 
 Rate-limiting: reference calls are made one at a time with `--sleep`
 seconds between them, and any 429/504 (or a timeout) is retried with

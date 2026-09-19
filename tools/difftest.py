@@ -65,6 +65,43 @@ def is_xml_variant(query: str) -> bool:
     return bool(re.search(r"\[out:\s*xml\s*\]", query))
 
 
+def force_out_xml(query: str) -> str:
+    """Force [out:xml] for diff/adiff comparison purposes -- the reference
+    rejects [out:json] in diff/adiff mode with a static error
+    (docs/m4-contracts.md section 6.1), so both sides must be asked in XML
+    for a [diff:]/[adiff:] corpus entry regardless of what it declared."""
+    if re.search(r"\[out:\s*json\s*\]", query):
+        return re.sub(r"\[out:\s*json\s*\]", "[out:xml]", query, count=1)
+    if re.search(r"\[out:\s*xml\s*\]", query):
+        return query
+    return "[out:xml]" + query
+
+
+def is_diff_variant(query: str) -> bool:
+    """True for a corpus entry using [diff:] or [adiff:] (docs/m4-contracts.md
+    section 7): these are graded by the XML action-list comparator instead
+    of the JSON element-set comparator."""
+    return bool(re.search(r"\[diff:|\[adiff:", query))
+
+
+_ATTIC_OWN_DATE_RE = re.compile(r"\[date:|\bretro\(|\[diff:|\[adiff:|\btimeline\(")
+
+
+def should_apply_date(query: str) -> bool:
+    """--date is inserted on the reference side to pin corpus 01-49 (which
+    know nothing about attic settings) to the dataset's base timestamp. A
+    query that already carries its own attic time setting -- [date:],
+    retro(), timeline(), [diff:]/[adiff:] -- must NOT also get --date
+    injected: each already names the instant(s) it wants, and layering a
+    snapshot [date:] on top would misdate or conflict with it
+    (docs/m4-contracts.md section 7). A plain (changed:a,b) query (corpus
+    43 and 55) keeps the old M0-M3 behavior of getting --date applied --
+    its a/b are absolute values independent of the reference's current
+    state, exactly like (changed:) needs a live current state to compare
+    the range against."""
+    return not _ATTIC_OWN_DATE_RE.search(query)
+
+
 def is_csv_variant(query: str) -> bool:
     """`[out:csv(...)]` corpus entries are graded as a multiset of lines
     (docs/m3-contracts.md section 3.6), never forced to `[out:json]` like
@@ -318,9 +355,12 @@ class Comparison:
             "status": self.status,
             "ref_count": self.ref_count,
             "local_count": self.local_count,
-            "missing": [f"{t}/{i}" for t, i in self.missing[:5]],
+            # `missing`/`extra` are usually (type, id) pairs, but the
+            # diff/adiff action comparator below keys on (action, type, id)
+            # triples -- join whatever tuple shape shows up with "/".
+            "missing": ["/".join(str(x) for x in item) for item in self.missing[:5]],
             "missing_total": len(self.missing),
-            "extra": [f"{t}/{i}" for t, i in self.extra[:5]],
+            "extra": ["/".join(str(x) for x in item) for item in self.extra[:5]],
             "extra_total": len(self.extra),
             "tag_mismatches": self.tag_mismatches[:5],
             "tag_mismatches_total": len(self.tag_mismatches),
@@ -391,7 +431,57 @@ def compare_elements(ref_el: dict[str, Any], local_el: dict[str, Any]) -> list[s
     return problems
 
 
+def _classify_element_problems(
+    key: str, ref_el: dict[str, Any], local_el: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Run compare_elements() on one pair and split its problem strings into
+    (tag_mismatches, other_mismatches), the same split compare() has always
+    made -- factored out so the diff/adiff action comparator can reuse it."""
+    tag_mismatches: list[dict[str, Any]] = []
+    other_mismatches: list[str] = []
+    for p in compare_elements(ref_el, local_el):
+        if "tags differ" in p:
+            tag_mismatches.append({"element": key, "detail": p})
+        else:
+            other_mismatches.append(p)
+    return tag_mismatches, other_mismatches
+
+
+def compare_timeline(ref_elements: list[dict[str, Any]], local_elements: list[dict[str, Any]]) -> Comparison:
+    """`timeline(...)` results are compared as a set of tag dicts, ignoring
+    the synthetic per-query `id` (docs/m4-contracts.md section 7): the
+    reference numbers timeline entries 1, 2, 3, ... in whatever order it
+    emits them, which is not a stable cross-implementation identity the way
+    (type, id) is for ordinary elements. Each entry's tags (reftype, ref,
+    refversion, created, expired) fully describe the state, so a multiset
+    of tag dicts is the right comparison -- a Counter in case two states
+    ever come out with identical tags."""
+    ref_counter = Counter(frozenset((e.get("tags") or {}).items()) for e in ref_elements if e.get("type") == "timeline")
+    local_counter = Counter(
+        frozenset((e.get("tags") or {}).items()) for e in local_elements if e.get("type") == "timeline"
+    )
+    missing = list((ref_counter - local_counter).elements())
+    extra = list((local_counter - ref_counter).elements())
+    other_mismatches: list[str] = []
+    if missing:
+        other_mismatches.append(f"timeline states missing (in reference, not local): {[dict(m) for m in missing[:5]]}")
+    if extra:
+        other_mismatches.append(f"timeline states extra (in local, not reference): {[dict(m) for m in extra[:5]]}")
+    status = "PASS" if not missing and not extra else "FAIL"
+    return Comparison(
+        status=status,
+        ref_count=sum(ref_counter.values()),
+        local_count=sum(local_counter.values()),
+        other_mismatches=other_mismatches,
+    )
+
+
 def compare(ref_elements: list[dict[str, Any]], local_elements: list[dict[str, Any]]) -> Comparison:
+    if any(e.get("type") == "timeline" for e in ref_elements) or any(
+        e.get("type") == "timeline" for e in local_elements
+    ):
+        return compare_timeline(ref_elements, local_elements)
+
     ref_count = extract_count(ref_elements)
     local_count = extract_count(local_elements)
     if ref_count is not None or local_count is not None:
@@ -414,12 +504,9 @@ def compare(ref_elements: list[dict[str, Any]], local_elements: list[dict[str, A
     tag_mismatches: list[dict[str, Any]] = []
     other_mismatches: list[str] = []
     for key in sorted(common):
-        problems = compare_elements(ref_by_key[key], local_by_key[key])
-        for p in problems:
-            if "tags differ" in p:
-                tag_mismatches.append({"element": f"{key[0]}/{key[1]}", "detail": p})
-            else:
-                other_mismatches.append(p)
+        tm, om = _classify_element_problems(f"{key[0]}/{key[1]}", ref_by_key[key], local_by_key[key])
+        tag_mismatches.extend(tm)
+        other_mismatches.extend(om)
 
     status = "PASS" if not missing and not extra and not tag_mismatches and not other_mismatches else "FAIL"
 
@@ -427,6 +514,119 @@ def compare(ref_elements: list[dict[str, Any]], local_elements: list[dict[str, A
         status=status,
         ref_count=len(ref_elements),
         local_count=len(local_elements),
+        missing=missing,
+        extra=extra,
+        tag_mismatches=tag_mismatches,
+        other_mismatches=other_mismatches,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Diff/adiff XML action-list comparison (docs/m4-contracts.md section 7)
+# ---------------------------------------------------------------------------
+
+
+def _xml_child_to_element(el: ET.Element) -> dict[str, Any]:
+    """Convert one <node>/<way>/<relation> XML element (as found inside an
+    <action>'s <old>/<new>, or directly under <action type="create">) into
+    the same element-dict shape parse_elements() produces from JSON, so
+    compare_elements()'s existing tolerances (tags as dicts, node lat/lon
+    and way `nodes` id lists, `geometry` point lists) apply unchanged.
+
+    A "stub" element -- the visible-but-unresolved <new> the reference
+    sometimes prints for a `delete` action's other side under recursion,
+    id/version only, no tags/nd children -- naturally comes out with empty
+    tags and nodes=None, which compare_elements() already treats as "no
+    data on this side" (see the nodes-list and geometry checks)."""
+    d: dict[str, Any] = {"type": el.tag, "id": int(el.get("id"))}
+    if el.tag == "node":
+        if el.get("lat") is not None:
+            d["lat"] = float(el.get("lat"))
+        if el.get("lon") is not None:
+            d["lon"] = float(el.get("lon"))
+    tags: dict[str, str] = {}
+    nds = list(el.findall("nd"))
+    for child in el:
+        if child.tag == "tag":
+            tags[child.get("k")] = child.get("v")
+    d["tags"] = tags
+    if el.tag == "way":
+        if nds:
+            d["nodes"] = [int(nd.get("ref")) for nd in nds]
+            if all(nd.get("lat") is not None and nd.get("lon") is not None for nd in nds):
+                d["geometry"] = [{"lat": float(nd.get("lat")), "lon": float(nd.get("lon"))} for nd in nds]
+        else:
+            d["nodes"] = None
+    return d
+
+
+def parse_diff_actions(body: str) -> list[dict[str, Any]]:
+    """Parse an Overpass [out:xml] diff/adiff response into a list of
+    {"action", "type", "id", "old", "new"} dicts. `old`/`new` are element
+    dicts (see _xml_child_to_element) or None -- absent for `create`'s
+    `old` and for a real `delete`'s `new` (docs/m4-contracts.md section 6.2
+    confirms via the probes that a genuine deletion has no <new> at all;
+    only a recursion-dropped-from-selection "delete" carries a stub
+    <new>)."""
+    root = ET.fromstring(body)
+    actions: list[dict[str, Any]] = []
+    for action_el in root.findall("action"):
+        atype = action_el.get("type")
+        old_el = action_el.find("old")
+        new_el = action_el.find("new")
+        if atype == "create":
+            el = next((c for c in action_el if c.tag not in ("old", "new")), None)
+            old_dict, new_dict = None, (_xml_child_to_element(el) if el is not None else None)
+        else:
+            old_dict = _xml_child_to_element(old_el[0]) if old_el is not None and len(old_el) else None
+            new_dict = _xml_child_to_element(new_el[0]) if new_el is not None and len(new_el) else None
+        ref = new_dict or old_dict
+        if ref is None:
+            continue
+        actions.append({"action": atype, "type": ref["type"], "id": ref["id"], "old": old_dict, "new": new_dict})
+    return actions
+
+
+def compare_diff_actions(ref_actions: list[dict[str, Any]], local_actions: list[dict[str, Any]]) -> Comparison:
+    """Compare two diff/adiff action lists semantically (docs/m4-contracts.md
+    section 7): as the set of (action, type, id) triples, plus -- per
+    action present on both sides -- the old/new element pair, using the
+    same tolerances the JSON path uses (compare_elements(), via
+    _classify_element_problems)."""
+
+    def key(a: dict[str, Any]) -> tuple[str, str, int]:
+        return (a["action"], a["type"], a["id"])
+
+    ref_by_key = {key(a): a for a in ref_actions}
+    local_by_key = {key(a): a for a in local_actions}
+
+    ref_keys = set(ref_by_key)
+    local_keys = set(local_by_key)
+    missing = sorted(ref_keys - local_keys)
+    extra = sorted(local_keys - ref_keys)
+    common = ref_keys & local_keys
+
+    tag_mismatches: list[dict[str, Any]] = []
+    other_mismatches: list[str] = []
+    for k in sorted(common):
+        ra, la = ref_by_key[k], local_by_key[k]
+        label = f"{k[0]}/{k[1]}/{k[2]}"
+        for side in ("old", "new"):
+            r_el, l_el = ra[side], la[side]
+            if r_el is None and l_el is None:
+                continue
+            if r_el is None or l_el is None:
+                other_mismatches.append(f"{label}: {side} present on one side only (ref={r_el!r} local={l_el!r})")
+                continue
+            tm, om = _classify_element_problems(f"{label}/{side}", r_el, l_el)
+            tag_mismatches.extend(tm)
+            other_mismatches.extend(om)
+
+    status = "PASS" if not missing and not extra and not tag_mismatches and not other_mismatches else "FAIL"
+    return Comparison(
+        status=status,
+        ref_count=len(ref_actions),
+        local_count=len(local_actions),
         missing=missing,
         extra=extra,
         tag_mismatches=tag_mismatches,
@@ -535,7 +735,7 @@ def _run_csv_task(
     instead of the element-set `compare()`."""
     substituted = substitute_bbox(raw_query, bbox)
     ref_query = substituted
-    if args.date:
+    if args.date and should_apply_date(ref_query):
         # `--date` is inserted on the reference side only (same convention
         # as the main json/xml flow above) -- the local engine doesn't
         # implement `[date:]` (attic) queries at all.
@@ -608,6 +808,130 @@ def _run_csv_task(
     )
 
 
+def _run_diff_task(
+    client: httpx.Client,
+    args: argparse.Namespace,
+    corpus_dir: Path,
+    qfile: Path,
+    bbox_name: str,
+    bbox: list[float],
+    raw_query: str,
+) -> QueryRunReport:
+    """Like the body of the main `run()` loop, but for a `[diff:]`/`[adiff:]`
+    corpus entry: both sides are forced to `[out:xml]` (the reference
+    rejects JSON in diff mode), `--date` is never injected (the query
+    already names its own a/b instant(s)), and grading is
+    `compare_diff_actions` -- the action-list comparator -- instead of the
+    JSON element-set `compare()`."""
+    substituted = substitute_bbox(raw_query, bbox)
+    ref_query = force_out_xml(substituted)
+    if args.date and should_apply_date(ref_query):
+        ref_query = prepend_date(ref_query, args.date)
+    local_query = force_out_xml(substituted)
+
+    key = cache_key(qfile.name, bbox_name, ref_query)
+    cpath = cache_path(corpus_dir, key)
+
+    if args.local_only:
+        ref_result = cache_read(cpath)
+        if ref_result is None:
+            return QueryRunReport(
+                query_file=qfile.name, bbox_name=bbox_name, status="FAIL", ref_elements=0,
+                local_elements=None, missing=0, extra=0, tag_mismatches=0, ref_ms=0.0, local_ms=None,
+                message=f"no cached reference response at {cpath}; run --reference-only first",
+            )
+    else:
+        cached = cache_read(cpath)
+        if cached is not None and cached.ok:
+            ref_result = cached
+        else:
+            ref_result = fetch(
+                client, args.reference, ref_query, timeout=args.timeout, retries=args.retries,
+                sleep_between=args.sleep, label="reference",
+            )
+            cache_write(cpath, ref_result)
+            time.sleep(args.sleep)
+
+    if not ref_result.ok:
+        msg = ref_result.remark or ref_result.error or f"HTTP {ref_result.status_code}"
+        return QueryRunReport(
+            query_file=qfile.name, bbox_name=bbox_name, status="FAIL", ref_elements=0,
+            local_elements=None, missing=0, extra=0, tag_mismatches=0, ref_ms=ref_result.elapsed_ms,
+            local_ms=None, message=f"reference error: {msg}",
+        )
+
+    if args.reference_only:
+        try:
+            n = len(parse_diff_actions(ref_result.body))
+        except ET.ParseError as exc:
+            return QueryRunReport(
+                query_file=qfile.name, bbox_name=bbox_name, status="FAIL", ref_elements=0,
+                local_elements=None, missing=0, extra=0, tag_mismatches=0, ref_ms=ref_result.elapsed_ms,
+                local_ms=None, message=f"reference XML did not parse: {exc}",
+            )
+        return QueryRunReport(
+            query_file=qfile.name, bbox_name=bbox_name, status="PASS",
+            ref_elements=n, local_elements=None,
+            missing=0, extra=0, tag_mismatches=0, ref_ms=ref_result.elapsed_ms, local_ms=None,
+            message="reference-only (cached)",
+        )
+
+    if args.local is None:
+        return QueryRunReport(
+            query_file=qfile.name, bbox_name=bbox_name, status="FAIL", ref_elements=0,
+            local_elements=None, missing=0, extra=0, tag_mismatches=0, ref_ms=ref_result.elapsed_ms,
+            local_ms=None, message="no --local given",
+        )
+
+    local_result = fetch(
+        client, args.local, local_query, timeout=args.timeout, retries=args.retries, sleep_between=0.0, label="local",
+    )
+    if not local_result.ok:
+        msg = local_result.remark or local_result.error or f"HTTP {local_result.status_code}"
+        return QueryRunReport(
+            query_file=qfile.name, bbox_name=bbox_name, status="FAIL", ref_elements=0,
+            local_elements=None, missing=0, extra=0, tag_mismatches=0, ref_ms=ref_result.elapsed_ms,
+            local_ms=local_result.elapsed_ms, message=f"local error: {msg}",
+        )
+
+    try:
+        ref_actions = parse_diff_actions(ref_result.body)
+    except ET.ParseError as exc:
+        return QueryRunReport(
+            query_file=qfile.name, bbox_name=bbox_name, status="FAIL", ref_elements=0,
+            local_elements=None, missing=0, extra=0, tag_mismatches=0, ref_ms=ref_result.elapsed_ms,
+            local_ms=local_result.elapsed_ms, message=f"reference XML did not parse: {exc}",
+        )
+    try:
+        local_actions = parse_diff_actions(local_result.body)
+    except ET.ParseError as exc:
+        return QueryRunReport(
+            query_file=qfile.name, bbox_name=bbox_name, status="FAIL", ref_elements=len(ref_actions),
+            local_elements=None, missing=0, extra=0, tag_mismatches=0, ref_ms=ref_result.elapsed_ms,
+            local_ms=local_result.elapsed_ms, message=f"local XML did not parse: {exc}",
+        )
+
+    cmp = compare_diff_actions(ref_actions, local_actions)
+    message = ""
+    if cmp.status == "FAIL":
+        parts = []
+        if cmp.missing:
+            parts.append(f"missing={len(cmp.missing)} e.g. {cmp.missing[:5]}")
+        if cmp.extra:
+            parts.append(f"extra={len(cmp.extra)} e.g. {cmp.extra[:5]}")
+        if cmp.tag_mismatches:
+            parts.append(f"tag_mismatches={len(cmp.tag_mismatches)}")
+        if cmp.other_mismatches:
+            parts.append(f"other={cmp.other_mismatches[:3]}")
+        message = "; ".join(parts)
+    return QueryRunReport(
+        query_file=qfile.name, bbox_name=bbox_name, status=cmp.status, ref_elements=cmp.ref_count,
+        local_elements=cmp.local_count, missing=len(cmp.missing), extra=len(cmp.extra),
+        tag_mismatches=len(cmp.tag_mismatches), ref_ms=ref_result.elapsed_ms, local_ms=local_result.elapsed_ms,
+        message=message, detail=cmp.to_dict(),
+    )
+
+
 def run(args: argparse.Namespace) -> int:
     corpus_dir = Path(args.corpus)
     bboxes = load_bboxes(Path(args.bboxes))
@@ -632,12 +956,16 @@ def run(args: argparse.Namespace) -> int:
                 print(f"[{task_num}/{total_tasks}] {qfile.name} @ {bbox_name} (csv) ...", file=sys.stderr, flush=True)
                 reports.append(_run_csv_task(client, args, corpus_dir, qfile, bbox_name, bboxes[bbox_name], raw_query))
                 continue
+            if is_diff_variant(raw_query):
+                print(f"[{task_num}/{total_tasks}] {qfile.name} @ {bbox_name} (diff) ...", file=sys.stderr, flush=True)
+                reports.append(_run_diff_task(client, args, corpus_dir, qfile, bbox_name, bboxes[bbox_name], raw_query))
+                continue
             if True:
                 print(f"[{task_num}/{total_tasks}] {qfile.name} @ {bbox_name} ...", file=sys.stderr, flush=True)
                 bbox = bboxes[bbox_name]
                 substituted = substitute_bbox(raw_query, bbox)
                 ref_query = force_out_json(substituted)
-                if args.date:
+                if args.date and should_apply_date(ref_query):
                     ref_query = prepend_date(ref_query, args.date)
                 local_query_json = force_out_json(substituted)
 
