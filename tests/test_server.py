@@ -91,7 +91,9 @@ def test_status_endpoint(client):
     resp = client.get("/api/status")
     assert resp.status_code == 200
     assert "Connected as:" in resp.text
-    assert "Rate limit: 0" in resp.text
+    # contract section 6.1: "Rate limit: <slots per ip>" -- OSMPQ_SLOTS_PER_IP
+    # defaults to 2 (see tests/test_server_limits.py for the full behaviour).
+    assert "Rate limit: 2" in resp.text
 
 
 def test_timestamp_endpoint(client):

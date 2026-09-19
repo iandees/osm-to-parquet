@@ -14,6 +14,13 @@ dependencies = [
   "fastapi",
   "uvicorn",
   "httpx",
+  "boto3",
+  # `osmpq.update.osc` (the replication `.osc.gz` parser M2 added) imports
+  # this; missing from here until now, so a plain `pip install .` (e.g.
+  # the service image, contract section 6.4) never actually pulled it in
+  # -- it only worked in this sandbox because the system Python already
+  # had it installed some other way.
+  "osmium",
 ]
 
 [project.optional-dependencies]

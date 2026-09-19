@@ -67,6 +67,7 @@ from typing import Optional
 
 import duckdb
 
+from osmpq import store as store_mod
 from osmpq.errors import RuntimeQueryError
 from osmpq.ql.ast import Program
 
@@ -83,36 +84,64 @@ def _s3_secret_sql(env: Optional[dict] = None) -> Optional[str]:
 
     A pure function (takes `env` instead of reading `os.environ`
     directly) so tests can assert on the exact SQL without a real bucket
-    or DuckDB connection, and without mutating process environment."""
-    env = os.environ if env is None else env
-    key_id = env.get("OSMPQ_S3_KEY_ID")
-    secret = env.get("OSMPQ_S3_SECRET")
-    endpoint = env.get("OSMPQ_S3_ENDPOINT")
-    if not (key_id and secret and endpoint):
-        return None
-    region = env.get("OSMPQ_S3_REGION", "auto")
-    url_style = env.get("OSMPQ_S3_URL_STYLE", "path")
-    use_ssl_raw = str(env.get("OSMPQ_S3_USE_SSL", "true")).strip().lower()
-    use_ssl = "false" if use_ssl_raw in ("0", "false", "no") else "true"
+    or DuckDB connection, and without mutating process environment.
 
-    def esc(s: str) -> str:
-        return s.replace("'", "''")
+    Factored into `osmpq.store.s3_secret_sql` (docs/m3-contracts.md
+    section 6.2) so `osmpq.update.updater` can issue the identical secret
+    for its own DuckDB connection when reading an `s3://` root's Parquet
+    files through `Store.url(...)`; kept here, delegating, for backward
+    compatibility (existing callers/tests use `executor._s3_secret_sql`)."""
+    return store_mod.s3_secret_sql(env)
 
-    return (
-        "CREATE OR REPLACE SECRET osmpq_s3 (\n"
-        "    TYPE S3,\n"
-        f"    KEY_ID '{esc(key_id)}',\n"
-        f"    SECRET '{esc(secret)}',\n"
-        f"    ENDPOINT '{esc(endpoint)}',\n"
-        f"    REGION '{esc(region)}',\n"
-        f"    URL_STYLE '{esc(url_style)}',\n"
-        f"    USE_SSL {use_ssl}\n"
-        ")"
-    )
+
+class CancelToken:
+    """Handed to `Engine.run`/`Engine.run_program`; `cancel()` interrupts
+    that run's DuckDB cursor (docs/m3-contracts.md section 6.1,
+    `/api/kill_my_queries`). Thread-safe: `cancel()` is typically called
+    from a different thread (another request's handler) than the one
+    running the query, so binding a cursor and cancelling are both guarded
+    by the same lock -- a `cancel()` that arrives before the run has bound
+    its cursor yet is remembered and applied as soon as it does."""
+
+    def __init__(self) -> None:
+        self._con = None
+        self._cancelled = False
+        self._lock = threading.Lock()
+
+    def _bind(self, con) -> None:
+        with self._lock:
+            self._con = con
+            if self._cancelled:
+                self._interrupt_locked()
+
+    def _unbind(self) -> None:
+        with self._lock:
+            self._con = None
+
+    def _interrupt_locked(self) -> None:
+        try:
+            self._con.interrupt()
+        except Exception:
+            pass
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._cancelled = True
+            if self._con is not None:
+                self._interrupt_locked()
+
+    def is_cancelled(self) -> bool:
+        with self._lock:
+            return self._cancelled
 
 
 class Engine:
-    def __init__(self, root: str, duckdb_config: Optional[dict] = None):
+    def __init__(
+        self,
+        root: str,
+        duckdb_config: Optional[dict] = None,
+        manifest_refresh_seconds: Optional[float] = None,
+    ):
         self.root = root
         self.duckdb_config = dict(duckdb_config or {})
         self._db = duckdb.connect(":memory:", config=self.duckdb_config)
@@ -122,15 +151,94 @@ class Engine:
         # rather than a throwaway connection with no secret.
         self.manifest = catalog.load_manifest(root, con=self._db)
 
+        # -- manifest refresh (docs/m3-contracts.md section 6.1) --------
+        # `manifest_refresh_seconds` defaults from `OSMPQ_MANIFEST_REFRESH_
+        # SECONDS` (60) rather than being read once at import time, so a
+        # test that sets the env var before constructing an `Engine` sees
+        # it, same spirit as `server.get_engine()` reading `OSMPQ_ROOT`
+        # fresh. `_manifest_refresh_lock` serializes the "is a refresh due,
+        # and if so reload" check across concurrent `run_program` calls;
+        # `_manifest_number` is `manifest/LATEST`'s raw text, compared
+        # cheaply on every check without re-parsing the full manifest JSON
+        # unless it actually changed.
+        if manifest_refresh_seconds is None:
+            manifest_refresh_seconds = float(os.environ.get("OSMPQ_MANIFEST_REFRESH_SECONDS", "60"))
+        self._manifest_refresh_seconds = manifest_refresh_seconds
+        self._manifest_refresh_lock = threading.Lock()
+        self._last_manifest_check = time.monotonic()
+        try:
+            latest_path = catalog.join_root(self.root, "manifest/LATEST")
+            self._manifest_number: Optional[str] = catalog.read_text_any(latest_path, con=self._db).strip()
+        except Exception:
+            self._manifest_number = None
+
+    @property
+    def manifest_number(self):
+        """`manifest/LATEST`'s raw contents (usually an integer string) as
+        of the last refresh check -- used for `/healthz` and the
+        `X-OSMPQ-Manifest` response header."""
+        n = self._manifest_number
+        try:
+            return int(n)
+        except (TypeError, ValueError):
+            return n
+
+    def refresh_manifest_if_due(self) -> None:
+        """Contract section 6.1: re-read `manifest/LATEST` at most every
+        `manifest_refresh_seconds` (checked here, called on the next
+        request rather than from a background thread); when the number
+        changed, reload the manifest (a fresh `catalog.Manifest` carries
+        its own empty `_rowgroup_cache`, so this is also "drop the
+        row-group index cache") and atomically swap `self.manifest` --
+        Python attribute assignment is atomic under the GIL, and
+        `run_program` captures `self.manifest` into a local right after
+        calling this, so a run already in flight keeps the manifest it
+        started with even if a refresh swaps `self.manifest` out from
+        under it midway through."""
+        now = time.monotonic()
+        with self._manifest_refresh_lock:
+            if now - self._last_manifest_check < self._manifest_refresh_seconds:
+                return
+            self._last_manifest_check = now
+            try:
+                latest_path = catalog.join_root(self.root, "manifest/LATEST")
+                latest_text = catalog.read_text_any(latest_path, con=self._db).strip()
+            except Exception:
+                return
+            if latest_text == self._manifest_number:
+                return
+            try:
+                new_manifest = catalog.load_manifest(self.root, con=self._db)
+            except Exception:
+                return
+            self._manifest_number = latest_text
+            self.manifest = new_manifest
+
     # -- public API -----------------------------------------------------
 
-    def run(self, query_text: str, timeout: Optional[float] = None) -> Result:
+    def run(
+        self,
+        query_text: str,
+        timeout: Optional[float] = None,
+        cancel: Optional[CancelToken] = None,
+    ) -> Result:
         from osmpq.ql import parse  # imported lazily: the parser may not exist yet
 
         program = parse(query_text)
-        return self.run_program(program, timeout=timeout)
+        return self.run_program(program, timeout=timeout, cancel=cancel)
 
-    def run_program(self, program: Program, timeout: Optional[float] = None) -> Result:
+    def run_program(
+        self,
+        program: Program,
+        timeout: Optional[float] = None,
+        cancel: Optional[CancelToken] = None,
+    ) -> Result:
+        self.refresh_manifest_if_due()
+        # Captured once: see `refresh_manifest_if_due`'s docstring -- this
+        # run always sees the manifest it started with, even if another
+        # thread's request swaps `self.manifest` to a newer one while this
+        # run is still in flight.
+        manifest = self.manifest
         settings = program.settings
         effective_timeout = timeout if timeout is not None else (settings.timeout or None)
 
@@ -140,7 +248,10 @@ class Engine:
         # `SET` state -- so concurrent `run()` calls on this Engine never
         # collide, per the module docstring.
         con = self._db.cursor()
+        if cancel is not None:
+            cancel._bind(con)
         timer: Optional[threading.Timer] = None
+        timed_out_flag = [False]
         # m1-contracts.md section 6: a per-run accumulator so
         # `catalog.prune_files_by_bbox` can report files-considered vs
         # files-read. Lives in a ContextVar (`catalog.FILE_STATS`) rather
@@ -158,6 +269,7 @@ class Engine:
 
             if effective_timeout:
                 def _kill() -> None:
+                    timed_out_flag[0] = True
                     try:
                         con.interrupt()
                     except Exception:
@@ -169,18 +281,30 @@ class Engine:
 
             start = time.monotonic()
             try:
-                ctx = planner.run_program(con, self.manifest, program)
+                ctx = planner.run_program(con, manifest, program)
             except duckdb.InterruptException:
                 elapsed = time.monotonic() - start
+                if timed_out_flag[0]:
+                    remark = (
+                        f'runtime error: Query timed out in "osmpq" at line 1 '
+                        f"after {effective_timeout} seconds."
+                    )
+                    stats = {"seconds": elapsed, "timed_out": True}
+                else:
+                    # Not the timeout timer: a `CancelToken.cancel()` from
+                    # `/api/kill_my_queries` interrupted this run's cursor
+                    # instead (contract section 6.1).
+                    remark = (
+                        f'runtime error: Query aborted in "osmpq" at line 1 '
+                        f"after {elapsed:.1f} seconds (killed by kill_my_queries)."
+                    )
+                    stats = {"seconds": elapsed, "timed_out": False, "cancelled": True}
                 return Result(
                     elements=[],
                     settings=settings,
-                    remark=(
-                        f'runtime error: Query timed out in "osmpq" at line 1 '
-                        f"after {effective_timeout} seconds."
-                    ),
-                    timestamp_osm_base=self.manifest.timestamp_osm_base,
-                    stats={"seconds": elapsed, "timed_out": True},
+                    remark=remark,
+                    timestamp_osm_base=manifest.timestamp_osm_base,
+                    stats=stats,
                 )
             except RuntimeQueryError as e:
                 elapsed = time.monotonic() - start
@@ -188,7 +312,7 @@ class Engine:
                     elements=[],
                     settings=settings,
                     remark=str(e),
-                    timestamp_osm_base=self.manifest.timestamp_osm_base,
+                    timestamp_osm_base=manifest.timestamp_osm_base,
                     stats={"seconds": elapsed},
                 )
             finally:
@@ -227,11 +351,13 @@ class Engine:
                 elements=ctx.elements,
                 settings=settings,
                 remark=None,
-                timestamp_osm_base=self.manifest.timestamp_osm_base,
+                timestamp_osm_base=manifest.timestamp_osm_base,
                 stats=stats,
             )
         finally:
             con.close()
+            if cancel is not None:
+                cancel._unbind()
             catalog.FILE_STATS.reset(stats_token)
             catalog.DELTA_STATS.reset(delta_stats_token)
 
