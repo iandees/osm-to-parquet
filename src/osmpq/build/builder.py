@@ -201,10 +201,10 @@ def build(opts: BuildOptions) -> manifest_mod.Manifest:
     con.execute("""
         UPDATE way1 SET is_area = (
             is_closed
-            AND coalesce(tags['area'][1], '') != 'no'
+            AND coalesce(tags['area'], '') != 'no'
             AND NOT (
-                (tags['highway'][1] IS NOT NULL OR tags['barrier'][1] IS NOT NULL)
-                AND coalesce(tags['area'][1], '') != 'yes'
+                (tags['highway'] IS NOT NULL OR tags['barrier'] IS NOT NULL)
+                AND coalesce(tags['area'], '') != 'yes'
             )
         )
     """)
@@ -512,7 +512,7 @@ def _register_assignment(con, name: str, ids: np.ndarray, cell: np.ndarray, hilb
 
 
 def _promoted_select(promoted_keys: list[str], tags_expr: str = "tags") -> str:
-    return ", ".join(f'{tags_expr}[\'{key}\'][1] AS "{key}"' for key in promoted_keys)
+    return ", ".join(f'{tags_expr}[\'{key}\'] AS "{key}"' for key in promoted_keys)
 
 
 def _copy_to_parquet(con, select_sql: str, path: Path) -> tuple[int, int]:

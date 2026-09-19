@@ -170,7 +170,7 @@ def test_promoted_amenity_matches_tags_map(built_root, con):
         if not files:
             continue
         mismatches = con.execute(
-            f"SELECT count(*) FROM read_parquet({files!r}) WHERE amenity IS DISTINCT FROM tags['amenity'][1]"
+            f"SELECT count(*) FROM read_parquet({files!r}) WHERE amenity IS DISTINCT FROM tags['amenity']"
         ).fetchone()[0]
         assert mismatches == 0
 
