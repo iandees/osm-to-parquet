@@ -15,7 +15,7 @@ Status: proposal, revised September 2026. Nothing here is implemented yet.
 | Compatibility | **"Most real queries work", not byte-identical.** Same language, same JSON/XML shape, documented differences on edge cases (ordering under `qt`, exotic evaluators, error page formatting). |
 | Attic | **Full history, back to 2012 and earlier eventually.** Loaded from the full-history planet; prototyped on small/recent regional history extracts first. |
 | Table format | Hand-rolled manifest for the hot query path (one small JSON per version); Iceberg on R2 Data Catalog for the history dataset and for offline/analytical access. Revisit if the manifest grows complex. |
-| Language | Rust for the base builder, updater and query engine; a Python prototype of the parser/planner is acceptable for milestone 0 if it speeds up validation. |
+| Language | Rust for the two whole-planet passes (nodes, ways: `rust/osmpq-raw`); Python + DuckDB for the relational tail of the build (relations, indexes, manifest) and for the query engine until its SQL is stable. M0/M1 showed DuckDB's out-of-core SQL is fast enough for everything except touching every node. |
 
 ## 1. Goal and constraints
 
@@ -130,11 +130,21 @@ to the root. Ancestors are few and hold long features (coastlines, rivers,
 motorways, boundaries), which is what Overpass does for large objects too.
 
 Within a file, rows are sorted by a space-filling curve (Hilbert) of the
-bbox center, then id. Row groups are small (about 50k-100k rows, a few MB
-compressed) so that min/max statistics on flat `xmin/ymin/xmax/ymax` (or
-`lat/lon`) columns let DuckDB skip most row groups when the query bbox covers
-part of a cell. Flat bbox columns are the portable way to get pruning in any
-reader; DuckDB 1.5's native GEOMETRY statistics add pruning on top.
+bbox center, then id. Row groups are sized by compressed bytes (about 1 MB
+for nodes, 4 MB for ways) so that min/max statistics on flat
+`xmin/ymin/xmax/ymax` (or `lat/lon`) columns let DuckDB skip most row groups
+when the query bbox covers part of a cell, while each file still costs few
+range requests (DuckDB reads one range per column chunk per row group).
+A row-group index side file per table (bbox per row group, built from the
+footers) lets the engine skip whole files without a request. Flat bbox
+columns are the portable way to get pruning in any reader; DuckDB 1.5's
+native GEOMETRY statistics add pruning on top.
+
+M1 learned that loose placement at every depth costs a fixed tax of about
+ten files per query, so ways and relations are placed only at leaves or at
+depths {0, 3, 6, 9, 12}; and that Parquet encodings matter as much as the
+schema (delta encoding on the sort key and coordinates, no dictionary on
+numeric columns: 2x smaller files than the writer defaults).
 
 ### 3.3 Tables
 
@@ -607,10 +617,13 @@ and copy no code; this project can be Apache-2/MIT.
   semantic comparison.
 - Publish cold and warm latency and cost per query. **Go/no-go gate.**
 
-**M1: full planet base build**
-- Build the planet on a laptop or rented node (section 4.6); record build
-  time, file counts, sizes, cell depth distribution; tune cell split
-  thresholds and row group sizes; sync to R2.
+**M1: planet-capable builder and layout v2** (done on Minnesota; see
+`docs/m1-report.md`)
+- Rust producer with a `dense-file` node store for the planet, layout v2
+  (loose placement restricted to depths {0,3,6,9,12}, row-group index side
+  files, tuned Parquet encodings and byte-sized row groups), engine caching
+  and R2 credentials. The planet run itself follows `docs/m1-runbook.md`
+  on the user's machine; its numbers replace the extrapolations.
 
 **M2: minutely updates**
 - Stateless updater in a scheduled container: rolling deltas, manifests,

@@ -22,9 +22,12 @@ queries work" rather than byte-identical Overpass compatibility; full history
 back to 2012 and earlier as a real goal, prototyped on small regional history
 extracts first. See the decisions table at the top of the design document.
 
-Status: **design phase**. Nothing runs yet. The documents below are the
-proposal; the repository name is historical and Parquet is a means, not the
-goal.
+Status: **M1 done on Minnesota, planet build ready to run.** A Rust
+producer (`rust/osmpq-raw`) turns a PBF into the layout, a Python/DuckDB
+stage finishes it, and a Python engine serves Overpass QL over it (local
+disk, HTTP, or R2). 54 of 55 gradable corpus queries match a public Overpass
+instance on a Minnesota extract. The repository name is historical and
+Parquet is a means, not the goal.
 
 ## Documents
 
@@ -33,6 +36,26 @@ goal.
 | [docs/prior-art.md](docs/prior-art.md) | Survey of existing projects (Overpass, Postpass, ohsome-planet, QLever, OSMExpress, GeoDesk, QuackOSM, osm-pds, DuckLake, R2 Data Catalog, ...) and what each one contributes or lacks |
 | [docs/design.md](docs/design.md) | Proposed architecture: storage layout, update pipeline, query translation, serving tier, cost model, roadmap, open questions |
 | [docs/overpass-ql-support.md](docs/overpass-ql-support.md) | Overpass QL feature matrix and the order we intend to implement it in |
+| [docs/m0-contracts.md](docs/m0-contracts.md), [docs/m0-report.md](docs/m0-report.md) | M0: exact layout, schemas, API and the Minnesota results of the first prototype |
+| [docs/m1-contracts.md](docs/m1-contracts.md), [docs/m1-report.md](docs/m1-report.md) | M1: Rust producer, layout v2 (restricted ancestor depths, row-group index, tuned encodings), engine caching, measurements |
+| [docs/m1-runbook.md](docs/m1-runbook.md) | How to build the planet on your own machine and publish it to R2 |
+
+## Running it
+
+```
+pip install -e '.[dev]'                       # Python side (DuckDB 1.5, pyarrow, FastAPI)
+(cd rust/osmpq-raw && cargo build --release)  # Rust producer
+osmpq-raw build extract.osm.pbf raw/          # PBF -> raw layout
+osmpq build --raw raw/ root/                  # raw -> dataset root (relations, indexes, manifest)
+osmpq validate root/
+OSMPQ_ROOT=root/ uvicorn osmpq.server:app --port 8080
+curl 'http://127.0.0.1:8080/api/interpreter' --data-urlencode 'data=[out:json];node(44.97,-93.28,44.985,-93.255)["amenity"="cafe"];out;'
+```
+
+`osmpq build extract.osm.pbf root/` does the same without Rust (slower, and
+untagged nodes get no metadata). `tools/difftest.py` compares a server
+against a real Overpass instance over `tests/corpus`; `tools/remote_profile.py`
+counts range requests and bytes per query over HTTP.
 
 ## Short version of the design
 
