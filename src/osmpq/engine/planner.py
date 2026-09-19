@@ -81,8 +81,6 @@ class Context:
 
 
 def check_settings(settings: Settings) -> None:
-    if settings.out_format == "csv":
-        raise UnsupportedError("[out:csv] is not supported in M0")
     if settings.date is not None:
         raise UnsupportedError("[date:] (attic) is not supported in M0")
     if settings.diff is not None:
@@ -324,8 +322,10 @@ def execute_difference(ctx: Context, d: Difference) -> None:
 
 def execute_out(ctx: Context, o: Out) -> None:
     _require_set(ctx, o.input_set)
-    if o.geom_bbox is not None:
-        raise UnsupportedError("out geom(s,w,n,e) (clipped geometry) is not supported in M0")
+    # docs/m3-contracts.md section 3.4: `out geom(s,w,n,e)` clipping is
+    # implemented entirely in render.build_elements/_row_to_element; the
+    # M0-era rejection here (this statement's only remaining line) is lifted
+    # as part of that delivery, same as check_settings' csv rejection above.
     elements, _extra = render.build_elements(ctx.con, ctx.manifest, o.input_set, o)
     ctx.elements.extend(elements)
 

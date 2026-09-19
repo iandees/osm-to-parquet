@@ -1,6 +1,50 @@
 """`out`: turn a materialized set into Overpass JSON-shaped element dicts
 (contract sections 6-7). The XML/JSON text renderers in result.py are pure
 formatting over this same list.
+
+`out geom(s,w,n,e)` clipping (docs/m3-contracts.md section 3.4)
+------------------------------------------------------------------
+Established empirically against the reference Overpass instance
+(`https://maps.mail.ru/osm/tools/overpass/api/interpreter`, `[date:
+"2026-09-19T00:21:52Z"]`), for a real way crossing a small bbox (East Lake
+Street, Minneapolis, way 6001527, selected with
+`way[highway=primary](44.9470,-93.2790,44.9490,-93.2760)` and clipped with
+`out geom(44.9480,-93.2777,44.9487,-93.2770)`; see
+`tests/corpus/46_out_geom_bbox.overpassql`), in both `[out:json]` and
+`[out:xml]`:
+
+* A way's node list (`nodes`)/member list is unaffected -- clipping only
+  changes *coordinates*, never which elements/nodes are present (contract:
+  "the bbox restricts geometry, not membership"). Plain node elements
+  always show their own `lat`/`lon` regardless of `out geom(bbox)`.
+* For each vertex of a way's geometry: if the vertex itself is inside the
+  clip bbox, or if either of its immediate neighbours in the way's node
+  sequence is inside the bbox, its real coordinates are kept. Otherwise
+  the coordinate is dropped: JSON emits a `null` entry in the `geometry`
+  array at that position (`"geometry": [null, {"lat":...,"lon":...}, ...]`)
+  and XML emits a bare `<nd ref="..."/>` (no `lat`/`lon` attributes) --
+  confirmed byte-for-byte against the reference for a 3-node way with one
+  interior vertex outside the bbox but adjacent to one inside it (kept)
+  and a 4-node way with two consecutive vertices outside and non-adjacent
+  to any inside vertex (dropped). This "keep one bounding vertex on each
+  side" rule is what lets the drawn line still reach the bbox edge.
+* `bounds` is recomputed from whichever vertices survived clipping (not
+  the way's own full stored bbox); a way with *no* vertex inside the bbox
+  (so nothing survives clipping) omits `bounds` entirely, in both JSON and
+  XML -- confirmed against the reference (way 700231761 in the same
+  response, entirely outside the clip bbox, has no `bounds` key/element).
+* Relation member *way* geometry follows the same per-vertex rule
+  (contract: "Relation member geometry follows the same rule"). This
+  extension was not independently re-verified against the reference (the
+  reference mirror timed out on the multipolygon queries tried for it) --
+  it is applied by analogy to the verified plain-way case. Since a
+  relation member's geometry list carries no `ref` to anchor a bare
+  placeholder against (unlike a top-level way's `nodes`/`geometry` pair),
+  dropped vertices are omitted from the member's `geometry` list entirely
+  rather than represented as `null`/an empty `<nd>`.
+* Relation member *node* coordinates, and a relation's own `bounds`, are
+  unaffected by `out geom(bbox)` in this implementation -- only member way
+  geometry is clipped.
 """
 from __future__ import annotations
 
@@ -279,6 +323,50 @@ def resolve_way_geometries(
     return out
 
 
+def _point_in_bbox(lon: float, lat: float, bbox) -> bool:
+    s, w, n, e = bbox
+    return s <= lat <= n and w <= lon <= e
+
+
+def clip_way_geometry(
+    pts: list[tuple[float, float]], bbox
+) -> list[Optional[tuple[float, float]]]:
+    """`out geom(s,w,n,e)` clipping (module docstring): a vertex keeps its
+    real (lon, lat) if it or an adjacent vertex is inside `bbox`, else it
+    becomes None (rendered as JSON null / a bare XML `<nd ref=.../>`)."""
+    n = len(pts)
+    inside = [_point_in_bbox(lon, lat, bbox) for lon, lat in pts]
+    return [
+        pts[i] if (inside[i] or (i > 0 and inside[i - 1]) or (i < n - 1 and inside[i + 1])) else None
+        for i in range(n)
+    ]
+
+
+def clipped_bounds(points: list[Optional[tuple[float, float]]]) -> Optional[dict]:
+    kept = [p for p in points if p is not None]
+    if not kept:
+        return None
+    lons = [p[0] for p in kept]
+    lats = [p[1] for p in kept]
+    return {
+        "minlat": round(min(lats), 7),
+        "minlon": round(min(lons), 7),
+        "maxlat": round(max(lats), 7),
+        "maxlon": round(max(lons), 7),
+    }
+
+
+def _geometry_points_to_json(points: list[Optional[tuple[float, float]]]) -> list[Optional[dict]]:
+    out: list[Optional[dict]] = []
+    for p in points:
+        if p is None:
+            out.append(None)
+        else:
+            lon, lat = p
+            out.append({"lat": round(lat, 7), "lon": round(lon, 7)})
+    return out
+
+
 # --------------------------------------------------------------------------
 # Row -> Overpass JSON element dict
 # --------------------------------------------------------------------------
@@ -345,16 +433,17 @@ def _row_to_element(row: dict, out: Out, node_coords: dict, way_geoms: dict) -> 
             el["lat"] = e7(row["lat_e7"])
             el["lon"] = e7(row["lon_e7"])
     elif t == "way":
+        pts = parse_linestring_wkt(row.get("geometry_wkt")) if out.geometry == "geom" else None
+        clipped = clip_way_geometry(pts, out.geom_bbox) if (pts is not None and out.geom_bbox is not None) else None
+
         if out.geometry in ("bb", "geom"):
-            b = bounds_dict(row)
+            b = clipped_bounds(clipped) if clipped is not None else bounds_dict(row)
             if b:
                 el["bounds"] = b
         if v != "ids" and v != "tags" and not out.noids:
             el["nodes"] = list(row["refs"]) if row["refs"] else []
-        if out.geometry == "geom":
-            pts = parse_linestring_wkt(row.get("geometry_wkt"))
-            if pts is not None:
-                el["geometry"] = [{"lat": round(lat, 7), "lon": round(lon, 7)} for lon, lat in pts]
+        if out.geometry == "geom" and pts is not None:
+            el["geometry"] = _geometry_points_to_json(clipped if clipped is not None else pts)
         if out.geometry == "center":
             c = center_dict(row)
             if c:
@@ -375,8 +464,18 @@ def _row_to_element(row: dict, out: Out, node_coords: dict, way_geoms: dict) -> 
                         md["lat"] = e7(lat_e7)
                         md["lon"] = e7(lon_e7)
                     elif m["type"] == "w" and m["ref"] in way_geoms:
+                        member_pts = way_geoms[m["ref"]]
+                        if out.geom_bbox is not None:
+                            # Same per-vertex rule as a top-level way
+                            # (module docstring), but a member has no
+                            # `ref` list to anchor a placeholder against,
+                            # so a dropped vertex is simply omitted here
+                            # instead of appearing as a null/empty entry.
+                            member_pts = [
+                                p for p in clip_way_geometry(member_pts, out.geom_bbox) if p is not None
+                            ]
                         md["geometry"] = [
-                            {"lat": round(lat, 7), "lon": round(lon, 7)} for lon, lat in way_geoms[m["ref"]]
+                            {"lat": round(lat, 7), "lon": round(lon, 7)} for lon, lat in member_pts
                         ]
                 out_members.append(md)
             el["members"] = out_members
