@@ -83,7 +83,13 @@ def test_transitive_forward_recurse(engine, fixture):
     r = engine.run(f"[out:json];relation({fixture.node_way_relation_id});>>;out ids;")
     got = sorted((e["type"], e["id"]) for e in r.elements)
     assert ("way", 105) in got
-    assert all(t in ("node", "way") for t, _ in got)
+    # `>>` keeps relations of the original input set in its result even
+    # though nothing "discovers" them via recursion (a real Overpass quirk;
+    # see recurse.py's recurse_transitive docstring and the
+    # `27_down_transitive_from_relation` corpus entry). `<<` has no such
+    # exception (test_transitive_backward_recurse below).
+    assert ("relation", fixture.node_way_relation_id) in got
+    assert all(t in ("node", "way", "relation") for t, _ in got)
 
 
 def test_transitive_backward_recurse(engine, fixture):

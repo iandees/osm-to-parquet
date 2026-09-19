@@ -118,6 +118,16 @@ def build_way_spatial_select(
         where.append(
             f"xmax_e7 >= {we} AND xmin_e7 <= {ee} AND ymax_e7 >= {se} AND ymin_e7 <= {ne}"
         )
+        # The flat-bbox test above is only a prune (a way's AABB can
+        # intersect the query bbox while its actual line never enters it,
+        # e.g. a diagonal way whose corners straddle the box). Overpass
+        # selects a way by its real geometry, so re-check exactly in the
+        # same scan; a way with fewer than 2 resolvable nodes has NULL
+        # geometry and ST_Intersects(NULL, ...) is NULL (excluded), which
+        # matches Overpass having nothing to test against either.
+        where.append(
+            f"ST_Intersects(geometry, ST_MakeEnvelope({w}, {s}, {e}, {n}))"
+        )
     if ids:
         where.append(idset.id_predicate(con, "id", ids))
     where.append(tagsql.tag_filters_sql(tag_filters, promoted_keys))
@@ -147,6 +157,85 @@ def build_way_spatial_select(
         f"WHERE {where_sql}"
     )
     return sql, len(files)
+
+
+def _relation_bbox_exact_filter(con, manifest: catalog.Manifest, cand_sql: str, bbox: BBox) -> tuple[str, int]:
+    """Overpass selects a relation for a bbox if at least one member *node*
+    lies in the bbox, or at least one member *way* intersects it exactly
+    (members of member relations don't count for this plain-bbox test;
+    contract section 8 / m0 task item 3). Relation rows carry no geometry
+    in M0, so resolve member nodes/ways the same way `render.py`'s `out
+    geom` does and keep only relations with a passing member. `cand_sql`
+    must already be the coarse-AABB-pruned candidate rows (id, members,
+    ...) -- this only trims false positives, it never adds rows back.
+    Returns (new SELECT sql, extra files read)."""
+    cand = idset.fresh_table_name("relcand")
+    con.execute(f"CREATE TEMP TABLE {cand} AS {cand_sql}")
+    files_read = 0
+
+    s, w, n, e = bbox
+    se, we, ne, ee = to_e7(s), to_e7(w), to_e7(n), to_e7(e)
+
+    node_ids_tbl = idset.fresh_table_name("relcandnodes")
+    way_ids_tbl = idset.fresh_table_name("relcandways")
+    con.execute(
+        f"CREATE TEMP TABLE {node_ids_tbl} AS "
+        f"SELECT DISTINCT m.ref AS id FROM {cand}, UNNEST(members) AS t(m) WHERE m.type = 'n'"
+    )
+    con.execute(
+        f"CREATE TEMP TABLE {way_ids_tbl} AS "
+        f"SELECT DISTINCT m.ref AS id FROM {cand}, UNNEST(members) AS t(m) WHERE m.type = 'w'"
+    )
+
+    node_hits = idset.fresh_table_name("relnodehits")
+    lo, hi, n_nodes = con.execute(f"SELECT min(id), max(id), count(*) FROM {node_ids_tbl}").fetchone()
+    node_files = [manifest.path(p["path"]) for p in catalog.byid_parts_for_range(manifest, "node", lo, hi)] if n_nodes else []
+    if node_files:
+        files_read += len(node_files)
+        con.execute(
+            f"CREATE TEMP TABLE {node_hits} AS "
+            f"SELECT nb.id FROM read_parquet({_quote_list(node_files)}) nb "
+            f"JOIN {node_ids_tbl} c ON nb.id = c.id "
+            f"WHERE nb.lat_e7 BETWEEN {se} AND {ne} AND nb.lon_e7 BETWEEN {we} AND {ee}"
+        )
+    else:
+        con.execute(f"CREATE TEMP TABLE {node_hits} (id BIGINT)")
+
+    way_hits = idset.fresh_table_name("relwayhits")
+    lo_w, hi_w, n_ways = con.execute(f"SELECT min(id), max(id), count(*) FROM {way_ids_tbl}").fetchone()
+    way_byid_files = [manifest.path(p["path"]) for p in catalog.byid_parts_for_range(manifest, "way", lo_w, hi_w)] if n_ways else []
+    if way_byid_files:
+        files_read += len(way_byid_files)
+        way_cells_tbl = idset.fresh_table_name("relwaycells")
+        con.execute(
+            f"CREATE TEMP TABLE {way_cells_tbl} AS "
+            f"SELECT wb.id, wb.cell FROM read_parquet({_quote_list(way_byid_files)}) wb "
+            f"JOIN {way_ids_tbl} c ON wb.id = c.id WHERE wb.cell IS NOT NULL"
+        )
+        way_tc = manifest.table_cells("way")
+        needed_cells = [r[0] for r in con.execute(f"SELECT DISTINCT cell FROM {way_cells_tbl}").fetchall()]
+        spatial_files = _way_files(manifest, needed_cells)
+        if spatial_files:
+            files_read += len(spatial_files)
+            con.execute(
+                f"CREATE TEMP TABLE {way_hits} AS "
+                f"SELECT ws.id FROM read_parquet({_quote_list(spatial_files)}, hive_partitioning=true, union_by_name=true) ws "
+                f"JOIN {way_cells_tbl} wc ON ws.cell = wc.cell AND ws.id = wc.id "
+                f"WHERE ST_Intersects(ws.geometry, ST_MakeEnvelope({w}, {s}, {e}, {n}))"
+            )
+        else:
+            con.execute(f"CREATE TEMP TABLE {way_hits} (id BIGINT)")
+    else:
+        con.execute(f"CREATE TEMP TABLE {way_hits} (id BIGINT)")
+
+    passing = idset.fresh_table_name("relpass")
+    con.execute(
+        f"CREATE TEMP TABLE {passing} AS "
+        f"SELECT DISTINCT c.id FROM {cand} c, UNNEST(c.members) AS t(m) "
+        f"WHERE (m.type = 'n' AND m.ref IN (SELECT id FROM {node_hits})) "
+        f"   OR (m.type = 'w' AND m.ref IN (SELECT id FROM {way_hits}))"
+    )
+    return f"SELECT * FROM {cand} WHERE id IN (SELECT id FROM {passing})", files_read
 
 
 def build_relation_spatial_select(
@@ -200,7 +289,16 @@ def build_relation_spatial_select(
         f"FROM read_parquet({_quote_list(files)}, hive_partitioning=true, union_by_name=true)\n"
         f"WHERE {where_sql}"
     )
-    return sql, len(files)
+    nfiles = len(files)
+    if bbox is not None:
+        # The coarse test above is the union-of-members AABB (contract
+        # section 4); it can pass while no individual member actually
+        # falls in the bbox (e.g. an L-shaped union of two far-apart member
+        # ways). Re-check exactly, only resolving the members of whatever
+        # survived the coarse prune.
+        sql, extra_files = _relation_bbox_exact_filter(con, manifest, sql, bbox)
+        nfiles += extra_files
+    return sql, nfiles
 
 
 SPATIAL_BUILDERS = {

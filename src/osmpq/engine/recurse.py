@@ -32,7 +32,11 @@ def _quote_list(paths: list[str]) -> str:
 # --------------------------------------------------------------------------
 
 
-def _forward_hop_sql(source_table: str, want_way: bool, want_rel: bool, role: Optional[str]) -> tuple[Optional[str], list]:
+_MEMBER_TYPE_NAME = {"n": "node", "w": "way", "r": "relation"}
+
+
+def _forward_hop_sql(source_table: str, want_way: bool, want_rel: bool, role: Optional[str],
+                      rel_member_types: Optional[set[str]] = None) -> tuple[Optional[str], list]:
     parts = []
     params: list = []
     if want_way:
@@ -41,27 +45,33 @@ def _forward_hop_sql(source_table: str, want_way: bool, want_rel: bool, role: Op
             f"WHERE type = 'way' AND refs IS NOT NULL"
         )
     if want_rel:
-        role_clause = " AND m.role = ?" if role is not None else ""
-        if role is not None:
-            params.append(role)
-        parts.append(
-            f"SELECT CASE m.type WHEN 'n' THEN 'node' WHEN 'w' THEN 'way' WHEN 'r' THEN 'relation' END AS type, "
-            f"m.ref AS id FROM {source_table}, UNNEST(members) AS t(m) "
-            f"WHERE type = 'relation' AND members IS NOT NULL{role_clause}"
-        )
+        wanted_chars = [c for c in ("n", "w", "r") if rel_member_types is None or c in rel_member_types]
+        if wanted_chars:
+            role_clause = " AND m.role = ?" if role is not None else ""
+            if role is not None:
+                params.append(role)
+            type_in = ",".join(f"'{c}'" for c in wanted_chars)
+            case_sql = " ".join(f"WHEN '{c}' THEN '{_MEMBER_TYPE_NAME[c]}'" for c in wanted_chars)
+            parts.append(
+                f"SELECT CASE m.type {case_sql} END AS type, "
+                f"m.ref AS id FROM {source_table}, UNNEST(members) AS t(m) "
+                f"WHERE type = 'relation' AND members IS NOT NULL AND m.type IN ({type_in}){role_clause}"
+            )
     if not parts:
         return None, []
     return "\nUNION ALL\n".join(parts), params
 
 
 def forward_new_ids_table(con, source_table: str, restrict_source_types: Optional[set[str]] = None,
-                           role: Optional[str] = None) -> Optional[str]:
-    """One hop of `>`: way.refs -> nodes; relation.members -> n/w/r ids.
-    Returns a fresh TEMP TABLE(type, id) name (deduplicated), or None if
-    there is nothing to hop from."""
+                           role: Optional[str] = None, rel_member_types: Optional[set[str]] = None) -> Optional[str]:
+    """One hop: way.refs -> nodes; relation.members -> ids of the member
+    types in `rel_member_types` (default: all of n/w/r, e.g. for `>>`'s
+    per-hop use and the `(r)` recurse filter). Returns a fresh TEMP
+    TABLE(type, id) name (deduplicated), or None if there is nothing to hop
+    from."""
     want_way = restrict_source_types is None or "way" in restrict_source_types
     want_rel = restrict_source_types is None or "relation" in restrict_source_types
-    hop_sql, params = _forward_hop_sql(source_table, want_way, want_rel, role)
+    hop_sql, params = _forward_hop_sql(source_table, want_way, want_rel, role, rel_member_types)
     if hop_sql is None:
         return None
     name = idset.fresh_table_name("fwd")
@@ -153,21 +163,61 @@ def hydrate_ids_table(con, manifest: catalog.Manifest, id_table: str, tag_filter
 def build_forward_one_hop(con, manifest: catalog.Manifest, source_table: str, promoted_keys: set[str],
                            restrict_source_types: Optional[set[str]] = None,
                            role: Optional[str] = None) -> tuple[str, int]:
-    table = forward_new_ids_table(con, source_table, restrict_source_types, role)
-    if table is None:
+    """`>`: all nodes of ways in the source, plus all node and way members
+    of relations in the source (relation-type members are excluded here --
+    that is `>>`'s job), plus all nodes of those member ways (Overpass
+    resolves a relation's member way down to its own nodes too, not just
+    the way itself; see docs/m0-contracts.md and the `27_down_transitive_*`
+    corpus symptom this fixes)."""
+    hop_table = forward_new_ids_table(con, source_table, restrict_source_types, role, rel_member_types={"n", "w"})
+    if hop_table is None:
         return empty_set_sql(), 0
-    sql, nfiles = hydrate_ids_table(con, manifest, table, [], promoted_keys)
-    return (sql or empty_set_sql()), nfiles
+    sql, nfiles = hydrate_ids_table(con, manifest, hop_table, [], promoted_keys)
+    total_files = nfiles
+    if sql is None:
+        return empty_set_sql(), total_files
+    hop_rows_table = idset.fresh_table_name("fwdrows")
+    con.execute(f"CREATE TEMP TABLE {hop_rows_table} AS {sql}")
+    selects = [f"SELECT * FROM {hop_rows_table}"]
+
+    # Second level: nodes of the way members found above. `hop_rows_table`
+    # already carries full way rows (with `refs`) for any way that came in
+    # as a relation member, so this is just another forward hop restricted
+    # to those.
+    node_ids_table = forward_new_ids_table(con, hop_rows_table, restrict_source_types={"way"})
+    if node_ids_table is not None:
+        node_sql, nfiles2 = hydrate_ids_table(con, manifest, node_ids_table, [], promoted_keys)
+        total_files += nfiles2
+        if node_sql:
+            selects.append(node_sql)
+
+    return "\nUNION ALL\n".join(selects), total_files
 
 
 def build_backward_one_hop(con, manifest: catalog.Manifest, source_table: str, promoted_keys: set[str],
                             restrict_source_types: Optional[set[str]] = None,
                             role: Optional[str] = None) -> tuple[str, int]:
-    table = backward_new_ids_table(con, manifest, source_table, restrict_source_types, role)
-    if table is None:
+    """`<`: all ways with a node from the source, plus all relations with a
+    node/way/relation from the source as a member, plus all relations that
+    have one of those *found ways* as a member (the extra hop Overpass does
+    that a single `backward_new_ids_table` call misses; see the
+    `25_up_from_node` corpus symptom this fixes)."""
+    hop_table = backward_new_ids_table(con, manifest, source_table, restrict_source_types, role)
+    if hop_table is None:
         return empty_set_sql(), 0
-    sql, nfiles = hydrate_ids_table(con, manifest, table, [], promoted_keys)
-    return (sql or empty_set_sql()), nfiles
+    total_files = 0
+    extra_rel_table = backward_new_ids_table(con, manifest, hop_table, restrict_source_types={"way"})
+    if extra_rel_table is not None:
+        merged = idset.fresh_table_name("bwdmerged")
+        con.execute(
+            f"CREATE TEMP TABLE {merged} AS "
+            f"SELECT type, id FROM {hop_table} "
+            f"UNION SELECT type, id FROM {extra_rel_table}"
+        )
+        hop_table = merged
+    sql, nfiles = hydrate_ids_table(con, manifest, hop_table, [], promoted_keys)
+    total_files += nfiles
+    return (sql or empty_set_sql()), total_files
 
 
 def recurse_transitive(con, manifest: catalog.Manifest, input_set: str, promoted_keys: set[str],
@@ -175,8 +225,18 @@ def recurse_transitive(con, manifest: catalog.Manifest, input_set: str, promoted
     """`>>` (direction='forward') or `<<` (direction='backward'): repeat one
     hop, accumulating newly discovered (type,id) pairs in a `seen` TEMP
     TABLE (an anti-join against it, not a growing Python set), until fixed
-    point. Returns a SELECT over everything newly discovered (never the
-    input set's own rows)."""
+    point. Returns a SELECT over everything newly discovered, plus -- for
+    `>>` only -- the relations already present in the input set itself.
+
+    That last part is a real, verified Overpass quirk: unlike `>`, `>>`
+    keeps relations of the *original* input set in its result even when
+    they are not otherwise reachable by recursing down from it (confirmed
+    against tests/corpus/27_down_transitive_from_relation.overpassql's
+    cached reference response, whose `relation["leisure"="park"](bbox);>>;`
+    output includes every one of the matched park relations, including
+    ones with no relation parent or relation members at all -- so they
+    cannot have been "discovered", only retained). `<<` has no such
+    exception; its own input rows are never echoed back."""
     seen = idset.fresh_table_name("seen")
     con.execute(f"CREATE TEMP TABLE {seen} AS SELECT DISTINCT type, id FROM {input_set}")
     frontier_table = input_set
@@ -216,6 +276,8 @@ def recurse_transitive(con, manifest: catalog.Manifest, input_set: str, promoted
         frontier_table = materialized
         if hop > 10000:  # safety valve against pathological cycles/bugs
             break
+    if direction == "forward":
+        discovered_selects.append(f"SELECT * FROM {input_set} WHERE type = 'relation'")
     if not discovered_selects:
         return empty_set_sql(), total_files
     return "\nUNION ALL\n".join(discovered_selects), total_files
