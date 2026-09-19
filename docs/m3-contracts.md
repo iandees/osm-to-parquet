@@ -480,3 +480,109 @@ observed, not a target.
 | updater on `s3://` | one `run_once` against a MemoryStore/LocalStore root through the store interface in tests; real R2 left to the runbook |
 | image | `docker build` if available; extension `LOAD` without network verified |
 | deployment code | `tsc --noEmit` clean; pure-function tests pass |
+
+## 9. Amendment: areas as the reference actually does them (W2b)
+
+Probing the reference (Overpass 0.7.62) after the first areas merge showed
+that section 4.1 was wrong about ways. Measured facts, each verified with
+live queries on `maps.mail.ru`:
+
+1. **Every closed way is an area** for `is_in`, `(area)`, `(pivot)` and
+   `map_to_area`: untagged closed ways, closed `highway=service` loops and
+   roundabouts, buildings, `landuse=grass` without a name — all of them.
+   Way areas are **not stored** by Overpass; they are the closed ways.
+2. **Way areas are printed as the way itself**: `area[name="Loring
+   Park"]; out;` returns `{"type":"way","id":42819182,"nodes":[…],
+   "tags":…}`, and `is_in` returns `way` elements for closed ways plus
+   `area` elements (`3600000000 + id`) for relations. `area(2400000000 +
+   way_id)` returns nothing on the reference.
+3. **Relation areas follow `areas.osm3s`** (the file in the Overpass
+   repo): relations with `type=multipolygon` **and** `name`, `type=boundary`
+   and `name`, `admin_level` and `name`, `postal_code`, or `addr:postcode`.
+   Unnamed multipolygons are not areas.
+4. **`way(area.a)` selects a way when at least one of its vertices is
+   strictly inside** the polygon. A way that crosses the boundary with no
+   vertex inside (a bridge whose two end nodes are on either side of a
+   river boundary) is not selected; `ST_Intersects` is therefore wrong.
+   Verified on ten partially-inside primary ways: 8 with ≥1 vertex inside
+   were selected, the 2 with none were not.
+
+This amendment replaces section 4.1 and changes 4.2–4.5 as follows.
+The engine hooks, statement hooks and the file ownership stay as before.
+
+### 9.1 Representation
+
+* A **way area is the closed way's own canonical row** (`type='way'`),
+  wherever areas appear in a set: `area[...]` results, `is_in` output,
+  `map_to_area` output. Closed means `refs[0] = refs[-1]` and at least 4
+  refs. No 2400000000 offset anywhere in sets or output; `area(N)` with
+  2400000000 ≤ N < 3600000000 is accepted as a lookup of way `N -
+  2400000000` (a superset of the reference, cheap, harmless).
+* A **relation area is a stored `area` row** (`type='area'`, `id =
+  3600000000 + relation id`) exactly as in section 4.2, derived for the
+  relations in rule 3 above that assemble into at least one valid ring.
+  Only these rows get polygon geometry files.
+* Polygon of a way area = `ST_MakePolygon(geometry)` of the way's
+  LINESTRING, computed when a filter needs it (hydrated by cell + id from
+  the way spatial files when the row's `geometry` is NULL, e.g. it came
+  from byid). A closed way whose polygon is invalid is `ST_MakeValid`-ed;
+  if it still has no area, it matches nothing.
+
+### 9.2 Files and manifest v4
+
+* `spatial/<gen>/area/cell=…/part-0.parquet` and
+  `index/<gen>/areas.parquet`: relation areas only (columns unchanged).
+* New `index/<gen>/way_areas.parquet`: closed ways that carry at least one
+  of the keys `name`, `ref`, `admin_level`, `boundary`, `place` — the keys
+  `area[...]` lookups use in practice (buildings with only an address are
+  deliberately not indexed). Columns: `id`, `tags`, promoted columns, meta,
+  `xmin_e7..ymax_e7`, `cell`, `hilbert`; sorted by `id`; row groups ~4 MB.
+  Manifest `areas.way_index: {"path", "rows", "bytes"}`, `stats.way_areas`.
+* `osmpq validate` checks both indexes; `osmpq areas`, `osmpq build` and
+  `osmpq compact` write both (compaction: relation areas re-derived for
+  touched relations as before; the way index is rewritten in full from the
+  compacted way tables — small, and simpler than merging).
+
+### 9.3 Statement and filter semantics
+
+* `area[...]` / `area(id)` / `area.a[...]`: relation rows from
+  `areas.parquet` ∪ way rows from `way_areas.parquet`, both with the tag
+  and id pushdown, way rows hydrated to full canonical rows (refs, geometry)
+  from the way spatial files by cell + id.
+* `(area)`, `(area.a)`, `(area:id)`: polygons from the area rows and the
+  closed way rows of the referenced set. Node: `ST_Within(point,
+  polygon)`. Way: **any vertex** `ST_Within` (never `ST_Intersects`).
+  Relation: any member node point within, or any member way with a vertex
+  within (from `geofilters.relation_geometry_table`). `implied_bbox` =
+  union bbox of the referenced polygons.
+* `(pivot.a)`: `way(pivot.a)` = the closed ways in `a` themselves;
+  `rel(pivot.a)` = relations `id - 3600000000` of the area rows in `a`.
+* `is_in`, `is_in(lat,lon)`: relation areas as before (candidate files by
+  `cells_for_bbox(manifest, "area", …)`), plus closed ways whose bbox
+  contains the point, from the way spatial files of the cells covering
+  the input (`cells_for_bbox(manifest, "way", …)`; ways are placed loosely,
+  so a containing way is in a cell whose bbox contains the point), tested
+  with `ST_Within`. Input ways/relations: any vertex within (documented
+  approximation). Output: way rows + area rows.
+* `map_to_area`: closed ways in the input → themselves; relations →
+  their area row when one exists.
+* `out count`: way areas are ways.
+
+### 9.4 Fixture, tests, corpus
+
+Fixture v4: relation areas only for the two relations that satisfy rule 3
+(give the multipolygon a `name`; add an unnamed multipolygon that must
+**not** become an area), plus `way_areas.parquet` for the named park and
+landuse ways. Tests updated to the representation above, including: a
+building-only closed way is found by `is_in` and `(area)` but not by
+`area[...]`; `way(area)` with a way that has no vertex inside but crosses
+the polygon is not selected; `is_in` returns the way row for a way area.
+Corpus 36–40, 49 keep their queries; 39 (`is_in`) must now pass against
+the cached reference response (the reference returns way elements for the
+closed ways containing the node).
+
+### 9.5 Report rows
+
+Re-measure the section 8 rows on Minnesota after the change (relation
+areas only: count, bytes, build time; the way index size) and the four
+timed queries.
