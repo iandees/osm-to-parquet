@@ -81,19 +81,63 @@ untagged node file:
 
 | column | DuckDB | parquet-rs default | parquet-rs tuned |
 | --- | --- | --- | --- |
-| id | 1.7 B | 3.5 B | _pending_ |
-| lat_e7 / lon_e7 | 3.2 B | 5.0 B | _pending_ |
-| hilbert | 0.9 B | 2.3 B | _pending_ |
+| id | 2.0 B | 3.9 B | 2.0 B |
+| lat_e7 / lon_e7 | 3.0 / 3.2 B | 4.8 / 4.9 B | 1.9 / 2.0 B |
+| hilbert (sort key) | 0.7 B | 2.2 B | 0.5 B |
+| timestamp / changeset / uid / version | NULL in the DuckDB build | 1.6 / 0.6 / 0.3 / 0.1 B | 1.2 / 0.5 / 0.3 / 0.1 B |
+| whole row | 8.9 B | 18.5 B | 8.6 B |
 
-_The tuned numbers and the resulting dataset size are filled in below once
-the writer change lands._
+Tuned settings (now part of the contract): Parquet 2.0 writer, ZSTD level 3,
+dictionary encoding only on strings, DELTA_BINARY_PACKED on the sort key and
+on every coordinate/bbox column, PLAIN on refs, changeset, timestamp and
+uid (deltas measured larger there), row groups sized by compressed bytes
+(nodes 1 MB, byid ways 2 MB, spatial ways 4 MB, relations 8k rows). The
+Rust output is now smaller than DuckDB's while carrying metadata for every
+node.
 
 ## Dataset size and the planet
 
-Minnesota, Rust producer, before writer tuning: spatial 2.29 GB, byid 1.40
-GB, index 0.26 GB (3.7 GB total, 6.8 GB at planet scale per 100M nodes).
-Metadata on all nodes costs about 120 MB per 55M nodes (2.2 bytes per
-node) and is required for JOSM-style `out meta`.
+Minnesota, Rust producer:
+
+| | before tuning | after tuning |
+| --- | --- | --- |
+| spatial (node + way + relation) | 2.29 GB | 1.50 GB |
+| byid | 1.40 GB | 0.69 GB |
+| index (node_way + member + row groups) | 0.26 GB | 0.24 GB |
+| **total** | **3.95 GB** | **2.42 GB** |
+| spatial way row groups | 541 (8.6k rows) | 334 (13.9k rows) |
+| spatial node row groups | 1,062 (52k rows) | 691 (80k rows) |
+
+That is 44 bytes per node-equivalent including full metadata, the id-sorted
+copy and the node_way index; roughly 440 GB for the planet, of which the
+spatial copy the queries read is about 270 GB. Metadata on all nodes costs
+about 2.1 bytes per node and is required for JOSM-style `out meta`.
+
+## Final query profile (Rust-produced, tuned dataset; cold Engine per query, HTTP range reads, downtown Minneapolis)
+
+| query | elements | seconds | requests | files | MB | M0 requests / MB |
+| --- | --- | --- | --- | --- | --- | --- |
+| wizard `amenity=cafe` | 72 | 0.18 | 38 | 14 | 6.5 | 43 / 8.8 |
+| wizard `building` | 6,893 | 0.37 | 85 | 19 | 12.3 | 95 / 15.9 |
+| wizard `highway=residential` | 159 | 0.19 | 46 | 14 | 7.1 | 59 / 9.5 |
+| wizard `natural=water` | 2,645 | 0.71 | 394 | 31 | 55 | 247 / 60 |
+| wizard `leisure=park` | 1,320 | 0.35 | 119 | 22 | 23 | 116 / 24 |
+| `nwr[amenity] out center` | 1,311 | 0.24 | 84 | 18 | 8.0 | 84 / 9.5 |
+| `way[highway] out geom` | 3,452 | 0.23 | 30 | 5 | 7.0 | 40 / 6.8 |
+| `way[building]`, any `out` | 614 | 0.08-0.11 | 27 | 5 | 4.4 | 39 / 6.6 |
+| `[bbox:]` + `nwr[shop]` | 103 | 0.12 | 41 | 13 | 5.0 | 55 / 7.3 |
+| regex `["name"~"^Lake",i]` | 12 | 0.13 | 51 | 13 | 10.5 | 65 / 10 |
+| `node(w)` | 5,878 | 0.17 | 38 | 8 | 7.0 | 49 / 9.4 |
+| `way(bn)` / `<` / `<<` | 422-654 | 0.22-0.43 | 45-82 | 8-12 | 12-15 | 44-87 / 12-14 |
+| `>>` from relations | 1,244 | 0.49 | 115 | 23 | 27 | 107 / 28 |
+| difference / intersection | 2,831 / 966 | 0.25 / 0.20 | 30 / 33 | 5 | 7.0 / 9.5 | 40 / 42 |
+| `node(id)` / `way(id:...)` | 1 / 2 | 0.03 / 0.09 | 5 / 9 | 1 / 2 | 1.0 / 5.0 | 5 / 7 |
+| relation `out geom` | 6 | 0.22 | 92 | 17 | 18 | 84 / 10 |
+
+Harness on this dataset: 54 of 55 gradable entries match, same set as M0.
+The `natural=water` wizard query is the one that still fans out (31 files,
+394 requests) because lake multipolygons pull member ways and their nodes
+from many cells; it is also the one where a warm Engine helps most.
 
 ## Findings
 
