@@ -5,6 +5,7 @@ contract section 8: spatial bbox scan, byid id lookup, and set-sourced
 """
 from __future__ import annotations
 
+import weakref
 from typing import Optional
 
 from osmpq.ql.ast import TagFilter
@@ -49,7 +50,101 @@ def _quote_str_list(values: list[str]) -> str:
 # (manifest v1/v2, or a v3 manifest with `deltas: {}`), every one of these
 # functions degrades to exactly the pre-M2 SQL with zero extra files read
 # and zero extra queries executed -- the "no extra scans" requirement.
+#
+# Per-run whole-tier cache (performance follow-up to the section above): a
+# query like the water bbox hydrates node/way/relation members through
+# several separate cell-scoped hops (member nodes, member ways, the
+# relation's own bbox-exact-filter pass, ...), and *every one* of those
+# used to call `spatial_delta_layer`/`byid_current_rows` again, each
+# reissuing `read_parquet(tier_file) WHERE cell IN (...)` (or `WHERE
+# id_pred`) plus a fresh `QUALIFY row_number()` re-rank against the file
+# straight off disk/network -- 5-6+ redundant rereads of the same
+# few-hundred-row tier files for one query, each paying its own round trip
+# when the root is remote. Since a tier is small by design (contract
+# sections 3/5: "they are small"), a tier's spatial/byid/tombstones file is
+# instead loaded *whole*, unfiltered and unranked, into a TEMP TABLE once
+# per DuckDB connection (`_load_or_cache` below) and reused by every later
+# call on that connection: cell/id filtering and the rank-and-dedupe
+# `QUALIFY` still happen in SQL, exactly as before, just against that
+# already-resident TEMP TABLE instead of a fresh Parquet scan -- so this is
+# a pure caching change, not a semantics change (same filter, same rank,
+# same result), and it also means two different tables that read the same
+# tombstones.parquet (every type does, contract section 3) now share one
+# cached copy instead of re-reading it once per type.
+#
+# The cache is keyed on the DuckDB connection object itself, via a
+# `WeakKeyDictionary`: `Engine.run_program` opens a fresh cursor per run
+# (executor.py's module docstring), so this is automatically scoped to one
+# run and self-cleans when that cursor is closed/GC'd -- no ContextVar
+# plumbing needed, and a direct (non-Engine) caller/test that passes its
+# own `duckdb.connect()` still gets first-call-loads-it, later-calls-reuse
+# semantics, scoped to that connection's own lifetime.
 # --------------------------------------------------------------------------
+
+_RUN_DELTA_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+# Planet-scale guard (docs/m2-contracts.md section 4 follow-up): the whole
+# point of the cache above is that a replication tier is small enough to
+# hold entirely in memory, which is true at Minnesota scale (a few hundred
+# rows) but not guaranteed at planet scale, where a `week` tier could in
+# principle accumulate a large fraction of a busy region's edits. Rather
+# than pay for an extra HEAD/metadata request per tier/table to learn the
+# real file size, this estimates it from the manifest's own declared row
+# count (`deltas.<tier>.rows.<table>`, already-loaded JSON, zero I/O) at a
+# generous per-row byte estimate; a tier/table whose estimated size passes
+# `DELTA_WHOLE_LOAD_MAX_BYTES` falls back to the pre-this-optimization
+# per-call `read_parquet(...)` read (still correct, just not cached/deduped
+# -- the same cost this run already had before the cache existed) instead
+# of ever being loaded whole. Tests exercise this by monkeypatching
+# `DELTA_WHOLE_LOAD_MAX_BYTES` down so a tiny fixture tier trips it.
+DELTA_WHOLE_LOAD_MAX_BYTES = 256 * 1024 * 1024
+DELTA_WHOLE_LOAD_EST_BYTES_PER_ROW = 150
+
+
+def _run_cache(con) -> dict:
+    cache = _RUN_DELTA_CACHE.get(con)
+    if cache is None:
+        cache = {}
+        _RUN_DELTA_CACHE[con] = cache
+    return cache
+
+
+def _tier_too_large(tier: dict, *tables: str) -> bool:
+    """True when the estimated size of `tier`'s file(s) for `tables`
+    (summed -- callers pass one table for a spatial/byid file, all three
+    for the shared tombstones file) exceeds `DELTA_WHOLE_LOAD_MAX_BYTES` at
+    `DELTA_WHOLE_LOAD_EST_BYTES_PER_ROW` bytes/row. A tier with no declared
+    row count for any of `tables` (an older/hand-built manifest without
+    `rows`) is never considered too large -- "unknown" defaults to the
+    behavior this cache exists to enable, same spirit as every other
+    manifest-v3-follow-up field defaulting to "no effect" when absent."""
+    rows = (tier.get("rows") or {})
+    total = sum(rows.get(t) or 0 for t in tables)
+    if not total:
+        return False
+    return total * DELTA_WHOLE_LOAD_EST_BYTES_PER_ROW > DELTA_WHOLE_LOAD_MAX_BYTES
+
+
+def _load_or_cache(con, path: str, too_large: bool) -> tuple[str, int]:
+    """Return (FROM-able SQL source for the whole contents of `path`,
+    files_read_this_call). When `too_large` (the planet-scale guard
+    tripped), returns a raw, uncached ``read_parquet('path')`` -- one
+    Parquet read every call, exactly the pre-cache behavior -- so an
+    oversized tier is still read correctly, just never materialized whole.
+    Otherwise returns the name of a per-connection-cached TEMP TABLE
+    holding `SELECT * FROM read_parquet('path')`: 1 file read the first
+    time (the load), 0 on every later call for the same `path` on this
+    connection (`_RUN_DELTA_CACHE`, keyed on `con`)."""
+    if too_large:
+        return f"read_parquet('{_q1(path)}')", 1
+    cache = _run_cache(con)
+    name = cache.get(path)
+    if name is not None:
+        return name, 0
+    name = idset.fresh_table_name("dfull")
+    con.execute(f"CREATE TEMP TABLE {name} AS SELECT * FROM read_parquet('{_q1(path)}')")
+    cache[path] = name
+    return name, 1
 
 
 def spatial_delta_layer(con, manifest: catalog.Manifest, table: str, cells: list[str]) -> Optional[dict]:
@@ -86,16 +181,24 @@ def spatial_delta_layer(con, manifest: catalog.Manifest, table: str, cells: list
     for tier in tiers:
         sp = tier["files"].get(table, {}).get("spatial")
         if sp:
-            files += 1
+            src, nfiles = _load_or_cache(con, sp, _tier_too_large(tier, table))
+            files += nfiles
             cand_parts.append(
-                f"SELECT *, {tier['rank']} AS __rank FROM read_parquet('{_q1(sp)}') "
+                f"SELECT *, {tier['rank']} AS __rank FROM {src} "
                 f"WHERE cell IN {cell_list_sql}"
             )
         tp = tier.get("tombstones")
         if tp:
-            files += 1
+            # One tombstones.parquet covers all three element types
+            # (contract section 3), so the size guard sums all three
+            # tables' declared row counts, and the cache is shared across
+            # every table's `spatial_delta_layer` call for this tier (same
+            # `tp` path -> same cache key) instead of being reloaded once
+            # per table.
+            src_t, nfiles_t = _load_or_cache(con, tp, _tier_too_large(tier, "node", "way", "relation"))
+            files += nfiles_t
             tomb_parts.append(
-                f"SELECT id FROM read_parquet('{_q1(tp)}') "
+                f"SELECT id FROM {src_t} "
                 f"WHERE type = '{table}' AND prev_cell IN {cell_list_sql}"
             )
     if not cand_parts:
@@ -236,10 +339,9 @@ def byid_current_rows(
         bp = tier["files"].get(element_type, {}).get("byid")
         if not bp:
             continue
-        files += 1
-        cand_parts.append(
-            f"SELECT *, {tier['rank']} AS __rank FROM read_parquet('{_q1(bp)}') WHERE {id_pred_sql}"
-        )
+        src, nfiles = _load_or_cache(con, bp, _tier_too_large(tier, element_type))
+        files += nfiles
+        cand_parts.append(f"SELECT *, {tier['rank']} AS __rank FROM {src} WHERE {id_pred_sql}")
     if not cand_parts:
         if not base_files:
             return empty_set_sql(), 0
@@ -1116,11 +1218,13 @@ def delta_way_ids_by_ref(con, manifest: catalog.Manifest, node_ids_source_sql: s
     complement to the `node_way` index scan in `recurse.backward_new_ids_table`.
     None when there are no delta tiers with a way byid file."""
     tiers = manifest.delta_tiers()
-    parts = [
-        f"SELECT *, {tier['rank']} AS __rank FROM read_parquet('{_q1(bp)}')"
-        for tier in tiers
-        if (bp := tier["files"].get("way", {}).get("byid"))
-    ]
+    parts = []
+    for tier in tiers:
+        bp = tier["files"].get("way", {}).get("byid")
+        if not bp:
+            continue
+        src, _nfiles = _load_or_cache(con, bp, _tier_too_large(tier, "way"))
+        parts.append(f"SELECT *, {tier['rank']} AS __rank FROM {src}")
     if not parts:
         return None
     name = idset.fresh_table_name("deltawayref")
@@ -1148,11 +1252,13 @@ def delta_relation_ids_by_member(
     is the relation's own current cell (from the delta row), same as the
     base member index's `parent_cell`."""
     tiers = manifest.delta_tiers()
-    parts = [
-        f"SELECT *, {tier['rank']} AS __rank FROM read_parquet('{_q1(bp)}')"
-        for tier in tiers
-        if (bp := tier["files"].get("relation", {}).get("byid"))
-    ]
+    parts = []
+    for tier in tiers:
+        bp = tier["files"].get("relation", {}).get("byid")
+        if not bp:
+            continue
+        src, _nfiles = _load_or_cache(con, bp, _tier_too_large(tier, "relation"))
+        parts.append(f"SELECT *, {tier['rank']} AS __rank FROM {src}")
     if not parts:
         return None
     role_clause = f" AND m.role = '{_q1(role)}'" if role is not None else ""

@@ -410,6 +410,108 @@ def test_stats_delta_rows_and_shadowed_present(engine_v3, fixture_v3):
 
 
 # --------------------------------------------------------------------------
+# Performance follow-up (docs/m2-contracts.md section 4): `current_rows`/
+# `byid_current_rows` used to reissue `read_parquet(tier_file)` (plus a
+# fresh `QUALIFY row_number()` re-rank) on *every* cell-scoped/by-id call
+# within one query, even though a tier's whole file is small enough to load
+# once and reuse. `sources._load_or_cache` is the cache that fixes that
+# (keyed on the DuckDB connection, so it is scoped to one `Engine.run()`);
+# `sources.DELTA_WHOLE_LOAD_MAX_BYTES`/`_tier_too_large` is the planet-scale
+# guard that keeps an oversized tier from being loaded whole at all.
+# --------------------------------------------------------------------------
+
+
+def test_load_or_cache_reuses_temp_table_across_calls_same_connection(fixture_v3):
+    import duckdb
+
+    manifest = catalog.load_manifest(fixture_v3.root)
+    tier = manifest.delta_tiers()[0]
+    path = tier["files"]["node"]["spatial"]
+
+    con = duckdb.connect()
+    try:
+        src1, nfiles1 = sources._load_or_cache(con, path, too_large=False)
+        src2, nfiles2 = sources._load_or_cache(con, path, too_large=False)
+        assert nfiles1 == 1  # first call: one real Parquet read (the load)
+        assert nfiles2 == 0  # second call on the same connection: reused, no read
+        assert src1 == src2  # same cached TEMP TABLE name
+        assert con.execute(f"SELECT count(*) FROM {src1}").fetchone()[0] > 0
+
+        # A different connection gets its own cache -- no cross-connection
+        # leakage, and no reuse across what would be two different runs.
+        con2 = duckdb.connect()
+        try:
+            src3, nfiles3 = sources._load_or_cache(con2, path, too_large=False)
+            assert nfiles3 == 1
+        finally:
+            con2.close()
+    finally:
+        con.close()
+
+
+def test_tier_too_large_guard(monkeypatch):
+    tier = {"rows": {"node": 1000, "way": 0, "relation": 0}}
+    assert not sources._tier_too_large(tier, "node")
+    monkeypatch.setattr(sources, "DELTA_WHOLE_LOAD_MAX_BYTES", 1)
+    assert sources._tier_too_large(tier, "node")
+    # A tier with no declared row count for the table(s) asked about is
+    # never "too large" -- absence means "no effect", same convention as
+    # every other manifest-v3-follow-up field.
+    assert not sources._tier_too_large({"rows": {}}, "node")
+    assert not sources._tier_too_large({}, "node")
+
+
+def test_load_or_cache_too_large_falls_back_to_uncached_read_parquet(fixture_v3):
+    import duckdb
+
+    manifest = catalog.load_manifest(fixture_v3.root)
+    tier = manifest.delta_tiers()[0]
+    path = tier["files"]["node"]["spatial"]
+
+    con = duckdb.connect()
+    try:
+        src1, nfiles1 = sources._load_or_cache(con, path, too_large=True)
+        src2, nfiles2 = sources._load_or_cache(con, path, too_large=True)
+        # Every call re-reads the raw file -- the old, pre-cache behavior
+        # -- instead of ever materializing it into a TEMP TABLE.
+        assert nfiles1 == 1 and nfiles2 == 1
+        assert src1 == src2 == f"read_parquet('{path}')"
+        assert con.execute(f"SELECT count(*) FROM {src1}").fetchone()[0] > 0
+    finally:
+        con.close()
+
+
+def test_delta_whole_load_size_guard_falls_back_but_stays_correct(engine_v3, fixture_v3, monkeypatch):
+    """With `DELTA_WHOLE_LOAD_MAX_BYTES` monkeypatched down so every tier's
+    (tiny, few-row) file trips the planet-scale guard, `current_rows` and
+    `byid_current_rows` take the uncached per-call `read_parquet(...)`
+    fallback path for every tier/table this query touches -- and the
+    results must be byte-for-byte the same as the (now-default) cached
+    path exercises elsewhere in this file, since the guard only changes
+    where the bytes come from, never the query semantics."""
+    monkeypatch.setattr(sources, "DELTA_WHOLE_LOAD_MAX_BYTES", 1)
+    manifest = catalog.load_manifest(fixture_v3.root)
+    for tier in manifest.delta_tiers():
+        for t in ("node", "way", "relation"):
+            if (tier.get("rows") or {}).get(t):  # only tables this tier actually touched
+                assert sources._tier_too_large(tier, t)
+
+    b = bbox_args(fixture_v3.leaf_bbox["000"])
+    r = engine_v3.run(f"[out:json];node[amenity=cafe]({b});out;")
+    by_id = {e["id"]: e for e in r.elements}
+    assert fixture_v3.delta_modified_node_id in by_id
+    assert by_id[fixture_v3.delta_modified_node_id]["tags"] == fixture_v3.delta_modified_node_day_tags
+    assert ids_of(r.elements, "node").count(fixture_v3.delta_modified_node_id) == 1
+
+    r2 = engine_v3.run(f"[out:json];way({fixture_v3.delta_deleted_way_id});out;")
+    assert r2.elements == []
+
+    r3 = engine_v3.run(f"[out:json];way({fixture_v3.delta_new_way_id});out geom;")
+    assert len(r3.elements) == 1
+    assert r3.elements[0]["nodes"] == fixture_v3.delta_new_way_refs
+
+
+# --------------------------------------------------------------------------
 # v2 (no deltas) is unaffected: same results, and the SQL the executor runs
 # never touches anything delta-specific. Captured via a logging proxy on
 # the cursor DuckDB executes through (Engine.run_program opens exactly one
