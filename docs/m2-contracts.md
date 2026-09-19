@@ -70,6 +70,14 @@ delta file holds **at most one row per (type, id)** (newest wins when a
 tier is rewritten). Untouched columns are never NULL-filled: a delta row is
 the element's complete current state.
 
+Conventions fixed during implementation: delta spatial files carry a
+**stored `cell` column** for every type (base node spatial files get it from
+the hive directory; delta files are flat). byid delta rows for node and way
+carry `hilbert` like the M1 base parts; byid relation rows do not. Deleted
+rows have every payload column NULL except `id`, and `cell = prev_cell`, in
+both the spatial and the byid file. Tombstone `type` values are the full
+names `node`/`way`/`relation`.
+
 `tombstones.parquet`: `type VARCHAR, id BIGINT, prev_cell VARCHAR, seq BIGINT`
 for every row in the tier whose `prev_cell` is not NULL and differs from
 `cell`, or which is deleted. Sorted by `(prev_cell, type, id)`. This is what
@@ -85,6 +93,7 @@ Manifest v3 (`manifest_version: 3`) adds:
 "replication_source": "https://download.openstreetmap.fr/replication/north-america/us-midwest/minute",
 "deltas": {
   "hour": {"version": 17, "seq_from": 7293001, "seq_to": 7293042, "timestamp": "...", "rows": {"node": 0, "way": 0, "relation": 0},
+           "cells": {"node": ["0213", "..."], "way": ["021", "root"], "relation": ["root"]},
            "files": {"node": {"spatial": "delta/g0001/hour/17/node.spatial.parquet", "byid": "..."}, "way": {...}, "relation": {...}, "tombstones": "delta/g0001/hour/17/tombstones.parquet"}},
   "day": {...}, "week": {...}
 }
@@ -99,7 +108,9 @@ Tier precedence: `hour` > `day` > `week` > base. For a table T and query
 cells C (from `cells_for_bbox`):
 
 1. **Delta candidates**: rows of T's spatial delta file of each present
-   tier with `cell IN C` (Parquet pruning on `cell` min/max works because
+   tier with `cell IN C`, where C for the delta side is computed over the
+   union of the base's cells and the tier's `cells` list (a new element may
+   live in a cell the base has no file for) (Parquet pruning on `cell` min/max works because
    the file is sorted by cell; the engine may also prune by bbox columns).
    Rank tiers, keep one row per `(type, id)` by highest rank
    (`QUALIFY row_number() OVER (PARTITION BY id ORDER BY rank DESC) = 1`).
