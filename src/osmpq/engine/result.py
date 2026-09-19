@@ -21,6 +21,55 @@ COPYRIGHT = (
     "The data is made available under ODbL."
 )
 
+_CSV_OTYPE = {"node": "n", "way": "w", "relation": "r"}
+
+
+def _csv_header_name(field: str) -> str:
+    """The reference server's CSV header spells a special field "@id" (not
+    "::id"), confirmed empirically (`[out:csv(name,::id,::lat,::lon)]`
+    against maps.mail.ru/.../interpreter, see
+    tests/corpus/47_out_csv.overpassql); a plain tag key keeps its own
+    name unchanged."""
+    if field.startswith("::"):
+        return "@" + field[2:]
+    return field
+
+
+def _csv_lat_lon(el: dict, which: str) -> str:
+    if el.get("type") == "node":
+        v = el.get(which)
+    else:
+        v = (el.get("center") or {}).get(which)
+    return "" if v is None else str(v)
+
+
+def _csv_field_value(el: dict, field: str) -> str:
+    """Contract 3.6: tag keys plus `::id`, `::type`, `::otype`, `::lat`,
+    `::lon`, `::count`, `::version`, `::timestamp`, `::changeset`, `::uid`,
+    `::user`. `out count` rows fill only `::count` and leave everything
+    else empty. Values are written raw, no quoting (contract; matches the
+    reference)."""
+    if el.get("type") == "count":
+        if field == "::count":
+            return str((el.get("tags") or {}).get("total", ""))
+        return ""
+    if field == "::id":
+        return str(el.get("id", ""))
+    if field == "::type":
+        return str(el.get("type", ""))
+    if field == "::otype":
+        return _CSV_OTYPE.get(el.get("type"), "")
+    if field == "::lat":
+        return _csv_lat_lon(el, "lat")
+    if field == "::lon":
+        return _csv_lat_lon(el, "lon")
+    if field == "::count":
+        return ""
+    if field in ("::version", "::timestamp", "::changeset", "::uid", "::user"):
+        v = el.get(field[2:])
+        return "" if v is None else str(v)
+    return (el.get("tags") or {}).get(field, "")
+
 
 @dataclass
 class Result:
@@ -34,6 +83,8 @@ class Result:
         fmt = self.settings.out_format if self.settings is not None else "json"
         if fmt == "xml":
             return self._render_xml(), "application/osm3s+xml"
+        if fmt == "csv":
+            return self._render_csv(), "text/csv; charset=utf-8"
         return self._render_json(), "application/json"
 
     # ---------------------------------------------------------------- JSON
@@ -51,6 +102,28 @@ class Result:
         if self.remark:
             envelope["remark"] = self.remark
         return json.dumps(envelope, indent=2)
+
+    # ----------------------------------------------------------------- CSV
+
+    def _render_csv(self) -> str:
+        """Contract 3.6. `settings.csv_fields` is always populated by the
+        parser when `out_format == "csv"` (the `[out:csv(...)]` grammar
+        requires the parenthesized field list), but this degrades to an
+        empty column set rather than erroring if it's ever missing."""
+        fields = (self.settings.csv_fields if self.settings else None) or []
+        sep = self.settings.csv_separator if self.settings else "\t"
+        header = self.settings.csv_header if self.settings else True
+
+        lines: list[str] = []
+        if header:
+            # Verified against the reference server: a field written
+            # "::id" in the query is headed "@id" in the csv output (not
+            # "::id") -- the "::" -> "@" spelling is display-only, it does
+            # not change which column the field selects.
+            lines.append(sep.join(_csv_header_name(f) for f in fields))
+        for el in self.elements:
+            lines.append(sep.join(_csv_field_value(el, f) for f in fields))
+        return "\n".join(lines) + ("\n" if lines else "")
 
     # ----------------------------------------------------------------- XML
 
@@ -141,7 +214,14 @@ def _way_xml(el: dict) -> str:
     geometry = el.get("geometry")
     if nodes is not None and geometry is not None and len(nodes) == len(geometry):
         for ref, pt in zip(nodes, geometry):
-            body += f'<nd ref="{ref}" lat="{pt["lat"]}" lon="{pt["lon"]}"/>'
+            # out geom(bbox): a vertex outside the clip bbox (and not
+            # adjacent to one inside it) has pt=None -- render.py's module
+            # docstring -- a bare <nd ref=.../> with no lat/lon, exactly
+            # like the reference.
+            if pt is None:
+                body += f'<nd ref="{ref}"/>'
+            else:
+                body += f'<nd ref="{ref}" lat="{pt["lat"]}" lon="{pt["lon"]}"/>'
     elif nodes is not None:
         for ref in nodes:
             body += f'<nd ref="{ref}"/>'

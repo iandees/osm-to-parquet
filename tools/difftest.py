@@ -16,6 +16,7 @@ import re
 import sys
 import time
 import xml.etree.ElementTree as ET
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -62,6 +63,43 @@ def force_out_json(query: str) -> str:
 
 def is_xml_variant(query: str) -> bool:
     return bool(re.search(r"\[out:\s*xml\s*\]", query))
+
+
+def is_csv_variant(query: str) -> bool:
+    """`[out:csv(...)]` corpus entries are graded as a multiset of lines
+    (docs/m3-contracts.md section 3.6), never forced to `[out:json]` like
+    every other entry -- csv is exactly the thing being tested."""
+    return bool(re.search(r"\[out:\s*csv\s*\(", query))
+
+
+def compare_csv(ref_body: str, local_body: str) -> "Comparison":
+    """Order-insensitive multiset comparison of the lines after the header
+    (contract 3.6). The header line itself (present or not) is compared
+    exactly, since it isn't affected by result-set ordering."""
+    ref_lines_all = ref_body.splitlines()
+    local_lines_all = local_body.splitlines()
+    ref_header = ref_lines_all[0] if ref_lines_all else ""
+    local_header = local_lines_all[0] if local_lines_all else ""
+    ref_rows = Counter(l for l in ref_lines_all[1:] if l != "")
+    local_rows = Counter(l for l in local_lines_all[1:] if l != "")
+
+    other_mismatches: list[str] = []
+    if ref_header != local_header:
+        other_mismatches.append(f"csv header differs (ref={ref_header!r} local={local_header!r})")
+    missing = sorted((ref_rows - local_rows).elements())
+    extra = sorted((local_rows - ref_rows).elements())
+    if missing:
+        other_mismatches.append(f"csv rows missing (in reference, not local): {missing[:5]}")
+    if extra:
+        other_mismatches.append(f"csv rows extra (in local, not reference): {extra[:5]}")
+
+    status = "PASS" if not other_mismatches else "FAIL"
+    return Comparison(
+        status=status,
+        ref_count=sum(ref_rows.values()),
+        local_count=sum(local_rows.values()),
+        other_mismatches=other_mismatches,
+    )
 
 
 _LEADING_COMMENT_RE = re.compile(r"\s*(?://[^\n]*\n|/\*.*?\*/)", re.DOTALL)
@@ -303,6 +341,13 @@ def geometry_close(a: Optional[list[dict]], b: Optional[list[dict]]) -> bool:
     if len(a) != len(b):
         return False
     for pa, pb in zip(a, b):
+        # `out geom(bbox)` clipping (docs/m3-contracts.md section 3.4):
+        # a vertex outside the clip bbox is `null` in JSON, so either or
+        # both entries at a given position can be None.
+        if pa is None or pb is None:
+            if pa != pb:
+                return False
+            continue
         if not coords_close(pa.get("lat"), pb.get("lat"), GEOM_TOL):
             return False
         if not coords_close(pa.get("lon"), pb.get("lon"), GEOM_TOL):
@@ -475,6 +520,94 @@ def bboxes_for(query_file: str, bbox_names: list[str], bbox_name_arg: Optional[s
     return [bbox_names[0]]
 
 
+def _run_csv_task(
+    client: httpx.Client,
+    args: argparse.Namespace,
+    corpus_dir: Path,
+    qfile: Path,
+    bbox_name: str,
+    bbox: list[float],
+    raw_query: str,
+) -> QueryRunReport:
+    """Like the body of the main `run()` loop, but for a `[out:csv(...)]`
+    corpus entry: neither side is forced to `[out:json]`, and grading is
+    `compare_csv` (order-insensitive multiset of lines after the header)
+    instead of the element-set `compare()`."""
+    substituted = substitute_bbox(raw_query, bbox)
+    ref_query = substituted
+    if args.date:
+        # `--date` is inserted on the reference side only (same convention
+        # as the main json/xml flow above) -- the local engine doesn't
+        # implement `[date:]` (attic) queries at all.
+        ref_query = prepend_date(ref_query, args.date)
+    local_query = substituted
+
+    key = cache_key(qfile.name, bbox_name, ref_query)
+    cpath = cache_path(corpus_dir, key)
+
+    if args.local_only:
+        ref_result = cache_read(cpath)
+        if ref_result is None:
+            return QueryRunReport(
+                query_file=qfile.name, bbox_name=bbox_name, status="FAIL", ref_elements=0,
+                local_elements=None, missing=0, extra=0, tag_mismatches=0, ref_ms=0.0, local_ms=None,
+                message=f"no cached reference response at {cpath}; run --reference-only first",
+            )
+    else:
+        cached = cache_read(cpath)
+        if cached is not None and cached.ok:
+            ref_result = cached
+        else:
+            ref_result = fetch(
+                client, args.reference, ref_query, timeout=args.timeout, retries=args.retries,
+                sleep_between=args.sleep, label="reference",
+            )
+            cache_write(cpath, ref_result)
+            time.sleep(args.sleep)
+
+    if not ref_result.ok:
+        msg = ref_result.remark or ref_result.error or f"HTTP {ref_result.status_code}"
+        return QueryRunReport(
+            query_file=qfile.name, bbox_name=bbox_name, status="FAIL", ref_elements=0,
+            local_elements=None, missing=0, extra=0, tag_mismatches=0, ref_ms=ref_result.elapsed_ms,
+            local_ms=None, message=f"reference error: {msg}",
+        )
+
+    if args.reference_only:
+        return QueryRunReport(
+            query_file=qfile.name, bbox_name=bbox_name, status="PASS",
+            ref_elements=max(0, len(ref_result.body.splitlines()) - 1), local_elements=None,
+            missing=0, extra=0, tag_mismatches=0, ref_ms=ref_result.elapsed_ms, local_ms=None,
+            message="reference-only (cached)",
+        )
+
+    if args.local is None:
+        return QueryRunReport(
+            query_file=qfile.name, bbox_name=bbox_name, status="FAIL", ref_elements=0,
+            local_elements=None, missing=0, extra=0, tag_mismatches=0, ref_ms=ref_result.elapsed_ms,
+            local_ms=None, message="no --local given",
+        )
+
+    local_result = fetch(
+        client, args.local, local_query, timeout=args.timeout, retries=args.retries, sleep_between=0.0, label="local",
+    )
+    if not local_result.ok:
+        msg = local_result.remark or local_result.error or f"HTTP {local_result.status_code}"
+        return QueryRunReport(
+            query_file=qfile.name, bbox_name=bbox_name, status="FAIL", ref_elements=0,
+            local_elements=None, missing=0, extra=0, tag_mismatches=0, ref_ms=ref_result.elapsed_ms,
+            local_ms=local_result.elapsed_ms, message=f"local error: {msg}",
+        )
+
+    cmp = compare_csv(ref_result.body, local_result.body)
+    message = "; ".join(cmp.other_mismatches) if cmp.status == "FAIL" else ""
+    return QueryRunReport(
+        query_file=qfile.name, bbox_name=bbox_name, status=cmp.status, ref_elements=cmp.ref_count,
+        local_elements=cmp.local_count, missing=0, extra=0, tag_mismatches=0, ref_ms=ref_result.elapsed_ms,
+        local_ms=local_result.elapsed_ms, message=message, detail=cmp.to_dict(),
+    )
+
+
 def run(args: argparse.Namespace) -> int:
     corpus_dir = Path(args.corpus)
     bboxes = load_bboxes(Path(args.bboxes))
@@ -495,6 +628,10 @@ def run(args: argparse.Namespace) -> int:
     with httpx.Client() as client:
         for task_num, (qfile, bbox_name) in enumerate(tasks, start=1):
             raw_query = qfile.read_text()
+            if is_csv_variant(raw_query):
+                print(f"[{task_num}/{total_tasks}] {qfile.name} @ {bbox_name} (csv) ...", file=sys.stderr, flush=True)
+                reports.append(_run_csv_task(client, args, corpus_dir, qfile, bbox_name, bboxes[bbox_name], raw_query))
+                continue
             if True:
                 print(f"[{task_num}/{total_tasks}] {qfile.name} @ {bbox_name} ...", file=sys.stderr, flush=True)
                 bbox = bboxes[bbox_name]
