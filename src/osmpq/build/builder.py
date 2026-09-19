@@ -603,6 +603,33 @@ def _write_loose_spatial(con, root: str, generation: str, table_name: str, src_t
     return out
 
 
+RANGE_TARGET_ROWS = 4_000_000  # headroom under the 5M-row part limit for duplicate keys
+
+
+def _range_bounds(con, table: str, col: str, total: int) -> list[tuple]:
+    """Split ``table`` into id ranges of about RANGE_TARGET_ROWS rows on ``col``
+    using quantiles, so parts can be written one at a time without numbering
+    every row (a window function over tens of millions of rows with map
+    columns does not fit in memory)."""
+    n = max(1, -(-total // RANGE_TARGET_ROWS))
+    if n == 1:
+        return [(None, None)]
+    fractions = [i / n for i in range(1, n)]
+    qs = con.execute(f"SELECT quantile_disc({col}, {fractions}) FROM {table}").fetchone()[0]
+    qs = sorted(set(qs))
+    bounds = [None] + qs + [None]
+    return list(zip(bounds[:-1], bounds[1:]))
+
+
+def _range_cond(col: str, lo, hi) -> str:
+    parts = []
+    if lo is not None:
+        parts.append(f"{col} >= {lo}")
+    if hi is not None:
+        parts.append(f"{col} < {hi}")
+    return " AND ".join(parts) or "TRUE"
+
+
 def _write_byid(con, root: str, generation: str, table_name: str, promoted_keys: list[str]) -> list[dict]:
     promoted_sql = _promoted_select(promoted_keys)
     if table_name == "node":
@@ -626,20 +653,13 @@ def _write_byid(con, root: str, generation: str, table_name: str, promoted_keys:
     total = con.execute(f"SELECT count(*) FROM {src}").fetchone()[0]
     if total == 0:
         return []
-    con.execute(f"CREATE TEMP TABLE _byid_numbered AS SELECT {select_cols}, "
-                f"row_number() OVER (ORDER BY id) AS rn FROM {src}")
     parts = []
-    n_parts = (total + BYID_PART_ROWS - 1) // BYID_PART_ROWS
-    out_cols = select_cols  # same columns minus rn
-    for k in range(n_parts):
-        lo = k * BYID_PART_ROWS + 1
-        hi = min((k + 1) * BYID_PART_ROWS, total)
-        select_sql = f"SELECT {out_cols} FROM _byid_numbered WHERE rn BETWEEN {lo} AND {hi} ORDER BY id"
+    for k, (lo, hi) in enumerate(_range_bounds(con, src, "id", total)):
+        cond = _range_cond("id", lo, hi)
+        select_sql = f"SELECT {select_cols} FROM {src} WHERE {cond} ORDER BY id"
         path = Path(root) / "byid" / generation / table_name / f"part-{k:05d}.parquet"
         rows, size = _copy_to_parquet(con, select_sql, path)
-        min_id, max_id = con.execute(
-            f"SELECT min(id), max(id) FROM _byid_numbered WHERE rn BETWEEN {lo} AND {hi}"
-        ).fetchone()
+        min_id, max_id = con.execute(f"SELECT min(id), max(id) FROM {src} WHERE {cond}").fetchone()
         parts.append({
             "path": f"byid/{generation}/{table_name}/part-{k:05d}.parquet",
             "min_id": min_id,
@@ -647,30 +667,28 @@ def _write_byid(con, root: str, generation: str, table_name: str, promoted_keys:
             "rows": rows,
             "bytes": size,
         })
-    con.execute("DROP TABLE _byid_numbered")
     return parts
 
 
 def _write_node_way_index(con, root: str, generation: str) -> list[dict]:
+    # A regular (on-disk) table, not TEMP: at state scale this has tens of
+    # millions of rows and must be allowed to exceed memory.
+    con.execute("DROP TABLE IF EXISTS _nw_index")
     con.execute("""
-        CREATE TEMP TABLE _nw_index AS
+        CREATE TABLE _nw_index AS
         SELECT t.ref AS node_id, w.id AS way_id
         FROM way1 w, UNNEST(w.refs) AS t(ref)
-        ORDER BY node_id, way_id
     """)
     total = con.execute("SELECT count(*) FROM _nw_index").fetchone()[0]
     parts = []
     if total > 0:
-        con.execute("CREATE TEMP TABLE _nw_numbered AS SELECT *, row_number() OVER (ORDER BY node_id, way_id) AS rn FROM _nw_index")
-        n_parts = (total + BYID_PART_ROWS - 1) // BYID_PART_ROWS
-        for k in range(n_parts):
-            lo = k * BYID_PART_ROWS + 1
-            hi = min((k + 1) * BYID_PART_ROWS, total)
-            select_sql = f"SELECT node_id, way_id FROM _nw_numbered WHERE rn BETWEEN {lo} AND {hi} ORDER BY node_id, way_id"
+        for k, (lo, hi) in enumerate(_range_bounds(con, "_nw_index", "node_id", total)):
+            cond = _range_cond("node_id", lo, hi)
+            select_sql = f"SELECT node_id, way_id FROM _nw_index WHERE {cond} ORDER BY node_id, way_id"
             path = Path(root) / "index" / generation / "node_way" / f"part-{k:05d}.parquet"
             rows, size = _copy_to_parquet(con, select_sql, path)
             min_id, max_id = con.execute(
-                f"SELECT min(node_id), max(node_id) FROM _nw_numbered WHERE rn BETWEEN {lo} AND {hi}"
+                f"SELECT min(node_id), max(node_id) FROM _nw_index WHERE {cond}"
             ).fetchone()
             parts.append({
                 "path": f"index/{generation}/node_way/part-{k:05d}.parquet",
@@ -679,29 +697,27 @@ def _write_node_way_index(con, root: str, generation: str) -> list[dict]:
                 "rows": rows,
                 "bytes": size,
             })
-        con.execute("DROP TABLE _nw_numbered")
     con.execute("DROP TABLE _nw_index")
     return parts
 
 
 def _write_member_index(con, root: str, generation: str) -> list[dict]:
+    con.execute("DROP TABLE IF EXISTS _mem_index")
     con.execute("""
-        CREATE TEMP TABLE _mem_index AS
+        CREATE TABLE _mem_index AS
         SELECT m.type AS member_type, m.ref AS member_id, r.id AS parent_id, m.role AS role, r.cell AS parent_cell
         FROM relation1 r, UNNEST(r.members) AS t(m)
-        ORDER BY member_type, member_id, parent_id
     """)
     total = con.execute("SELECT count(*) FROM _mem_index").fetchone()[0]
     parts = []
     if total > 0:
-        con.execute("CREATE TEMP TABLE _mem_numbered AS SELECT *, row_number() OVER (ORDER BY member_type, member_id, parent_id) AS rn FROM _mem_index")
-        n_parts = (total + BYID_PART_ROWS - 1) // BYID_PART_ROWS
-        for k in range(n_parts):
-            lo = k * BYID_PART_ROWS + 1
-            hi = min((k + 1) * BYID_PART_ROWS, total)
+        # member_type has three values; range on member_id within one file set
+        # keeps the contract's (member_type, member_id, parent_id) sort per part.
+        for k, (lo, hi) in enumerate(_range_bounds(con, "_mem_index", "member_id", total)):
+            cond = _range_cond("member_id", lo, hi)
             select_sql = (
-                f"SELECT member_type, member_id, parent_id, role, parent_cell FROM _mem_numbered "
-                f"WHERE rn BETWEEN {lo} AND {hi} ORDER BY member_type, member_id, parent_id"
+                f"SELECT member_type, member_id, parent_id, role, parent_cell FROM _mem_index "
+                f"WHERE {cond} ORDER BY member_type, member_id, parent_id"
             )
             path = Path(root) / "index" / generation / "member" / f"part-{k:05d}.parquet"
             rows, size = _copy_to_parquet(con, select_sql, path)
@@ -710,6 +726,5 @@ def _write_member_index(con, root: str, generation: str) -> list[dict]:
                 "rows": rows,
                 "bytes": size,
             })
-        con.execute("DROP TABLE _mem_numbered")
     con.execute("DROP TABLE _mem_index")
     return parts
