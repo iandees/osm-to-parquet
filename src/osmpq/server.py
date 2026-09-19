@@ -6,6 +6,7 @@ created once at startup. Kept thin: all query semantics live in
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -16,7 +17,19 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from osmpq.engine import Engine
 from osmpq.errors import ParseError, UnsupportedError
 
-app = FastAPI(title="osmpq")
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    # Fail fast if the manifest can't be loaded, but don't crash import
+    # (useful for tests that set OSMPQ_ROOT per-test, after import time).
+    try:
+        get_engine()
+    except Exception:
+        pass
+    yield
+
+
+app = FastAPI(title="osmpq", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,16 +57,6 @@ def reset_engine() -> None:
     Used by tests that point at a fresh fixture root per test."""
     global _engine
     _engine = None
-
-
-@app.on_event("startup")
-def _startup() -> None:
-    # Fail fast if the manifest can't be loaded, but don't crash import
-    # (useful for tests that set OSMPQ_ROOT per-test).
-    try:
-        get_engine()
-    except Exception:
-        pass
 
 
 def _error_html(message: str, line: int = 1) -> str:

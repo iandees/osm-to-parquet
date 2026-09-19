@@ -226,6 +226,8 @@ def execute_difference(ctx: Context, d: Difference) -> None:
 
 def execute_out(ctx: Context, o: Out) -> None:
     _require_set(ctx, o.input_set)
+    if o.geom_bbox is not None:
+        raise UnsupportedError("out geom(s,w,n,e) (clipped geometry) is not supported in M0")
     elements, _extra = render.build_elements(ctx.con, ctx.manifest, o.input_set, o)
     ctx.elements.extend(elements)
 
