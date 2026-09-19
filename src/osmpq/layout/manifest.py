@@ -66,9 +66,16 @@ class Manifest:
     manifest_version: int = MANIFEST_VERSION
     schema_version: int = SCHEMA_VERSION
     coordinate_scale: int = COORDINATE_SCALE
+    # -- v2 fields (docs/m1-contracts.md section 5); None/empty when absent
+    # from a v1 manifest, so v1 loading is unaffected. ------------------------
+    ancestor_depths: Optional[list[int]] = None
+    max_depth: Optional[int] = None
+    rowgroup_index: dict[str, str] = field(default_factory=dict)
+    producer: dict[str, str] = field(default_factory=dict)
+    stats: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "manifest_version": self.manifest_version,
             "generation": self.generation,
             "schema_version": self.schema_version,
@@ -83,6 +90,13 @@ class Manifest:
             "byid": self.byid,
             "index": self.index,
         }
+        if self.manifest_version >= 2:
+            d["ancestor_depths"] = self.ancestor_depths
+            d["max_depth"] = self.max_depth
+            d["rowgroup_index"] = self.rowgroup_index
+            d["producer"] = self.producer
+            d["stats"] = self.stats
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Manifest":
@@ -100,6 +114,11 @@ class Manifest:
             manifest_version=d.get("manifest_version", MANIFEST_VERSION),
             schema_version=d.get("schema_version", SCHEMA_VERSION),
             coordinate_scale=d.get("coordinate_scale", COORDINATE_SCALE),
+            ancestor_depths=d.get("ancestor_depths"),
+            max_depth=d.get("max_depth"),
+            rowgroup_index=d.get("rowgroup_index", {}),
+            producer=d.get("producer", {}),
+            stats=d.get("stats", {}),
         )
 
     # -- convenience accessors -------------------------------------------------
@@ -130,6 +149,8 @@ class Manifest:
         for _table, parts in self.index.items():
             for part in parts:
                 paths.append(part["path"])
+        for path in self.rowgroup_index.values():
+            paths.append(path)
         return paths
 
 

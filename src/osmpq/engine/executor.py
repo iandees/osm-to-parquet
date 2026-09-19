@@ -34,6 +34,13 @@ class Engine:
 
         con = duckdb.connect(":memory:", config=self.duckdb_config)
         timer: Optional[threading.Timer] = None
+        # m1-contracts.md section 6: a per-run accumulator so
+        # `catalog.prune_files_by_bbox` can report files-considered vs
+        # files-read (Manifest instances are cached/reused across
+        # `Engine.run()` calls) without threading an extra return value
+        # through every SQL-builder call chain. Always reset, even on an
+        # error/timeout path, so a later run never inherits stale counts.
+        self.manifest._file_stats = catalog.FileStats()
         try:
             self._setup_connection(con, settings)
             hilbert.register_duckdb_udfs(con)
@@ -78,9 +85,18 @@ class Engine:
                     timer.cancel()
 
             elapsed = time.monotonic() - start
+            file_stats = self.manifest._file_stats
+            # `ctx.files_read` already reflects row-group pruning (the file
+            # lists shrink in place, inside sources.py, before anything
+            # counts them), so it doubles as "files_read" directly; the
+            # only thing missing is the pre-prune candidate count for those
+            # same (row-group-indexed) selections, which `file_stats`
+            # tracked on the side.
+            files_considered = ctx.files_read + max(0, file_stats.considered - file_stats.read)
             stats = {
                 "seconds": elapsed,
                 "files_read": ctx.files_read,
+                "files_considered": files_considered,
                 "elements": len(ctx.elements),
             }
             if ctx.warnings:
@@ -101,6 +117,7 @@ class Engine:
             )
         finally:
             con.close()
+            self.manifest._file_stats = None
 
     # -- internals --------------------------------------------------------
 

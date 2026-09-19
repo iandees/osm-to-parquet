@@ -1,20 +1,21 @@
-"""M0 builder: PBF -> the layout of docs/m0-contracts.md sections 1-4.
+"""M1 builder: two stages over docs/m1-contracts.md.
 
-Reads the PBF with DuckDB's ``spatial`` extension (``ST_ReadOSM``, which
-returns raw node/way/relation rows with refs but no version metadata) and
-the community ``osmium`` extension (``osmium_read``, which returns version
-metadata for ways, relations and *tagged* nodes, joined back in by
-``(type, id)``). Untagged nodes therefore have NULL meta columns in M0 --
-see the "known gaps" note in ``build()``'s docstring.
+``build(opts)`` is the M0-compatible entry point (``osmpq build <pbf>
+<root>``): it runs :func:`osmpq.build.raw.raw_build` into a temp ``raw/``
+directory and then :func:`build_from_raw`, per m1-contracts.md section 7.
 
-Everything that must touch every node (cell assignment, Hilbert keys) is
-vectorized with numpy; everything counted in the tens-of-thousands to low
-millions (ways, relations, per-cell/per-part file writes) is a plain Python
-loop calling into DuckDB per iteration, which is fine at that scale and much
-simpler than trying to express loose-cell assignment as one query.
+``build_from_raw(opts)`` is ``osmpq build --raw <rawdir> <root>``: it places
+the raw node/way files (link/copy/move), computes relation
+bbox/cell/hilbert/centroid from the raw parts (a join, not a full node
+scan), writes the member index, builds the row-group index side files from
+Parquet footers, and writes manifest v2. It works from *either* producer's
+``raw/`` layout (``osmpq-raw`` or ``osmpq raw-py``).
 """
 from __future__ import annotations
 
+import json
+import os
+import shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -23,16 +24,24 @@ from typing import Optional
 
 import numpy as np
 
+from osmpq.build import common
+from osmpq.build import rowgroups as rowgroups_mod
+from osmpq.build.raw import RawBuildOptions, raw_build
 from osmpq.layout import cells as cells_mod
 from osmpq.layout import hilbert as hilbert_mod
 from osmpq.layout import manifest as manifest_mod
 
-BYID_PART_ROWS = 5_000_000
-ROW_GROUP_SIZE = 100_000
+BUILD_PRODUCER_NAME = "osmpq 0.1.0"
+RELATION_PART_ROWS = common.RANGE_TARGET_ROWS
 
 
 def _log(msg: str) -> None:
-    print(f"[osmpq build] {msg}", file=sys.stderr, flush=True)
+    common.log("osmpq build", msg)
+
+
+# --------------------------------------------------------------------------
+# M0-compatible entry point: PBF -> root, via a temp raw/ dir
+# --------------------------------------------------------------------------
 
 
 @dataclass
@@ -42,27 +51,94 @@ class BuildOptions:
     bbox: Optional[tuple[float, float, float, float]] = None  # s,w,n,e
     generation: Optional[str] = None
     max_nodes_per_cell: int = 1_000_000
+    max_depth: int = cells_mod.DEFAULT_MAX_DEPTH_V2
     promoted_keys: Optional[list[str]] = None
     timestamp: Optional[str] = None
     replication_sequence: Optional[int] = None
     threads: Optional[int] = None
     memory_limit: Optional[str] = None
     tmpdir: Optional[str] = None
+    mode: str = "link"  # link|copy|move, for placing the intermediate raw/ files
 
 
 def build(opts: BuildOptions) -> manifest_mod.Manifest:
-    t_start = time.time()
+    """``osmpq build <pbf> <root>``: raw-py into a temp dir, then build --raw."""
     tmpdir = Path(opts.tmpdir) if opts.tmpdir else Path.cwd() / ".osmpq-tmp"
     tmpdir.mkdir(parents=True, exist_ok=True)
+    rawdir = tmpdir / "raw"
+    raw_opts = RawBuildOptions(
+        pbf_path=opts.pbf_path,
+        rawdir=str(rawdir),
+        bbox=opts.bbox,
+        max_nodes_per_cell=opts.max_nodes_per_cell,
+        max_depth=opts.max_depth,
+        promoted_keys=opts.promoted_keys,
+        threads=opts.threads,
+        memory_limit=opts.memory_limit,
+        tmpdir=str(tmpdir / "raw-build-tmp"),
+    )
+    raw_build(raw_opts)
+    from_raw_opts = BuildFromRawOptions(
+        rawdir=str(rawdir),
+        root=opts.root,
+        generation=opts.generation,
+        timestamp=opts.timestamp,
+        replication_sequence=opts.replication_sequence,
+        threads=opts.threads,
+        memory_limit=opts.memory_limit,
+        tmpdir=str(tmpdir / "build-from-raw-tmp"),
+        mode=opts.mode,
+    )
+    return build_from_raw(from_raw_opts)
+
+
+# --------------------------------------------------------------------------
+# build --raw: raw/ -> dataset root, manifest v2
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class BuildFromRawOptions:
+    rawdir: str
+    root: str
+    generation: Optional[str] = None
+    timestamp: Optional[str] = None
+    replication_sequence: Optional[int] = None
+    threads: Optional[int] = None
+    memory_limit: Optional[str] = None
+    tmpdir: Optional[str] = None
+    mode: str = "link"  # link|copy|move
+
+
+def build_from_raw(opts: BuildFromRawOptions) -> manifest_mod.Manifest:
+    t_start = time.time()
+    timer = common.Timer()
+    rawdir = Path(opts.rawdir)
     root_is_local = "://" not in opts.root
     if root_is_local:
         Path(opts.root).mkdir(parents=True, exist_ok=True)
+    tmpdir = Path(opts.tmpdir) if opts.tmpdir else Path.cwd() / ".osmpq-build-raw-tmp"
+    tmpdir.mkdir(parents=True, exist_ok=True)
 
-    promoted_keys = list(opts.promoted_keys or manifest_mod.DEFAULT_PROMOTED_KEYS)
+    leaves_json = json.loads((rawdir / "leaves.json").read_text())
+    leaves = list(leaves_json["leaves"])
+    max_depth = int(leaves_json.get("max_depth", cells_mod.DEFAULT_MAX_DEPTH_V2))
+    ancestor_depths = list(leaves_json.get("ancestor_depths", cells_mod.DEFAULT_ANCESTOR_DEPTHS))
+    leaf_index = cells_mod.LeafIndex(leaves)
+
+    summary_path = rawdir / "summary.json"
+    raw_summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
+    promoted_keys = list(raw_summary.get("promoted_keys") or manifest_mod.DEFAULT_PROMOTED_KEYS)
+    producer_raw = raw_summary.get("producer", "unknown")
+    source = raw_summary.get("source", rawdir.name)
+
+    gen_number = manifest_mod.next_manifest_number(opts.root)
+    generation = opts.generation or f"g{gen_number:04d}"
+    _log(f"writing generation {generation} to {opts.root} from raw {rawdir} ...")
 
     import duckdb
 
-    db_path = tmpdir / "build.duckdb"
+    db_path = tmpdir / "build-from-raw.duckdb"
     if db_path.exists():
         db_path.unlink()
     con = duckdb.connect(str(db_path))
@@ -75,147 +151,341 @@ def build(opts: BuildOptions) -> manifest_mod.Manifest:
     con.execute("SET preserve_insertion_order=false")
     con.execute("INSTALL spatial")
     con.execute("LOAD spatial")
-    con.execute("INSTALL osmium FROM community")
-    con.execute("LOAD osmium")
-    if not root_is_local:
-        con.execute("INSTALL httpfs")
-        con.execute("LOAD httpfs")
 
-    pbf = opts.pbf_path.replace("'", "''")
-    _log(f"reading {opts.pbf_path} ...")
-    t0 = time.time()
-    con.execute(f"""
-        CREATE TABLE raw_osm AS
-        SELECT kind::VARCHAR AS kind, id, tags, refs, lat, lon, ref_roles,
-               list_transform(ref_types, x -> CASE x
-                   WHEN 'node' THEN 'n' WHEN 'way' THEN 'w' WHEN 'relation' THEN 'r' END) AS ref_types
-        FROM ST_ReadOSM('{pbf}')
-    """)
-    con.execute(f"""
-        CREATE TABLE raw_meta AS
-        SELECT DISTINCT ON (type, id) type, id,
-               CAST(version AS INTEGER) AS version,
-               CAST(changeset AS BIGINT) AS changeset,
-               CAST(timestamp AS TIMESTAMP) AS timestamp,
-               CAST(uid AS INTEGER) AS uid,
-               username AS "user"
-        FROM osmium_read('{pbf}')
-    """)
-    counts = dict(con.execute("SELECT kind, count(*) FROM raw_osm GROUP BY kind").fetchall())
-    _log(f"read {sum(counts.values())} raw rows {counts} in {time.time()-t0:.1f}s")
+    root = Path(opts.root)
+    bytes_by_kind = {"spatial": 0, "byid": 0, "index": 0}
 
-    con.execute("""
-        CREATE TABLE node0 AS
-        SELECT r.id,
-               CAST(round(r.lat*1e7) AS INTEGER) AS lat_e7,
-               CAST(round(r.lon*1e7) AS INTEGER) AS lon_e7,
-               r.tags,
-               m.version, m.changeset, m.timestamp, m.uid, m."user"
-        FROM raw_osm r LEFT JOIN raw_meta m ON m.type='node' AND m.id=r.id
-        WHERE r.kind='node'
-    """)
-    con.execute("""
-        CREATE TABLE way0 AS
-        SELECT r.id, r.refs, r.tags,
-               m.version, m.changeset, m.timestamp, m.uid, m."user"
-        FROM raw_osm r LEFT JOIN raw_meta m ON m.type='way' AND m.id=r.id
-        WHERE r.kind='way'
-    """)
-    con.execute("""
-        CREATE TABLE relation0 AS
-        SELECT r.id, r.tags,
-               list_transform(range(1, len(coalesce(r.refs, [])) + 1),
-                   i -> struct_pack("type" := r.ref_types[i], ref := r.refs[i],
-                                    role := coalesce(r.ref_roles[i], ''))) AS members,
-               m.version, m.changeset, m.timestamp, m.uid, m."user"
-        FROM raw_osm r LEFT JOIN raw_meta m ON m.type='relation' AND m.id=r.id
-        WHERE r.kind='relation'
-    """)
-    con.execute("DROP TABLE raw_osm")
-    con.execute("DROP TABLE raw_meta")
+    # ---- place node/way byid + spatial files as-is -----------------------------
+    node_byid_manifest, n_bytes = _place_and_index_byid(rawdir / "node", root / "byid" / generation / "node", opts.mode)
+    bytes_by_kind["byid"] += n_bytes
+    way_byid_manifest, w_bytes = _place_and_index_byid(rawdir / "way", root / "byid" / generation / "way", opts.mode)
+    bytes_by_kind["byid"] += w_bytes
+    _log(f"placed byid node/way files in {timer.lap('place_byid'):.1f}s")
 
-    if opts.bbox is not None:
-        _apply_bbox_extract(con, opts.bbox)
+    node_table_manifest, node_bytes = _place_node_spatial(rawdir, root, generation, opts.mode)
+    bytes_by_kind["spatial"] += node_bytes
+    way_table_manifest, way_bytes, way_files_for_rg = _place_way_spatial(rawdir, root, generation, opts.mode)
+    bytes_by_kind["spatial"] += way_bytes
+    _log(f"placed spatial node/way files in {timer.lap('place_spatial'):.1f}s")
 
-    n_nodes, n_ways, n_relations = (
-        con.execute("SELECT count(*) FROM node0").fetchone()[0],
-        con.execute("SELECT count(*) FROM way0").fetchone()[0],
-        con.execute("SELECT count(*) FROM relation0").fetchone()[0],
+    node_way_manifest, nw_bytes = _place_node_way_index(rawdir, root, generation, opts.mode)
+    bytes_by_kind["index"] += nw_bytes
+    _log(f"placed node_way index in {timer.lap('place_node_way'):.1f}s")
+
+    # ---- relations: bbox/cell/hilbert/centroid, byid + spatial + member index --
+    relation_table_manifest, relation_byid_manifest, member_manifest, rel_bytes = _build_relations(
+        con, rawdir, root, generation, promoted_keys, leaf_index, ancestor_depths, max_depth
     )
-    _log(f"nodes={n_nodes} ways={n_ways} relations={n_relations}")
+    bytes_by_kind["spatial"] += rel_bytes["spatial"]
+    bytes_by_kind["byid"] += rel_bytes["byid"]
+    bytes_by_kind["index"] += rel_bytes["member"]
+    _log(f"computed + wrote relations in {timer.lap('relations'):.1f}s")
 
-    # ---- way geometry / bbox --------------------------------------------------
-    t0 = time.time()
-    # Materialize the way->node join first (hash join, spills to disk), then
-    # aggregate in id-range batches: an ordered list() over tens of millions
-    # of rows in one go cannot spill and runs out of memory at state scale.
-    con.execute("""
-        CREATE TABLE way_pts AS
-        SELECT w.id AS way_id, t.ordinal, n.lat_e7, n.lon_e7
-        FROM way0 w, UNNEST(w.refs) WITH ORDINALITY AS t(ref, ordinal)
-        LEFT JOIN node0 n ON n.id = t.ref
-    """)
-    con.execute("""
-        CREATE TABLE way_geom (
-            id BIGINT, ymin_e7 INTEGER, ymax_e7 INTEGER, xmin_e7 INTEGER, xmax_e7 INTEGER,
-            geometry GEOMETRY
-        )
-    """)
-    batch_rows = 250_000
-    bounds = [r[0] for r in con.execute(f"""
-        SELECT id FROM (SELECT id, row_number() OVER (ORDER BY id) AS rn FROM way0)
-        WHERE rn % {batch_rows} = 1 ORDER BY id
-    """).fetchall()]
-    bounds.append(None)
-    for lo, hi in zip(bounds[:-1], bounds[1:]):
-        cond = f"way_id >= {lo}" + (f" AND way_id < {hi}" if hi is not None else "")
-        con.execute(f"""
-            INSERT INTO way_geom
-            SELECT way_id AS id,
-                   CASE WHEN count(lat_e7) > 0 THEN min(lat_e7) END AS ymin_e7,
-                   CASE WHEN count(lat_e7) > 0 THEN max(lat_e7) END AS ymax_e7,
-                   CASE WHEN count(lat_e7) > 0 THEN min(lon_e7) END AS xmin_e7,
-                   CASE WHEN count(lat_e7) > 0 THEN max(lon_e7) END AS xmax_e7,
-                   CASE WHEN count(lat_e7) >= 2 THEN
-                       ST_MakeLine(list(ST_Point(lon_e7 / 1e7, lat_e7 / 1e7) ORDER BY ordinal)
-                                   FILTER (WHERE lat_e7 IS NOT NULL))
-                   END AS geometry
-            FROM way_pts WHERE {cond}
-            GROUP BY way_id
-        """)
-    con.execute("DROP TABLE way_pts")
-    con.execute("""
-        CREATE TABLE way1 AS
-        SELECT w.id, w.refs, w.tags, w.version, w.changeset, w.timestamp, w.uid, w."user",
-               g.xmin_e7, g.ymin_e7, g.xmax_e7, g.ymax_e7, g.geometry,
-               (coalesce(len(w.refs), 0) >= 4 AND w.refs[1] = w.refs[len(w.refs)]) AS is_closed,
-               CASE WHEN g.xmin_e7 IS NULL THEN NULL
-                    ELSE CAST(round((g.ymin_e7 + g.ymax_e7) / 2.0) AS INTEGER) END AS centroid_lat_e7,
-               CASE WHEN g.xmin_e7 IS NULL THEN NULL
-                    ELSE CAST(round((g.xmin_e7 + g.xmax_e7) / 2.0) AS INTEGER) END AS centroid_lon_e7
-        FROM way0 w JOIN way_geom g ON g.id = w.id
-    """)
-    con.execute("""
-        ALTER TABLE way1 ADD COLUMN is_area BOOLEAN
-    """)
-    con.execute("""
-        UPDATE way1 SET is_area = (
-            is_closed
-            AND coalesce(tags['area'], '') != 'no'
-            AND NOT (
-                (tags['highway'] IS NOT NULL OR tags['barrier'] IS NOT NULL)
-                AND coalesce(tags['area'], '') != 'yes'
-            )
-        )
-    """)
-    con.execute("DROP TABLE way_geom")
-    _log(f"way geometry/bbox built in {time.time()-t0:.1f}s")
+    # ---- row-group index side files ---------------------------------------------
+    node_rg_files = _node_rowgroup_files(node_table_manifest, generation)
+    way_rg_files = way_files_for_rg
+    relation_rg_files = _relation_rowgroup_files(relation_table_manifest, generation)
+    node_rg_path, node_rg_rows = rowgroups_mod.write_rowgroup_index(con, opts.root, generation, "node", node_rg_files)
+    way_rg_path, way_rg_rows = rowgroups_mod.write_rowgroup_index(con, opts.root, generation, "way", way_rg_files)
+    relation_rg_path, relation_rg_rows = rowgroups_mod.write_rowgroup_index(
+        con, opts.root, generation, "relation", relation_rg_files
+    )
+    for p in (node_rg_path, way_rg_path, relation_rg_path):
+        bytes_by_kind["index"] += (root / p).stat().st_size
+    _log(
+        f"built rowgroup index ({node_rg_rows} node, {way_rg_rows} way, {relation_rg_rows} relation rows) "
+        f"in {timer.lap('rowgroup_index'):.1f}s"
+    )
 
-    # ---- relation bbox (member nodes/ways, then one nested pass) -------------
-    t0 = time.time()
-    # Flatten members first so every lookup is a plain equi-join; a lateral
-    # UNNEST joined straight against the node table planned as a near
-    # cross product at state scale.
+    # ---- manifest -----------------------------------------------------------------
+    if opts.timestamp:
+        timestamp_osm_base = opts.timestamp
+    elif raw_summary.get("max_timestamp"):
+        timestamp_osm_base = raw_summary["max_timestamp"]
+    else:
+        timestamp_osm_base = "1970-01-01T00:00:00Z"
+
+    extent = raw_summary.get("extent") or [0.0, 0.0, 0.0, 0.0]
+
+    n_nodes = sum(p["rows"] for p in node_byid_manifest)
+    n_tagged_nodes = sum(
+        entry.get("tagged", {}).get("rows", 0) for entry in node_table_manifest["cells"].values()
+    )
+    n_ways = sum(p["rows"] for p in way_byid_manifest)
+    n_relations = sum(p["rows"] for p in relation_byid_manifest)
+
+    man = manifest_mod.Manifest(
+        generation=generation,
+        timestamp_osm_base=timestamp_osm_base,
+        source=source,
+        extent=[float(x) for x in extent],
+        leaf_cells=sorted(leaves),
+        tables={"node": node_table_manifest, "way": way_table_manifest, "relation": relation_table_manifest},
+        byid={"node": node_byid_manifest, "way": way_byid_manifest, "relation": relation_byid_manifest},
+        index={"node_way": node_way_manifest, "member": member_manifest},
+        promoted_keys=promoted_keys,
+        replication_sequence=opts.replication_sequence,
+        manifest_version=2,
+        ancestor_depths=ancestor_depths,
+        max_depth=max_depth,
+        rowgroup_index={"node": node_rg_path, "way": way_rg_path, "relation": relation_rg_path},
+        producer={"raw": producer_raw, "build": BUILD_PRODUCER_NAME},
+        stats={
+            "nodes": n_nodes,
+            "tagged_nodes": n_tagged_nodes,
+            "ways": n_ways,
+            "relations": n_relations,
+            "leaf_cells": len(leaves),
+            "bytes": bytes_by_kind,
+        },
+    )
+    manifest_mod.write_manifest(opts.root, man, gen_number)
+    _log(f"wrote manifest/{gen_number}.json and manifest/LATEST")
+    _log(f"done in {time.time()-t_start:.1f}s total")
+    con.close()
+    if db_path.exists():
+        db_path.unlink()
+    return man
+
+
+# --------------------------------------------------------------------------
+# file placement (link/copy/move)
+# --------------------------------------------------------------------------
+
+
+def _place_file(src: Path, dst: Path, mode: str) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        dst.unlink()
+    if mode == "copy":
+        shutil.copy2(src, dst)
+        return
+    if mode == "move":
+        shutil.move(str(src), str(dst))
+        return
+    # link (default): hardlink, falling back to copy across filesystems.
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def _parquet_stats(path: Path) -> tuple[int, int]:
+    """(rows, bytes) for a Parquet file, from the footer only."""
+    import pyarrow.parquet as pq
+
+    md = pq.ParquetFile(str(path)).metadata
+    return md.num_rows, path.stat().st_size
+
+
+def _parquet_id_range(path: Path) -> tuple[Optional[int], Optional[int]]:
+    """(min_id, max_id) for a Parquet file's ``id`` column, from row-group
+    statistics in the footer only (no data read)."""
+    import pyarrow.parquet as pq
+
+    md = pq.ParquetFile(str(path)).metadata
+    schema = md.schema
+    id_idx = next((i for i in range(len(schema)) if schema.column(i).name == "id"), None)
+    if id_idx is None:
+        return None, None
+    lo, hi = None, None
+    for rg in range(md.num_row_groups):
+        stats = md.row_group(rg).column(id_idx).statistics
+        if stats is None or not stats.has_min_max:
+            continue
+        lo = stats.min if lo is None else min(lo, stats.min)
+        hi = stats.max if hi is None else max(hi, stats.max)
+    return (int(lo) if lo is not None else None), (int(hi) if hi is not None else None)
+
+
+def _place_and_index_byid(src_dir: Path, dst_dir: Path, mode: str) -> tuple[list[dict], int]:
+    parts = []
+    total_bytes = 0
+    if not src_dir.exists():
+        return parts, total_bytes
+    root = dst_dir.parents[2]  # <root>/byid/<gen>/<table> -> <root>
+    for src in sorted(src_dir.glob("part-*.parquet")):
+        dst = dst_dir / src.name
+        _place_file(src, dst, mode)
+        rows, size = _parquet_stats(dst)
+        min_id, max_id = _parquet_id_range(dst)
+        parts.append({
+            "path": str(dst.relative_to(root)).replace(os.sep, "/"),
+            "min_id": min_id,
+            "max_id": max_id,
+            "rows": rows,
+            "bytes": size,
+        })
+        total_bytes += size
+    return parts, total_bytes
+
+
+def _place_node_spatial(rawdir: Path, root: Path, generation: str, mode: str) -> tuple[dict, int]:
+    src_base = rawdir / "spatial" / "node"
+    dst_base = root / "spatial" / generation / "node"
+    out: dict = {"cells": {}}
+    total_bytes = 0
+    if not src_base.exists():
+        return out, total_bytes
+    for cell_dir in sorted(src_base.glob("cell=*")):
+        cell = cell_dir.name.split("=", 1)[1]
+        entry: dict = {}
+        for tagged, suffix in ((True, "true"), (False, "false")):
+            src = cell_dir / f"tagged={suffix}" / "part-0.parquet"
+            if not src.exists():
+                continue
+            dst = dst_base / f"cell={cell}" / f"tagged={suffix}" / "part-0.parquet"
+            _place_file(src, dst, mode)
+            rows, size = _parquet_stats(dst)
+            if rows == 0:
+                dst.unlink()
+                continue
+            entry[("tagged" if tagged else "untagged")] = {
+                "path": str(dst.relative_to(root)).replace(os.sep, "/"),
+                "rows": rows,
+                "bytes": size,
+            }
+            total_bytes += size
+        if entry:
+            out["cells"][cell] = entry
+    return out, total_bytes
+
+
+def _place_way_spatial(rawdir: Path, root: Path, generation: str, mode: str) -> tuple[dict, int, list[dict]]:
+    src_base = rawdir / "spatial" / "way"
+    dst_base = root / "spatial" / generation / "way"
+    out: dict = {"cells": {}}
+    total_bytes = 0
+    rg_files: list[dict] = []
+    if not src_base.exists():
+        return out, total_bytes, rg_files
+    import duckdb
+
+    con = duckdb.connect()
+    con.execute("SET preserve_insertion_order=false")
+    for cell_dir in sorted(src_base.glob("cell=*")):
+        cell = cell_dir.name.split("=", 1)[1]
+        src = cell_dir / "part-0.parquet"
+        if not src.exists():
+            continue
+        dst = dst_base / f"cell={cell}" / "part-0.parquet"
+        _place_file(src, dst, mode)
+        rows, size = _parquet_stats(dst)
+        if rows == 0:
+            dst.unlink()
+            continue
+        posix = str(dst).replace("'", "''")
+        bbox = con.execute(
+            f"SELECT min(ymin_e7)/1e7, min(xmin_e7)/1e7, max(ymax_e7)/1e7, max(xmax_e7)/1e7 "
+            f"FROM read_parquet('{posix}')"
+        ).fetchone()
+        rel_path = str(dst.relative_to(root)).replace(os.sep, "/")
+        out["cells"][cell] = {
+            "path": rel_path,
+            "rows": rows,
+            "bytes": size,
+            "bbox": [float(x) if x is not None else None for x in bbox],
+        }
+        rg_files.append({"rel_path": rel_path, "cell": cell, "tagged": None})
+        total_bytes += size
+    con.close()
+    return out, total_bytes, rg_files
+
+
+def _node_rowgroup_files(node_table_manifest: dict, generation: str) -> list[dict]:
+    out = []
+    for cell, entry in node_table_manifest["cells"].items():
+        for tagged_key, tagged_bool in (("tagged", True), ("untagged", False)):
+            if tagged_key in entry:
+                out.append({"rel_path": entry[tagged_key]["path"], "cell": cell, "tagged": tagged_bool})
+    return out
+
+
+def _relation_rowgroup_files(relation_table_manifest: dict, generation: str) -> list[dict]:
+    return [
+        {"rel_path": entry["path"], "cell": cell, "tagged": None}
+        for cell, entry in relation_table_manifest["cells"].items()
+    ]
+
+
+def _place_node_way_index(rawdir: Path, root: Path, generation: str, mode: str) -> tuple[list[dict], int]:
+    src_dir = rawdir / "node_way"
+    dst_dir = root / "index" / generation / "node_way"
+    parts = []
+    total_bytes = 0
+    if not src_dir.exists():
+        return parts, total_bytes
+    for src in sorted(src_dir.glob("part-*.parquet")):
+        dst = dst_dir / src.name
+        _place_file(src, dst, mode)
+        rows, size = _parquet_stats(dst)
+        import pyarrow.parquet as pq
+
+        md = pq.ParquetFile(str(dst)).metadata
+        schema = md.schema
+        idx = next((i for i in range(len(schema)) if schema.column(i).name == "node_id"), None)
+        min_id = max_id = None
+        if idx is not None:
+            for rg in range(md.num_row_groups):
+                stats = md.row_group(rg).column(idx).statistics
+                if stats is None or not stats.has_min_max:
+                    continue
+                min_id = stats.min if min_id is None else min(min_id, stats.min)
+                max_id = stats.max if max_id is None else max(max_id, stats.max)
+        parts.append({
+            "path": str(dst.relative_to(root)).replace(os.sep, "/"),
+            "min_id": int(min_id) if min_id is not None else None,
+            "max_id": int(max_id) if max_id is not None else None,
+            "rows": rows,
+            "bytes": size,
+        })
+        total_bytes += size
+    return parts, total_bytes
+
+
+# --------------------------------------------------------------------------
+# relations: bbox / cell / hilbert / centroid from raw parts
+# --------------------------------------------------------------------------
+
+
+def _build_relations(
+    con,
+    rawdir: Path,
+    root: Path,
+    generation: str,
+    promoted_keys: list[str],
+    leaf_index: cells_mod.LeafIndex,
+    ancestor_depths: list[int],
+    max_depth: int,
+) -> tuple[dict, list[dict], list[dict], dict]:
+    rel_dir = rawdir / "relation"
+    rel_parts = sorted(str(p) for p in rel_dir.glob("part-*.parquet")) if rel_dir.exists() else []
+    empty_table_manifest = {"cells": {}}
+    empty_bytes = {"spatial": 0, "byid": 0, "member": 0}
+    if not rel_parts:
+        return empty_table_manifest, [], [], empty_bytes
+
+    node_byid_paths = sorted(str(p) for p in (root / "byid" / generation / "node").glob("part-*.parquet"))
+    way_byid_paths = sorted(str(p) for p in (root / "byid" / generation / "way").glob("part-*.parquet"))
+
+    con.execute(f"CREATE VIEW relation0 AS SELECT * FROM read_parquet({rel_parts!r})")
+    if node_byid_paths:
+        con.execute(f"CREATE VIEW node_byid AS SELECT id, lat_e7, lon_e7 FROM read_parquet({node_byid_paths!r})")
+    else:
+        con.execute("CREATE VIEW node_byid AS SELECT NULL::BIGINT AS id, NULL::INTEGER AS lat_e7, NULL::INTEGER AS lon_e7 WHERE FALSE")
+    if way_byid_paths:
+        con.execute(
+            f"CREATE VIEW way_byid AS SELECT id, xmin_e7, ymin_e7, xmax_e7, ymax_e7 FROM read_parquet({way_byid_paths!r})"
+        )
+    else:
+        con.execute(
+            "CREATE VIEW way_byid AS SELECT NULL::BIGINT AS id, NULL::INTEGER AS xmin_e7, "
+            "NULL::INTEGER AS ymin_e7, NULL::INTEGER AS xmax_e7, NULL::INTEGER AS ymax_e7 WHERE FALSE"
+        )
+
+    # Flatten members once; the node/way bbox joins below are then plain
+    # equi-joins keyed by member id, i.e. a semi-join against the byid
+    # tables on just the referenced ids -- not a scan of every node.
     con.execute("""
         CREATE TABLE rel_members AS
         SELECT r.id AS rel_id, m.type AS mtype, m.ref AS mref
@@ -225,11 +495,11 @@ def build(opts: BuildOptions) -> manifest_mod.Manifest:
         CREATE TABLE rel_member_bbox AS
         SELECT rm.rel_id, nn.lat_e7 AS ymin_e7, nn.lat_e7 AS ymax_e7,
                nn.lon_e7 AS xmin_e7, nn.lon_e7 AS xmax_e7
-        FROM rel_members rm JOIN node0 nn ON nn.id = rm.mref
+        FROM rel_members rm JOIN node_byid nn ON nn.id = rm.mref
         WHERE rm.mtype = 'n'
         UNION ALL
         SELECT rm.rel_id, ww.ymin_e7, ww.ymax_e7, ww.xmin_e7, ww.xmax_e7
-        FROM rel_members rm JOIN way1 ww ON ww.id = rm.mref
+        FROM rel_members rm JOIN way_byid ww ON ww.id = rm.mref
         WHERE rm.mtype = 'w' AND ww.xmin_e7 IS NOT NULL
     """)
     con.execute("""
@@ -255,9 +525,13 @@ def build(opts: BuildOptions) -> manifest_mod.Manifest:
     """)
     con.execute("DROP TABLE rel_member_bbox")
     con.execute("DROP TABLE rel_members")
-    con.execute("""
+    con.execute("DROP TABLE relation_bbox0")
+
+    promoted_sql = common.promoted_select(promoted_keys)
+    con.execute(f"""
         CREATE TABLE relation1 AS
-        SELECT r.id, r.tags, r.members, r.version, r.changeset, r.timestamp, r.uid, r."user",
+        SELECT r.id, r.tags, r.members, {promoted_sql},
+               r.version, r.changeset, r.timestamp, r.uid, r."user",
                b.xmin_e7, b.ymin_e7, b.xmax_e7, b.ymax_e7,
                CASE WHEN b.xmin_e7 IS NULL THEN NULL
                     ELSE CAST(round((b.ymin_e7 + b.ymax_e7) / 2.0) AS INTEGER) END AS centroid_lat_e7,
@@ -265,466 +539,126 @@ def build(opts: BuildOptions) -> manifest_mod.Manifest:
                     ELSE CAST(round((b.xmin_e7 + b.xmax_e7) / 2.0) AS INTEGER) END AS centroid_lon_e7
         FROM relation0 r JOIN relation_bbox1 b ON b.id = r.id
     """)
-    con.execute("DROP TABLE relation_bbox0")
     con.execute("DROP TABLE relation_bbox1")
-    _log(f"relation bbox built in {time.time()-t0:.1f}s")
 
-    # ---- leaf cell selection (aggregated counts, numpy) -----------------------
-    t0 = time.time()
-    leaf_cells = _select_leaf_cells(con, opts.max_nodes_per_cell)
-    leaf_index = cells_mod.LeafIndex(leaf_cells)
-    _log(f"selected {len(leaf_cells)} leaf cells in {time.time()-t0:.1f}s")
+    # v2 cell + hilbert, vectorized.
+    ids, ymin, xmin, ymax, xmax = con.execute(
+        "SELECT id, ymin_e7, xmin_e7, ymax_e7, xmax_e7 FROM relation1"
+    ).fetchnumpy().values()
 
-    # ---- node cell + hilbert (vectorized) --------------------------------------
-    t0 = time.time()
-    ids, lat_e7, lon_e7 = con.execute("SELECT id, lat_e7, lon_e7 FROM node0").fetchnumpy().values()
-    qk = cells_mod.point_to_qk_np(lat_e7, lon_e7)
-    leaf_idx = leaf_index.leaf_index_for_qk(qk)
-    leaf_keys_arr = np.array(leaf_index.leaves_by_lo, dtype=object)
-    node_cell = leaf_keys_arr[leaf_idx]
-    node_hilbert = hilbert_mod.hilbert_keys(lat_e7, lon_e7)
-    _register_assignment(con, "node_assign", ids, node_cell, node_hilbert)
-    con.execute("""
-        CREATE TABLE node1 AS
-        SELECT n.*, a.cell, a.hilbert FROM node0 n JOIN node_assign a USING (id)
-    """)
-    _log(f"node cell/hilbert assigned in {time.time()-t0:.1f}s")
+    def _filled_f64(col: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if isinstance(col, np.ma.MaskedArray):
+            return col.filled(np.nan).astype("float64"), np.ma.getmaskarray(col)
+        arr = np.asarray(col, dtype="float64")
+        return arr, np.zeros(len(arr), dtype=bool)
 
-    # ---- way / relation cell + hilbert (bbox descent, python loop) ------------
-    t0 = time.time()
-    _assign_loose_cells(con, "way1", leaf_index)
-    _assign_loose_cells(con, "relation1", leaf_index)
-    _log(f"way/relation cells assigned in {time.time()-t0:.1f}s")
+    ymin_f, ymin_null = _filled_f64(ymin)
+    xmin_f, xmin_null = _filled_f64(xmin)
+    ymax_f, ymax_null = _filled_f64(ymax)
+    xmax_f, xmax_null = _filled_f64(xmax)
+    has_bbox = ~(ymin_null | xmin_null | ymax_null | xmax_null)
 
-    # ---- write everything -------------------------------------------------------
-    gen_number = manifest_mod.next_manifest_number(opts.root)
-    generation = opts.generation or f"g{gen_number:04d}"
-    _log(f"writing generation {generation} to {opts.root} ...")
-
-    tables_manifest: dict = {}
-    t0 = time.time()
-    tables_manifest["node"] = _write_node_spatial(con, opts.root, generation, promoted_keys)
-    _log(f"wrote node spatial files in {time.time()-t0:.1f}s")
-
-    t0 = time.time()
-    tables_manifest["way"] = _write_loose_spatial(con, opts.root, generation, "way", "way1", promoted_keys)
-    _log(f"wrote way spatial files in {time.time()-t0:.1f}s")
-
-    t0 = time.time()
-    tables_manifest["relation"] = _write_loose_spatial(
-        con, opts.root, generation, "relation", "relation1", promoted_keys
-    )
-    _log(f"wrote relation spatial files in {time.time()-t0:.1f}s")
-
-    t0 = time.time()
-    byid_manifest = {
-        "node": _write_byid(con, opts.root, generation, "node", promoted_keys),
-        "way": _write_byid(con, opts.root, generation, "way", promoted_keys),
-        "relation": _write_byid(con, opts.root, generation, "relation", promoted_keys),
-    }
-    _log(f"wrote byid files in {time.time()-t0:.1f}s")
-
-    t0 = time.time()
-    index_manifest = {
-        "node_way": _write_node_way_index(con, opts.root, generation),
-        "member": _write_member_index(con, opts.root, generation),
-    }
-    _log(f"wrote index files in {time.time()-t0:.1f}s")
-
-    # ---- manifest ---------------------------------------------------------------
-    if opts.timestamp:
-        timestamp_osm_base = opts.timestamp
-    else:
-        max_ts = con.execute(
-            "SELECT max(x) FROM (SELECT max(timestamp) AS x FROM node1 "
-            "UNION ALL SELECT max(timestamp) FROM way1 UNION ALL SELECT max(timestamp) FROM relation1)"
-        ).fetchone()[0]
-        timestamp_osm_base = (
-            max_ts.strftime("%Y-%m-%dT%H:%M:%SZ") if max_ts is not None else "1970-01-01T00:00:00Z"
+    rel_cell = np.full(len(ids), cells_mod.ROOT, dtype=object)
+    rel_hilbert = np.zeros(len(ids), dtype=np.uint64)
+    if has_bbox.any():
+        sub_cell = cells_mod.containing_cells_v2_np(
+            ymin_f[has_bbox].astype(np.int64),
+            xmin_f[has_bbox].astype(np.int64),
+            ymax_f[has_bbox].astype(np.int64),
+            xmax_f[has_bbox].astype(np.int64),
+            leaf_index,
+            ancestor_depths,
+            max_depth,
         )
-
-    if opts.bbox is not None:
-        extent = list(opts.bbox)
-        source = f"{Path(opts.pbf_path).name} bbox=({opts.bbox[0]},{opts.bbox[1]},{opts.bbox[2]},{opts.bbox[3]})"
-    else:
-        ext = con.execute(
-            "SELECT min(lat_e7)/1e7, min(lon_e7)/1e7, max(lat_e7)/1e7, max(lon_e7)/1e7 FROM node1"
-        ).fetchone()
-        extent = [float(x) if x is not None else 0.0 for x in ext]
-        source = Path(opts.pbf_path).name
-
-    man = manifest_mod.Manifest(
-        generation=generation,
-        timestamp_osm_base=timestamp_osm_base,
-        source=source,
-        extent=extent,
-        leaf_cells=sorted(leaf_cells),
-        tables=tables_manifest,
-        byid=byid_manifest,
-        index=index_manifest,
-        promoted_keys=promoted_keys,
-        replication_sequence=opts.replication_sequence,
-    )
-    manifest_mod.write_manifest(opts.root, man, gen_number)
-    _log(f"wrote manifest/{gen_number}.json and manifest/LATEST")
-    _log(f"done in {time.time()-t_start:.1f}s total")
-    con.close()
-    return man
-
-
-# --------------------------------------------------------------------------
-# bbox extract (Osmium "smart" semantics)
-# --------------------------------------------------------------------------
-
-
-def _apply_bbox_extract(con, bbox: tuple[float, float, float, float]) -> None:
-    south, west, north, east = bbox
-    south_e7, west_e7, north_e7, east_e7 = (
-        round(south * 1e7),
-        round(west * 1e7),
-        round(north * 1e7),
-        round(east * 1e7),
-    )
-    con.execute(f"""
-        CREATE TEMP TABLE node_in_bbox AS
-        SELECT id FROM node0
-        WHERE lat_e7 BETWEEN {south_e7} AND {north_e7}
-          AND lon_e7 BETWEEN {west_e7} AND {east_e7}
-    """)
+        clat_e7 = np.round((ymin_f[has_bbox] + ymax_f[has_bbox]) / 2.0).astype(np.int64)
+        clon_e7 = np.round((xmin_f[has_bbox] + xmax_f[has_bbox]) / 2.0).astype(np.int64)
+        sub_hilbert = hilbert_mod.hilbert_keys(clat_e7, clon_e7)
+        rel_cell[has_bbox] = sub_cell
+        rel_hilbert[has_bbox] = sub_hilbert
+    common.register_assignment(con, "rel_assign", np.asarray(ids, dtype=np.int64), rel_cell, rel_hilbert)
     con.execute("""
-        CREATE TEMP TABLE way_keep AS
-        SELECT w.id FROM way0 w
-        WHERE EXISTS (
-            SELECT 1 FROM UNNEST(w.refs) AS t(ref)
-            WHERE t.ref IN (SELECT id FROM node_in_bbox)
-        )
+        CREATE TABLE relation2 AS
+        SELECT r.*, a.cell, a.hilbert FROM relation1 r JOIN rel_assign a USING (id)
     """)
-    con.execute("""
-        CREATE TEMP TABLE node_keep AS
-        SELECT id FROM node_in_bbox
-        UNION
-        SELECT DISTINCT unnest(refs) AS id FROM way0 WHERE id IN (SELECT id FROM way_keep)
-    """)
-    con.execute("""
-        CREATE TEMP TABLE relation_keep AS
-        SELECT DISTINCT r.id FROM relation0 r, UNNEST(r.members) AS t(m)
-        WHERE (m.type = 'n' AND m.ref IN (SELECT id FROM node_keep))
-           OR (m.type = 'w' AND m.ref IN (SELECT id FROM way_keep))
-           OR (m.type = 'r' AND m.ref IN (SELECT id FROM relation0))
-    """)
-    con.execute("CREATE TEMP TABLE node0_f AS SELECT * FROM node0 WHERE id IN (SELECT id FROM node_keep)")
-    con.execute("CREATE TEMP TABLE way0_f AS SELECT * FROM way0 WHERE id IN (SELECT id FROM way_keep)")
-    con.execute(
-        "CREATE TEMP TABLE relation0_f AS SELECT * FROM relation0 WHERE id IN (SELECT id FROM relation_keep)"
-    )
-    con.execute("DROP TABLE node0")
-    con.execute("DROP TABLE way0")
-    con.execute("DROP TABLE relation0")
-    con.execute("ALTER TABLE node0_f RENAME TO node0")
-    con.execute("ALTER TABLE way0_f RENAME TO way0")
-    con.execute("ALTER TABLE relation0_f RENAME TO relation0")
+    con.execute("DROP TABLE relation1")
 
-
-# --------------------------------------------------------------------------
-# leaf cell selection
-# --------------------------------------------------------------------------
-
-
-def _select_leaf_cells(con, max_nodes_per_cell: int) -> list[str]:
-    lat_e7, lon_e7 = con.execute("SELECT lat_e7, lon_e7 FROM node0").fetchnumpy().values()
-    if len(lat_e7) == 0:
-        return [cells_mod.ROOT]
-    qk = cells_mod.point_to_qk_np(lat_e7, lon_e7)
-    codes, counts = np.unique(qk, return_counts=True)
-    order = np.argsort(codes)
-    codes = codes[order]
-    counts = counts[order]
-    cum = np.concatenate(([0], np.cumsum(counts)))
-
-    def range_count(lo: int, hi: int) -> int:
-        # sum of counts for codes in [lo, hi], via searchsorted on the sorted codes
-        i0 = int(np.searchsorted(codes, np.uint64(lo), side="left"))
-        i1 = int(np.searchsorted(codes, np.uint64(hi), side="right"))
-        return int(cum[i1] - cum[i0])
-
-    leaves: list[str] = []
-
-    def recurse(key: str, depth: int) -> None:
-        lo, hi = cells_mod.qk_range(key)
-        n = range_count(lo, hi)
-        if n <= max_nodes_per_cell or depth >= cells_mod.MAX_DEPTH:
-            if n > 0 or key == cells_mod.ROOT:
-                leaves.append(key)
-            return
-        for child in cells_mod.children(key):
-            recurse(child, depth + 1)
-
-    recurse(cells_mod.ROOT, 0)
-    return leaves
-
-
-def _assign_loose_cells(con, table: str, leaf_index: cells_mod.LeafIndex) -> None:
-    rows = con.execute(f"SELECT id, ymin_e7, xmin_e7, ymax_e7, xmax_e7 FROM {table}").fetchall()
-    ids = []
-    cell_vals = []
-    hilbert_vals = []
-    for rid, ymin, xmin, ymax, xmax in rows:
-        ids.append(rid)
-        if ymin is None:
-            cell_vals.append(cells_mod.ROOT)
-            hilbert_vals.append(0)
-            continue
-        south, west, north, east = ymin / 1e7, xmin / 1e7, ymax / 1e7, xmax / 1e7
-        cell_vals.append(cells_mod.containing_cell((south, west, north, east), leaf_index))
-        clat_e7 = round((ymin + ymax) / 2.0)
-        clon_e7 = round((xmin + xmax) / 2.0)
-        hilbert_vals.append(int(hilbert_mod.hilbert_key(clat_e7, clon_e7)))
-    ids_arr = np.array(ids, dtype=np.int64)
-    cell_arr = np.array(cell_vals, dtype=object)
-    hilbert_arr = np.array(hilbert_vals, dtype=np.uint64)
-    _register_assignment(con, f"{table}_assign", ids_arr, cell_arr, hilbert_arr)
-    con.execute(f"""
-        CREATE TABLE {table}_c AS
-        SELECT t.*, a.cell, a.hilbert FROM {table} t JOIN {table}_assign a USING (id)
-    """)
-    con.execute(f"DROP TABLE {table}")
-    con.execute(f"ALTER TABLE {table}_c RENAME TO {table}")
-
-
-def _register_assignment(con, name: str, ids: np.ndarray, cell: np.ndarray, hilbert: np.ndarray) -> None:
-    import pyarrow as pa
-
-    tbl = pa.table(
-        {
-            "id": pa.array(ids, type=pa.int64()),
-            "cell": pa.array([str(c) for c in cell], type=pa.string()),
-            "hilbert": pa.array(hilbert, type=pa.uint64()),
-        }
-    )
-    con.register(f"_{name}_arrow", tbl)
-    con.execute(f"CREATE OR REPLACE TABLE {name} AS SELECT * FROM _{name}_arrow")
-    con.unregister(f"_{name}_arrow")
-
-
-# --------------------------------------------------------------------------
-# writers
-# --------------------------------------------------------------------------
-
-
-def _promoted_select(promoted_keys: list[str], tags_expr: str = "tags") -> str:
-    return ", ".join(f'{tags_expr}[\'{key}\'] AS "{key}"' for key in promoted_keys)
-
-
-def _copy_to_parquet(con, select_sql: str, path: Path) -> tuple[int, int]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    posix = str(path).replace("'", "''")
-    con.execute(f"""
-        COPY ({select_sql}) TO '{posix}'
-        (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {ROW_GROUP_SIZE})
-    """)
-    rows = con.execute(f"SELECT count(*) FROM read_parquet('{posix}')").fetchone()[0]
-    size = path.stat().st_size
-    return rows, size
-
-
-def _rel_path(generation: str, *parts: str) -> str:
-    return "/".join([p.strip("/") for p in ("spatial", generation, *parts)])
-
-
-def _write_node_spatial(con, root: str, generation: str, promoted_keys: list[str]) -> dict:
-    promoted_sql = _promoted_select(promoted_keys)
-    cells_rows = con.execute("SELECT DISTINCT cell FROM node1").fetchall()
-    out: dict = {"cells": {}}
-    for (cell,) in cells_rows:
-        entry: dict = {}
-        untagged_promoted_sql = ", ".join(f'NULL::VARCHAR AS "{k}"' for k in promoted_keys)
-        for tagged, suffix in ((True, "true"), (False, "false")):
-            tag_cond = "tags IS NOT NULL" if tagged else "tags IS NULL"
-            tags_col = "tags" if tagged else "NULL::MAP(VARCHAR,VARCHAR)"
-            this_promoted_sql = promoted_sql if tagged else untagged_promoted_sql
-            select_cols = (
-                f"id, lat_e7, lon_e7, "
-                f"{tags_col} AS tags, "
-                f"{this_promoted_sql}, "
-                f"version, changeset, timestamp, uid, \"user\", hilbert"
-            )
-            select_sql = (
-                f"SELECT {select_cols} FROM node1 WHERE cell = '{cell}' AND ({tag_cond}) "
-                f"ORDER BY hilbert, id"
-            )
-            path = Path(root) / _rel_path(generation, "node", f"cell={cell}", f"tagged={suffix}", "part-0.parquet")
-            rows, size = _copy_to_parquet(con, select_sql, path)
-            if rows > 0:
-                entry[("tagged" if tagged else "untagged")] = {
-                    "path": _rel_path(generation, "node", f"cell={cell}", f"tagged={suffix}", "part-0.parquet"),
-                    "rows": rows,
-                    "bytes": size,
-                }
-        if entry:
-            out["cells"][cell] = entry
-    return out
-
-
-def _way_relation_select(promoted_keys: list[str], table: str) -> str:
-    promoted_sql = _promoted_select(promoted_keys)
-    if table == "way1":
-        return (
-            f"id, refs, tags, {promoted_sql}, version, changeset, timestamp, uid, \"user\", "
-            f"xmin_e7, ymin_e7, xmax_e7, ymax_e7, geometry, is_closed, is_area, "
-            f"centroid_lat_e7, centroid_lon_e7, cell, hilbert"
-        )
-    return (
+    # ---- write spatial/relation ------------------------------------------------
+    select_cols_spatial = (
         f"id, members, tags, {promoted_sql}, version, changeset, timestamp, uid, \"user\", "
         f"xmin_e7, ymin_e7, xmax_e7, ymax_e7, NULL::GEOMETRY AS geometry, "
         f"centroid_lat_e7, centroid_lon_e7, cell, hilbert"
     )
-
-
-def _write_loose_spatial(con, root: str, generation: str, table_name: str, src_table: str, promoted_keys: list[str]) -> dict:
-    select_cols = _way_relation_select(promoted_keys, src_table)
-    cells_rows = con.execute(f"SELECT DISTINCT cell FROM {src_table}").fetchall()
-    out: dict = {"cells": {}}
+    table_manifest: dict = {"cells": {}}
+    spatial_bytes = 0
+    cells_rows = con.execute("SELECT DISTINCT cell FROM relation2").fetchall()
     for (cell,) in cells_rows:
-        select_sql = f"SELECT {select_cols} FROM {src_table} WHERE cell = '{cell}' ORDER BY hilbert, id"
-        path = Path(root) / _rel_path(generation, table_name, f"cell={cell}", "part-0.parquet")
-        rows, size = _copy_to_parquet(con, select_sql, path)
+        select_sql = f"SELECT {select_cols_spatial} FROM relation2 WHERE cell = '{cell}' ORDER BY hilbert, id"
+        rel_path = f"spatial/{generation}/relation/cell={cell}/part-0.parquet"
+        path = root / rel_path
+        rows, size = common.copy_to_parquet(con, select_sql, path, row_group_size=100_000)
         if rows == 0:
+            path.unlink()
             continue
         bbox = con.execute(
             f"SELECT min(ymin_e7)/1e7, min(xmin_e7)/1e7, max(ymax_e7)/1e7, max(xmax_e7)/1e7 "
-            f"FROM {src_table} WHERE cell = '{cell}'"
+            f"FROM relation2 WHERE cell = '{cell}'"
         ).fetchone()
-        out["cells"][cell] = {
-            "path": _rel_path(generation, table_name, f"cell={cell}", "part-0.parquet"),
+        table_manifest["cells"][cell] = {
+            "path": rel_path,
             "rows": rows,
             "bytes": size,
             "bbox": [float(x) if x is not None else None for x in bbox],
         }
-    return out
+        spatial_bytes += size
 
+    # ---- write byid/relation ----------------------------------------------------
+    select_cols_byid = (
+        f"id, members, tags, {promoted_sql}, version, changeset, timestamp, uid, \"user\", "
+        f"xmin_e7, ymin_e7, xmax_e7, ymax_e7, cell"
+    )
+    total = con.execute("SELECT count(*) FROM relation2").fetchone()[0]
+    byid_manifest: list[dict] = []
+    byid_bytes = 0
+    for k, (lo, hi) in enumerate(common.range_bounds(con, "relation2", "id", total, RELATION_PART_ROWS)):
+        cond = common.range_cond("id", lo, hi)
+        select_sql = f"SELECT {select_cols_byid} FROM relation2 WHERE {cond} ORDER BY id"
+        rel_path = f"byid/{generation}/relation/part-{k:05d}.parquet"
+        path = root / rel_path
+        rows, size = common.copy_to_parquet(con, select_sql, path, row_group_size=100_000)
+        min_id, max_id = con.execute(f"SELECT min(id), max(id) FROM relation2 WHERE {cond}").fetchone()
+        byid_manifest.append({"path": rel_path, "min_id": min_id, "max_id": max_id, "rows": rows, "bytes": size})
+        byid_bytes += size
 
-RANGE_TARGET_ROWS = 4_000_000  # headroom under the 5M-row part limit for duplicate keys
-
-
-def _range_bounds(con, table: str, col: str, total: int) -> list[tuple]:
-    """Split ``table`` into id ranges of about RANGE_TARGET_ROWS rows on ``col``
-    using quantiles, so parts can be written one at a time without numbering
-    every row (a window function over tens of millions of rows with map
-    columns does not fit in memory)."""
-    n = max(1, -(-total // RANGE_TARGET_ROWS))
-    if n == 1:
-        return [(None, None)]
-    fractions = [i / n for i in range(1, n)]
-    qs = con.execute(f"SELECT quantile_disc({col}, {fractions}) FROM {table}").fetchone()[0]
-    qs = sorted(set(qs))
-    bounds = [None] + qs + [None]
-    return list(zip(bounds[:-1], bounds[1:]))
-
-
-def _range_cond(col: str, lo, hi) -> str:
-    parts = []
-    if lo is not None:
-        parts.append(f"{col} >= {lo}")
-    if hi is not None:
-        parts.append(f"{col} < {hi}")
-    return " AND ".join(parts) or "TRUE"
-
-
-def _write_byid(con, root: str, generation: str, table_name: str, promoted_keys: list[str]) -> list[dict]:
-    promoted_sql = _promoted_select(promoted_keys)
-    if table_name == "node":
-        src = "node1"
-        select_cols = (
-            f"id, lat_e7, lon_e7, tags, {promoted_sql}, version, changeset, timestamp, uid, \"user\", cell"
-        )
-    elif table_name == "way":
-        src = "way1"
-        select_cols = (
-            f"id, refs, tags, {promoted_sql}, version, changeset, timestamp, uid, \"user\", "
-            f"xmin_e7, ymin_e7, xmax_e7, ymax_e7, is_closed, is_area, cell"
-        )
-    else:
-        src = "relation1"
-        select_cols = (
-            f"id, members, tags, {promoted_sql}, version, changeset, timestamp, uid, \"user\", "
-            f"xmin_e7, ymin_e7, xmax_e7, ymax_e7, cell"
-        )
-
-    total = con.execute(f"SELECT count(*) FROM {src}").fetchone()[0]
-    if total == 0:
-        return []
-    parts = []
-    for k, (lo, hi) in enumerate(_range_bounds(con, src, "id", total)):
-        cond = _range_cond("id", lo, hi)
-        select_sql = f"SELECT {select_cols} FROM {src} WHERE {cond} ORDER BY id"
-        path = Path(root) / "byid" / generation / table_name / f"part-{k:05d}.parquet"
-        rows, size = _copy_to_parquet(con, select_sql, path)
-        min_id, max_id = con.execute(f"SELECT min(id), max(id) FROM {src} WHERE {cond}").fetchone()
-        parts.append({
-            "path": f"byid/{generation}/{table_name}/part-{k:05d}.parquet",
-            "min_id": min_id,
-            "max_id": max_id,
-            "rows": rows,
-            "bytes": size,
-        })
-    return parts
-
-
-def _write_node_way_index(con, root: str, generation: str) -> list[dict]:
-    # A regular (on-disk) table, not TEMP: at state scale this has tens of
-    # millions of rows and must be allowed to exceed memory.
-    con.execute("DROP TABLE IF EXISTS _nw_index")
-    con.execute("""
-        CREATE TABLE _nw_index AS
-        SELECT t.ref AS node_id, w.id AS way_id
-        FROM way1 w, UNNEST(w.refs) AS t(ref)
-    """)
-    total = con.execute("SELECT count(*) FROM _nw_index").fetchone()[0]
-    parts = []
-    if total > 0:
-        for k, (lo, hi) in enumerate(_range_bounds(con, "_nw_index", "node_id", total)):
-            cond = _range_cond("node_id", lo, hi)
-            select_sql = f"SELECT node_id, way_id FROM _nw_index WHERE {cond} ORDER BY node_id, way_id"
-            path = Path(root) / "index" / generation / "node_way" / f"part-{k:05d}.parquet"
-            rows, size = _copy_to_parquet(con, select_sql, path)
-            min_id, max_id = con.execute(
-                f"SELECT min(node_id), max(node_id) FROM _nw_index WHERE {cond}"
-            ).fetchone()
-            parts.append({
-                "path": f"index/{generation}/node_way/part-{k:05d}.parquet",
-                "min_id": min_id,
-                "max_id": max_id,
-                "rows": rows,
-                "bytes": size,
-            })
-    con.execute("DROP TABLE _nw_index")
-    return parts
-
-
-def _write_member_index(con, root: str, generation: str) -> list[dict]:
-    con.execute("DROP TABLE IF EXISTS _mem_index")
+    # ---- member index -------------------------------------------------------------
     con.execute("""
         CREATE TABLE _mem_index AS
         SELECT m.type AS member_type, m.ref AS member_id, r.id AS parent_id, m.role AS role, r.cell AS parent_cell
-        FROM relation1 r, UNNEST(r.members) AS t(m)
+        FROM relation2 r, UNNEST(r.members) AS t(m)
     """)
-    total = con.execute("SELECT count(*) FROM _mem_index").fetchone()[0]
-    parts = []
-    if total > 0:
-        # member_type has three values; range on member_id within one file set
-        # keeps the contract's (member_type, member_id, parent_id) sort per part.
-        for k, (lo, hi) in enumerate(_range_bounds(con, "_mem_index", "member_id", total)):
-            cond = _range_cond("member_id", lo, hi)
+    mem_total = con.execute("SELECT count(*) FROM _mem_index").fetchone()[0]
+    member_manifest: list[dict] = []
+    member_bytes = 0
+    if mem_total > 0:
+        for k, (lo, hi) in enumerate(common.range_bounds(con, "_mem_index", "member_id", mem_total)):
+            cond = common.range_cond("member_id", lo, hi)
             select_sql = (
                 f"SELECT member_type, member_id, parent_id, role, parent_cell FROM _mem_index "
                 f"WHERE {cond} ORDER BY member_type, member_id, parent_id"
             )
-            path = Path(root) / "index" / generation / "member" / f"part-{k:05d}.parquet"
-            rows, size = _copy_to_parquet(con, select_sql, path)
-            parts.append({
-                "path": f"index/{generation}/member/part-{k:05d}.parquet",
-                "rows": rows,
-                "bytes": size,
-            })
+            rel_path = f"index/{generation}/member/part-{k:05d}.parquet"
+            path = root / rel_path
+            rows, size = common.copy_to_parquet(con, select_sql, path, row_group_size=100_000)
+            member_manifest.append({"path": rel_path, "rows": rows, "bytes": size})
+            member_bytes += size
     con.execute("DROP TABLE _mem_index")
-    return parts
+    con.execute("DROP TABLE relation2")
+    con.execute("DROP VIEW relation0")
+    con.execute("DROP VIEW node_byid")
+    con.execute("DROP VIEW way_byid")
+
+    return (
+        table_manifest,
+        byid_manifest,
+        member_manifest,
+        {"spatial": spatial_bytes, "byid": byid_bytes, "member": member_bytes},
+    )

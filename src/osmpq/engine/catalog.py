@@ -61,6 +61,19 @@ class Manifest:
     root: str
     data: dict
 
+    def __post_init__(self) -> None:
+        # Not dataclass fields (excluded from repr/eq on purpose): a small
+        # per-Engine cache of the row-group index (section 5/6 of
+        # docs/m1-contracts.md), lazily populated and reused across
+        # `Engine.run()` calls since a Manifest instance lives for the
+        # Engine's whole lifetime; and a transient per-run accumulator that
+        # `Engine.run_program` sets up before planning and reads back after,
+        # so `catalog.prune_files_by_bbox` can report files-considered vs
+        # files-read without threading an extra return value through every
+        # SQL-builder function in sources.py/recurse.py/planner.py.
+        self._rowgroup_cache: dict[str, Optional["RowGroupIndex"]] = {}
+        self._file_stats: Optional["FileStats"] = None
+
     @property
     def promoted_keys(self) -> list[str]:
         return list(self.data.get("promoted_keys", []))
@@ -76,6 +89,29 @@ class Manifest:
     @property
     def leaf_cells(self) -> list[str]:
         return list(self.data.get("leaf_cells", []))
+
+    @property
+    def manifest_version(self) -> int:
+        return int(self.data.get("manifest_version", 1))
+
+    @property
+    def ancestor_depths(self) -> list[int]:
+        """Manifest v2's `ancestor_depths` (docs/m1-contracts.md section 5),
+        e.g. [0, 3, 6, 9, 12]. Empty for v1 (unused there: v1's
+        `cells_for_bbox` keeps using every ancestor, section 2 of
+        docs/m0-contracts.md)."""
+        return list(self.data.get("ancestor_depths", []))
+
+    @property
+    def max_depth(self) -> int:
+        return int(self.data.get("max_depth", 20))
+
+    @property
+    def rowgroup_index_paths(self) -> dict[str, str]:
+        """{'node'|'way'|'relation': manifest-relative path}, from manifest
+        v2's `rowgroup_index` (docs/m1-contracts.md section 5). Empty dict
+        when absent (v1, or a v2 manifest built without it)."""
+        return dict(self.data.get("rowgroup_index", {}))
 
     def table_cells(self, table: str) -> dict:
         return self.data.get("tables", {}).get(table, {}).get("cells", {})
@@ -150,15 +186,43 @@ def leaves_intersecting(manifest: Manifest, bbox: BBox) -> set[str]:
     return hits
 
 
+def _ancestor_at_depth(leaf_key: str, depth: int) -> str:
+    """The ancestor of `leaf_key` at `depth` digits (0 = 'root')."""
+    if depth <= 0:
+        return "root"
+    return leaf_key[:depth]
+
+
 def cells_for_bbox(manifest: Manifest, table: str, bbox: Optional[BBox]) -> list[str]:
-    """Contract section 2: leaves intersecting bbox + ancestors incl. root,
-    filtered to cells present for `table`. bbox=None means "everything"."""
+    """Contract section 2 (v1) / m1-contracts.md section 2 and 6 (v2):
+    leaves intersecting bbox, plus ancestors, filtered to cells present for
+    `table`. bbox=None means "everything".
+
+    - Manifest v1 (or v2 for the `node` table, which is leaf-only by
+      construction regardless of version -- section 2: nodes always live in
+      a leaf, so `present` never contains a non-leaf key for it and the
+      ancestors added below are filtered out for free): every ancestor of
+      every intersecting leaf, up to and including root.
+    - Manifest v2, `way`/`relation`: every intersecting leaf itself (an
+      element can be stored exactly at a leaf), plus -- for each such leaf
+      -- only the ancestors whose depth is in `ancestor_depths` (root, depth
+      0, is always included even if the manifest's list omits it)."""
     present = manifest.table_cells(table)
     if bbox is None:
         return sorted(present.keys())
+    leaves = leaves_intersecting(manifest, bbox)
     wanted: set[str] = set()
-    for leaf in leaves_intersecting(manifest, bbox):
-        wanted.update(ancestors_and_self(leaf))
+    if manifest.manifest_version >= 2 and table in ("way", "relation"):
+        depths = set(manifest.ancestor_depths)
+        depths.add(0)
+        for leaf in leaves:
+            wanted.add(leaf)
+            for d in depths:
+                if d <= len(leaf):
+                    wanted.add(_ancestor_at_depth(leaf, d))
+    else:
+        for leaf in leaves:
+            wanted.update(ancestors_and_self(leaf))
     return sorted(c for c in wanted if c in present)
 
 
@@ -201,3 +265,122 @@ def index_parts_for_ids(manifest: Manifest, name: str, ids: Iterable[int]) -> li
     if not ids or not parts:
         return parts if ids else []
     return index_parts_for_range(manifest, name, min(ids), max(ids))
+
+
+# --------------------------------------------------------------------------
+# Row-group index and pruning (m1-contracts.md sections 4/6): manifest v2's
+# index/<gen>/rowgroups/{node,way,relation}.parquet, one row per Parquet row
+# group of the spatial files: path, cell, tagged (nodes only), rg, rows,
+# xmin_e7, ymin_e7, xmax_e7, ymax_e7 (for nodes: min/max of lon_e7/lat_e7).
+# --------------------------------------------------------------------------
+
+RowGroupBBox = tuple[int, int, int, int]  # (xmin_e7, ymin_e7, xmax_e7, ymax_e7)
+
+
+@dataclass
+class RowGroupIndex:
+    """One table's row-group index, loaded once per Engine and cached on the
+    Manifest (`Manifest._rowgroup_cache`): every spatial file's absolute
+    path (already joined with `manifest.path`, so it matches exactly what
+    `sources.py`'s `_node_files`/`_way_files`/`_relation_files` produce) ->
+    the bboxes of its row groups."""
+
+    by_path: dict[str, list[RowGroupBBox]]
+
+
+@dataclass
+class FileStats:
+    """Transient per-`Engine.run()` accumulator for the row-group-prunable
+    file selections (see `Manifest.__post_init__` and `prune_files_by_bbox`
+    below): `considered` is the candidate-file count before pruning,
+    `read` the count that survived it. `Engine.run_program` derives
+    `Result.stats["files_considered"]` from this plus the (already-correct,
+    because pruning mutates the file lists in place before anything counts
+    them) existing `files_read` total."""
+
+    considered: int = 0
+    read: int = 0
+
+
+def _load_rowgroup_index(manifest: Manifest, table: str) -> Optional[RowGroupIndex]:
+    relpath = manifest.rowgroup_index_paths.get(table)
+    if not relpath:
+        return None
+    path = manifest.path(relpath)
+    import duckdb
+
+    con = duckdb.connect()
+    try:
+        try:
+            con.execute("LOAD httpfs;")
+        except Exception:
+            try:
+                con.execute("INSTALL httpfs; LOAD httpfs;")
+            except Exception:
+                pass
+        try:
+            rows = con.execute(
+                "SELECT path, xmin_e7, ymin_e7, xmax_e7, ymax_e7 FROM read_parquet(?)",
+                [path],
+            ).fetchall()
+        except Exception:
+            # Manifest declares a rowgroup_index path but the file is
+            # missing/unreadable: treat as "no index" rather than failing
+            # the whole query, same spirit as v1 simply lacking the key.
+            return None
+    finally:
+        con.close()
+
+    by_path: dict[str, list[RowGroupBBox]] = {}
+    for relp, xmin, ymin, xmax, ymax in rows:
+        if None in (relp, xmin, ymin, xmax, ymax):
+            continue
+        abspath = manifest.path(relp)
+        by_path.setdefault(abspath, []).append((xmin, ymin, xmax, ymax))
+    return RowGroupIndex(by_path=by_path)
+
+
+def _rowgroup_index_for(manifest: Manifest, table: str) -> Optional[RowGroupIndex]:
+    cache = getattr(manifest, "_rowgroup_cache", None)
+    if cache is None:
+        cache = {}
+        manifest._rowgroup_cache = cache
+    if table not in cache:
+        cache[table] = _load_rowgroup_index(manifest, table)
+    return cache[table]
+
+
+def prune_files_by_bbox(manifest: Manifest, table: str, files: list[str], bbox_e7: RowGroupBBox) -> list[str]:
+    """Drop any file in `files` that has no row group whose
+    [xmin_e7..xmax_e7] x [ymin_e7..ymax_e7] intersects `bbox_e7`
+    (docs/m1-contracts.md section 6). A file the index has no entries for
+    (e.g. a manifest/index mismatch) is kept rather than guessed away.
+    When the manifest has no rowgroup index for `table` (v1, or a v2
+    manifest built without one), returns `files` unchanged -- pruning is
+    skipped entirely, per contract.
+
+    Updates `manifest._file_stats` (set up for the duration of one
+    `Engine.run()` by `executor.Engine.run_program`) with the candidate
+    count (`considered`) and the surviving count (`read`), when pruning
+    actually runs; callers don't need to touch it themselves."""
+    if not files:
+        return files
+    idx = _rowgroup_index_for(manifest, table)
+    if idx is None:
+        return files
+
+    xmin, ymin, xmax, ymax = bbox_e7
+    kept = []
+    for f in files:
+        boxes = idx.by_path.get(f)
+        if not boxes:
+            kept.append(f)
+            continue
+        if any(bx0 <= xmax and bx1 <= ymax and bx2 >= xmin and bx3 >= ymin for bx0, bx1, bx2, bx3 in boxes):
+            kept.append(f)
+
+    stats = getattr(manifest, "_file_stats", None)
+    if stats is not None:
+        stats.considered += len(files)
+        stats.read += len(kept)
+    return kept

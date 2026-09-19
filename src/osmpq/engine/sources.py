@@ -62,6 +62,12 @@ def build_node_spatial_select(
     files = _node_files(manifest, cells, "tagged")
     if need_untagged:
         files = files + _node_files(manifest, cells, "untagged")
+    if bbox is not None:
+        se, we, ne, ee = to_e7(bbox[0]), to_e7(bbox[1]), to_e7(bbox[2]), to_e7(bbox[3])
+        # Row-group pruning (m1-contracts.md section 6): node row groups
+        # carry the min/max of lon_e7/lat_e7, so the bbox tuple order here
+        # is (xmin=lon_min, ymin=lat_min, xmax=lon_max, ymax=lat_max).
+        files = catalog.prune_files_by_bbox(manifest, "node", files, (we, se, ee, ne))
     if not files:
         return empty_set_sql(), 0
 
@@ -108,6 +114,9 @@ def build_way_spatial_select(
 ) -> tuple[str, int]:
     cells = catalog.cells_for_bbox(manifest, "way", bbox)
     files = _way_files(manifest, cells)
+    if bbox is not None:
+        se, we, ne, ee = to_e7(bbox[0]), to_e7(bbox[1]), to_e7(bbox[2]), to_e7(bbox[3])
+        files = catalog.prune_files_by_bbox(manifest, "way", files, (we, se, ee, ne))
     if not files:
         return empty_set_sql(), 0
 
@@ -215,6 +224,7 @@ def _relation_bbox_exact_filter(con, manifest: catalog.Manifest, cand_sql: str, 
         way_tc = manifest.table_cells("way")
         needed_cells = [r[0] for r in con.execute(f"SELECT DISTINCT cell FROM {way_cells_tbl}").fetchall()]
         spatial_files = _way_files(manifest, needed_cells)
+        spatial_files = catalog.prune_files_by_bbox(manifest, "way", spatial_files, (we, se, ee, ne))
         if spatial_files:
             files_read += len(spatial_files)
             con.execute(
@@ -248,6 +258,9 @@ def build_relation_spatial_select(
 ) -> tuple[str, int]:
     cells = catalog.cells_for_bbox(manifest, "relation", bbox)
     files = _relation_files(manifest, cells)
+    if bbox is not None:
+        se, we, ne, ee = to_e7(bbox[0]), to_e7(bbox[1]), to_e7(bbox[2]), to_e7(bbox[3])
+        files = catalog.prune_files_by_bbox(manifest, "relation", files, (we, se, ee, ne))
     if not files:
         return empty_set_sql(), 0
 
@@ -462,11 +475,12 @@ def build_way_bbox_semijoin_select(
     if not cells or len(cells) > max_cell_fraction * total_leaves:
         return None, 0
     files = _way_files(manifest, cells)
+    s, w, n, e = bbox
+    se, we, ne, ee = to_e7(s), to_e7(w), to_e7(n), to_e7(e)
+    files = catalog.prune_files_by_bbox(manifest, "way", files, (we, se, ee, ne))
     if not files:
         return empty_set_sql(), 0
 
-    s, w, n, e = bbox
-    se, we, ne, ee = to_e7(s), to_e7(w), to_e7(n), to_e7(e)
     bbox_where = f"xmax_e7 >= {we} AND xmin_e7 <= {ee} AND ymax_e7 >= {se} AND ymin_e7 <= {ne}"
     tag_where = tagsql.tag_filters_sql(tag_filters, promoted_keys)
 
@@ -543,9 +557,10 @@ def build_way_hydrate_via_bbox_select(
         total_leaves = len(manifest.leaf_cells) or 1
         if cells and len(cells) <= max_cell_fraction * total_leaves:
             way_files = _way_files(manifest, cells)
+            s, w, n, e = bbox
+            se, we, ne, ee = to_e7(s), to_e7(w), to_e7(n), to_e7(e)
+            way_files = catalog.prune_files_by_bbox(manifest, "way", way_files, (we, se, ee, ne))
             if way_files:
-                s, w, n, e = bbox
-                se, we, ne, ee = to_e7(s), to_e7(w), to_e7(n), to_e7(e)
                 bbox_where = (
                     f"w.xmax_e7 >= {we} AND w.xmin_e7 <= {ee} "
                     f"AND w.ymax_e7 >= {se} AND w.ymin_e7 <= {ne}"
@@ -759,6 +774,9 @@ def build_node_hydrate_via_bbox_select(
         total_leaves = len(manifest.leaf_cells) or 1
         if cells and len(cells) <= max_cell_fraction * total_leaves:
             node_files = _node_files(manifest, cells, "tagged") + _node_files(manifest, cells, "untagged")
+            s, w, n, e = bbox
+            se, we, ne, ee = to_e7(s), to_e7(w), to_e7(n), to_e7(e)
+            node_files = catalog.prune_files_by_bbox(manifest, "node", node_files, (we, se, ee, ne))
             if node_files:
                 files_total += len(node_files)
                 found_table = idset.fresh_table_name("bboxnodehits")

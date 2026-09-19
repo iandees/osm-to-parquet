@@ -297,6 +297,133 @@ def _bbox_intersects(a: BBox, b: BBox) -> bool:
     return True
 
 
+DEFAULT_ANCESTOR_DEPTHS = [0, 3, 6, 9, 12]
+DEFAULT_MAX_DEPTH_V2 = 13
+
+
+def _value_to_key(value: int, depth: int) -> str:
+    """Inverse of :func:`key_to_value` at a known ``depth`` (zero-padded)."""
+    if depth == 0:
+        return ROOT
+    digits = []
+    v = value
+    for _ in range(depth):
+        digits.append(str(v & 3))
+        v >>= 2
+    return "".join(reversed(digits))
+
+
+def containing_cells_v2_np(
+    ymin_e7: np.ndarray,
+    xmin_e7: np.ndarray,
+    ymax_e7: np.ndarray,
+    xmax_e7: np.ndarray,
+    leaves: Leaves,
+    ancestor_depths: Sequence[int] = DEFAULT_ANCESTOR_DEPTHS,
+    max_depth: int = DEFAULT_MAX_DEPTH_V2,
+) -> np.ndarray:
+    """Vectorized v2 loose-placement rule (docs/m1-contracts.md section 2).
+
+    For each row's bbox (ymin/xmin/ymax/xmax in INT32 e7 units), find C, the
+    smallest cell (leaf or ancestor, incl. root) that a plain unrestricted
+    quadtree descent would stop at: this is exactly the cell identified by
+    the longest common (quadkey-digit) prefix of the bbox's two extreme
+    corners -- (ymin, xmin) and (ymax, xmax) -- truncated at ``max_depth``,
+    and further truncated wherever the actual leaf set stops splitting that
+    branch first. If that truncation stopped at an actual leaf, C is that
+    leaf (used as-is, however deep). Otherwise C is an internal node of the
+    real tree, so the result is the ancestor of C at the greatest depth in
+    ``ancestor_depths`` that is <= depth(C).
+
+    All inputs must be non-null (callers route null-bbox rows, e.g. ways
+    with no resolvable geometry, to ``ROOT`` themselves before calling this).
+    Returns an object array of ``str`` cell keys.
+    """
+    ymin_e7 = np.asarray(ymin_e7, dtype=np.int64)
+    xmin_e7 = np.asarray(xmin_e7, dtype=np.int64)
+    ymax_e7 = np.asarray(ymax_e7, dtype=np.int64)
+    xmax_e7 = np.asarray(xmax_e7, dtype=np.int64)
+    n = len(ymin_e7)
+    if n == 0:
+        return np.array([], dtype=object)
+    if max_depth > MAX_DEPTH:
+        raise ValueError(f"max_depth {max_depth} exceeds the module MAX_DEPTH {MAX_DEPTH}")
+
+    index = leaves if isinstance(leaves, LeafIndex) else LeafIndex(leaves)
+
+    # SW corner = (ymin, xmin), NE corner = (ymax, xmax): the bbox's two
+    # extreme points. A quadtree cell is an axis-aligned rectangle, so it
+    # fully contains the bbox iff it contains both of these corners.
+    qk_sw = point_to_qk_np(ymin_e7, xmin_e7)
+    qk_ne = point_to_qk_np(ymax_e7, xmax_e7)
+
+    # Per-depth digit (0=MSB, i.e. depth-1 digit) of each corner's full
+    # depth-MAX_DEPTH code, for depths 0..max_depth-1.
+    digits_sw = np.empty((max_depth, n), dtype=np.uint8)
+    digits_ne = np.empty((max_depth, n), dtype=np.uint8)
+    for i in range(max_depth):
+        shift = np.uint64(2 * (MAX_DEPTH - 1 - i))
+        digits_sw[i] = ((qk_sw >> shift) & np.uint64(3)).astype(np.uint8)
+        digits_ne[i] = ((qk_ne >> shift) & np.uint64(3)).astype(np.uint8)
+
+    # Longest common prefix depth of the two corners' digit strings, capped
+    # at max_depth (this is the depth of the smallest cell in an
+    # unrestricted quadtree that contains both corners, hence the bbox).
+    lcp_depth = np.full(n, max_depth, dtype=np.int64)
+    still = np.ones(n, dtype=bool)
+    for i in range(max_depth):
+        mismatch = still & (digits_sw[i] != digits_ne[i])
+        lcp_depth[mismatch] = i
+        still &= ~mismatch
+
+    # Depth of the actual leaf covering the SW corner (shared by the NE
+    # corner too, for any depth <= lcp_depth, since they agree that far).
+    leaf_idx = index.leaf_index_for_qk(qk_sw)
+    leaf_depth_by_lo = np.array(
+        [0 if k == ROOT else len(k) for k in index.leaves_by_lo], dtype=np.int64
+    )
+    leaf_depth = leaf_depth_by_lo[leaf_idx]
+
+    truncated_depth = np.minimum(lcp_depth, leaf_depth)
+    is_leaf_c = truncated_depth == leaf_depth
+
+    ad_sorted = np.array(sorted(set(ancestor_depths)), dtype=np.int64)
+    idx = np.searchsorted(ad_sorted, truncated_depth, side="right") - 1
+    idx = np.clip(idx, 0, len(ad_sorted) - 1)
+    rounded_depth = ad_sorted[idx]
+
+    final_depth = np.where(is_leaf_c, truncated_depth, rounded_depth)
+
+    # Build the full max_depth-digit string per row from the SW corner's
+    # digits (shared with NE up to lcp_depth >= final_depth), then slice.
+    acc = np.full(n, "", dtype=f"U{max_depth}")
+    for i in range(max_depth):
+        acc = np.char.add(acc, digits_sw[i].astype("U1"))
+
+    final_depth_list = final_depth.tolist()
+    out = np.empty(n, dtype=object)
+    for row in range(n):
+        d = final_depth_list[row]
+        out[row] = ROOT if d == 0 else acc[row][:d]
+    return out
+
+
+def containing_cell_v2(
+    bbox: BBox,
+    leaves: Leaves,
+    ancestor_depths: Sequence[int] = DEFAULT_ANCESTOR_DEPTHS,
+    max_depth: int = DEFAULT_MAX_DEPTH_V2,
+) -> str:
+    """Scalar wrapper around :func:`containing_cells_v2_np` for a single bbox."""
+    south, west, north, east = bbox
+    ymin = np.array([round(south * 1e7)], dtype=np.int64)
+    xmin = np.array([round(west * 1e7)], dtype=np.int64)
+    ymax = np.array([round(north * 1e7)], dtype=np.int64)
+    xmax = np.array([round(east * 1e7)], dtype=np.int64)
+    result = containing_cells_v2_np(ymin, xmin, ymax, xmax, leaves, ancestor_depths, max_depth)
+    return result[0]
+
+
 def cells_for_bbox(bbox: BBox, leaves: Leaves) -> list[str]:
     """Leaves intersecting ``bbox`` plus all their ancestors (incl. root).
 

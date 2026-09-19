@@ -479,9 +479,28 @@ def test_exists_and_not_exists(engine, fixture):
 # ---------------------------------------------------------------- timeout
 
 
-def test_timeout_produces_remark(engine, fixture):
+def test_timeout_produces_remark(engine, fixture, monkeypatch):
+    # A bare `timeout=1e-9` against this tiny fixture was flaky: the query
+    # can finish before the threading.Timer that calls `con.interrupt()`
+    # even fires, so `r.remark` sometimes comes back None. Make the slow
+    # part deterministic instead of racing the fixture's own size: splice
+    # in a real, non-trivial DuckDB scan (a full range scan with a modulo
+    # filter -- cheap for the optimizer to plan but not to skip) ahead of
+    # the actual query, on the same connection `Engine.run_program`'s timer
+    # calls `con.interrupt()` on, so the timeout has something to land in
+    # the middle of every single time.
+    import osmpq.engine.executor as executor_mod
+
+    real_run_program = executor_mod.planner.run_program
+
+    def slow_run_program(con, manifest, program):
+        con.execute("SELECT count(*) FROM range(200000000) t WHERE t.range % 999983 = 0")
+        return real_run_program(con, manifest, program)
+
+    monkeypatch.setattr(executor_mod.planner, "run_program", slow_run_program)
+
     b = bbox_args(fixture.total_bbox)
-    r = engine.run(f"[out:json];node({b});out;", timeout=1e-9)
+    r = engine.run(f"[out:json];node({b});out;", timeout=0.05)
     assert r.remark is not None
     assert "timed out" in r.remark
     assert r.elements == []

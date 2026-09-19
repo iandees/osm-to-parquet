@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import duckdb
+import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
@@ -39,6 +40,27 @@ TIMESTAMP_OSM_BASE = "2026-09-19T00:21:52Z"
 LEAVES = ["000", "001", "002"]
 ANCESTOR = "00"
 
+# -- manifest v2 (docs/m1-contracts.md sections 2/4/5) --------------------
+# `manifest_version=2` reuses every v1 node/way/relation verbatim (same
+# ids, tags, geometry -- see build()'s "v2 cell-placement adjustments"
+# block below) so the same overpassQL queries return the same elements
+# against either mode (see test_engine_v2.py's v1-vs-v2 equivalence test);
+# only *where things are filed* (cell placement) and what side files exist
+# (row-group index) differ.
+V2_ANCESTOR_DEPTHS = [0, 3, 6, 9, 12]
+V2_MAX_DEPTH = 13
+# A brand-new, disjoint branch of the quadtree (nothing under "3" exists in
+# the v1 topology) with one deliberately deep split, purely to exercise the
+# ancestor-depth placement rule (m1-contracts.md section 2): a way whose
+# smallest *containing* cell (root-descend algorithm, no depth
+# restriction) is "3000" (depth 4) -- because it straddles leaves "30000"
+# and "30001", two children of "3000" -- lands, once v2 restricts loose
+# placement to leaves and to depths in `V2_ANCESTOR_DEPTHS`, at "300"
+# (depth 3, the greatest allowed depth <= 4). See `TRAP_WAY_CELL` below.
+V2_TRAP_LEAVES = ["30000", "30001", "30002", "30003"]
+TRAP_WAY_CELL = "300"  # V2_TRAP_LEAVES[0][:3] == V2_TRAP_LEAVES[1][:3]
+TRAP_WAY_ID = 120
+
 
 def to_e7(deg: float) -> int:
     return int(round(deg * 1e7))
@@ -49,6 +71,59 @@ def _inset_point(bbox, frac_lat: float, frac_lon: float):
     lat = s + (n - s) * frac_lat
     lon = w + (e - w) * frac_lon
     return lon, lat
+
+
+def _column_stats(row_group, column_name: str):
+    """A row group's statistics for the scalar (non-nested) column named
+    `column_name`, found by `path_in_schema` rather than a positional index
+    -- a MAP column (``tags``) flattens into several physical leaf columns
+    in the Parquet footer, which would otherwise throw off any fixed
+    column-index arithmetic for the plain INTEGER columns after it."""
+    for k in range(row_group.num_columns):
+        col = row_group.column(k)
+        if col.path_in_schema == column_name:
+            return col.statistics
+    return None
+
+
+def _node_rowgroup_rows(path: Path, rel_path: str, cell: str, tagged: bool) -> list[dict]:
+    """Row-group index rows (m1-contracts.md section 4) for one node
+    spatial file, read from its own Parquet footer: for nodes, xmin_e7/
+    ymax_e7/etc. are the min/max of lon_e7/lat_e7."""
+    md = pq.ParquetFile(str(path)).metadata
+    rows = []
+    for i in range(md.num_row_groups):
+        rg = md.row_group(i)
+        lon_st, lat_st = _column_stats(rg, "lon_e7"), _column_stats(rg, "lat_e7")
+        if lon_st is None or lat_st is None or not lon_st.has_min_max or not lat_st.has_min_max:
+            continue
+        rows.append({
+            "path": rel_path, "cell": cell, "tagged": tagged, "rg": i, "rows": rg.num_rows,
+            "xmin_e7": int(lon_st.min), "ymin_e7": int(lat_st.min),
+            "xmax_e7": int(lon_st.max), "ymax_e7": int(lat_st.max),
+        })
+    return rows
+
+
+def _bbox_rowgroup_rows(path: Path, rel_path: str, cell: str) -> list[dict]:
+    """Row-group index rows for one way/relation spatial file: the envelope
+    (min of xmin_e7/ymin_e7, max of xmax_e7/ymax_e7) of every row in the
+    group. A row group whose rows all have NULL bbox (no resolvable
+    geometry) contributes no row -- `catalog.prune_files_by_bbox` treats a
+    file with no index entries as "keep", the same safe default as v1."""
+    md = pq.ParquetFile(str(path)).metadata
+    rows = []
+    for i in range(md.num_row_groups):
+        rg = md.row_group(i)
+        stats = {c: _column_stats(rg, c) for c in ("xmin_e7", "ymin_e7", "xmax_e7", "ymax_e7")}
+        if any(s is None or not s.has_min_max for s in stats.values()):
+            continue
+        rows.append({
+            "path": rel_path, "cell": cell, "tagged": None, "rg": i, "rows": rg.num_rows,
+            "xmin_e7": int(stats["xmin_e7"].min), "ymin_e7": int(stats["ymin_e7"].min),
+            "xmax_e7": int(stats["xmax_e7"].max), "ymax_e7": int(stats["ymax_e7"].max),
+        })
+    return rows
 
 
 @dataclass
@@ -109,9 +184,37 @@ class FixtureInfo:
     all_way_ids: list = field(default_factory=list)
     all_relation_ids: list = field(default_factory=list)
     total_bbox: tuple = None  # (s, w, n, e) covering everything
+    # -- manifest_version=2 only (all None/empty in v1 mode) --------------
+    manifest_version: int = 1
+    trap_way_id: int = 0  # placed at TRAP_WAY_CELL ("300"), not "3000" (v2 rule)
+    trap_leaf_bbox: dict = field(default_factory=dict)  # V2_TRAP_LEAVES -> bbox
+    # An untagged node with real metadata (version/changeset/timestamp/uid/
+    # user all non-NULL) and one with all of it NULL (mirrors `osmpq
+    # raw-py`'s allowed gap, m1-contracts.md section 1) -- for `out meta`'s
+    # "omit when NULL, emit when present" rule (section 6).
+    trap_node_with_meta_id: int = 0
+    trap_node_without_meta_id: int = 0
+    # way110 (spanning_way_id) and every relation at old-v1 ancestor "00"
+    # (depth 2, not in V2_ANCESTOR_DEPTHS) move to "root" under the v2 rule
+    # -- see build()'s v2 cell-placement adjustments. Same ids as v1.
+    root_promoted_way_ids: list = field(default_factory=list)
+    root_promoted_relation_ids: list = field(default_factory=list)
 
 
-def build(root_dir: str, con: duckdb.DuckDBPyConnection | None = None) -> FixtureInfo:
+def build(
+    root_dir: str,
+    con: duckdb.DuckDBPyConnection | None = None,
+    manifest_version: int = 1,
+) -> FixtureInfo:
+    """`manifest_version=1` (default): exactly the original fixture,
+    unchanged, for every existing test. `manifest_version=2`: the same
+    logical nodes/ways/relations (same ids/tags/geometry -- see the "v2
+    cell-placement adjustments" block below), a brand-new disjoint trap
+    region for the ancestor-depth rule, metadata on untagged nodes
+    (including one deliberately all-NULL), and the row-group index side
+    files, per docs/m1-contracts.md sections 2/4/5."""
+    if manifest_version not in (1, 2):
+        raise ValueError(f"unsupported manifest_version {manifest_version!r}")
     root = Path(root_dir)
     root.mkdir(parents=True, exist_ok=True)
     own_con = con is None
@@ -121,7 +224,9 @@ def build(root_dir: str, con: duckdb.DuckDBPyConnection | None = None) -> Fixtur
 
     leaf_bbox = {c: cell_bbox(c) for c in LEAVES}
     ancestor_bbox = cell_bbox(ANCESTOR)
-    info = FixtureInfo(root=str(root), leaf_bbox=leaf_bbox, ancestor_bbox=ancestor_bbox)
+    info = FixtureInfo(root=str(root), leaf_bbox=leaf_bbox, ancestor_bbox=ancestor_bbox,
+                        manifest_version=manifest_version)
+    null_meta_node_ids: set[int] = set()
 
     # ---------------------------------------------------------------- nodes
     # Deterministic placement: for the i-th node in a cell, spread it inside
@@ -230,6 +335,25 @@ def build(root_dir: str, con: duckdb.DuckDBPyConnection | None = None) -> Fixtur
     info.all_node_ids = [n["id"] for n in nodes]
     info.untagged_node_in_cafe_cell = leaf000_extra_ids[0]
 
+    # ---------------------------------------------- v2 trap region (nodes)
+    # Deliberately not folded into `info.all_node_ids`/the byid id-range
+    # tests above: this whole region only exists in manifest_version=2, in
+    # a part of the quadtree v1 never uses, precisely so the same queries
+    # against v1 and v2 fixtures built from everything above stay
+    # equivalent (test_engine_v2.py).
+    if manifest_version == 2:
+        trap_leaf_bbox = {c: cell_bbox(c) for c in V2_TRAP_LEAVES}
+        info.trap_leaf_bbox = trap_leaf_bbox
+        trap_with_meta_id = alloc()
+        lon, lat = _inset_point(trap_leaf_bbox["30000"], frac_lat=0.5, frac_lon=0.5)
+        nodes.append({"id": trap_with_meta_id, "lon": lon, "lat": lat, "cell": "30000", "tags": None})
+        trap_without_meta_id = alloc()
+        lon, lat = _inset_point(trap_leaf_bbox["30001"], frac_lat=0.5, frac_lon=0.5)
+        nodes.append({"id": trap_without_meta_id, "lon": lon, "lat": lat, "cell": "30001", "tags": None})
+        null_meta_node_ids.add(trap_without_meta_id)
+        info.trap_node_with_meta_id = trap_with_meta_id
+        info.trap_node_without_meta_id = trap_without_meta_id
+
     # ----------------------------------------------------------------- ways
     ways = []  # dict(id, refs, tags, cell)
 
@@ -261,6 +385,17 @@ def build(root_dir: str, con: duckdb.DuckDBPyConnection | None = None) -> Fixtur
     # way 112: diagonal_way_id, a single segment across leaf "000" from its
     # SW corner to its NE corner (see the node comment above).
     ways.append({"id": 112, "refs": [diagonal_sw_id, diagonal_ne_id], "tags": {}, "cell": "000"})
+
+    # way TRAP_WAY_ID (v2 only): straddles trap leaves "30000"/"30001" (two
+    # children of "3000", depth 4) -- see the V2_TRAP_LEAVES comment above.
+    if manifest_version == 2:
+        ways.append({
+            "id": TRAP_WAY_ID,
+            "refs": [info.trap_node_with_meta_id, info.trap_node_without_meta_id],
+            "tags": {"highway": "track"},
+            "cell": TRAP_WAY_CELL,
+        })
+        info.trap_way_id = TRAP_WAY_ID
 
     info.open_way_ids = [w["id"] for w in ways if w["id"] != 101]
     info.all_way_ids = [w["id"] for w in ways]
@@ -369,13 +504,39 @@ def build(root_dir: str, con: duckdb.DuckDBPyConnection | None = None) -> Fixtur
     for r in relations:
         r["xmin"], r["ymin"], r["xmax"], r["ymax"] = relation_bbox(r["members"])
 
+    # ------------------------------------- v2 cell-placement adjustments
+    # Everything above is identical to v1 (same ids/tags/geometry/bbox).
+    # The only thing manifest_version=2 changes for the *existing* v1
+    # elements is where loose placement files them: ancestor "00" is depth
+    # 2, which is not in V2_ANCESTOR_DEPTHS, so anything the v1 rule placed
+    # there (way 110, relations 202/204/205/206 -- all "descend from root
+    # while exactly one child fully contains the bbox" stopped at "00"
+    # because their members straddle two of "00"'s own children) promotes
+    # to the greatest allowed depth <= 2, which is 0 ("root"). This is the
+    # "one long way at root" case the m1-contracts.md task calls for --
+    # way 110 already spans two leaves, hence "00" under v1 in the first
+    # place. TRAP_WAY_CELL ("300") above is the other case: a way whose v1
+    # cell (a depth-4 ancestor with no equivalent under v1's 3-leaf-deep
+    # topology) doesn't exist in this fixture at all, only in the v2 trap
+    # region.
+    if manifest_version == 2:
+        for w in ways:
+            if w["cell"] == "00":
+                w["cell"] = "root"
+                info.root_promoted_way_ids.append(w["id"])
+        for r in relations:
+            if r["cell"] == "00":
+                r["cell"] = "root"
+                info.root_promoted_relation_ids.append(r["id"])
+
     all_lons = [n["lon"] for n in nodes]
     all_lats = [n["lat"] for n in nodes]
     info.total_bbox = (min(all_lats), min(all_lons), max(all_lats), max(all_lons))
 
     # ---------------------------------------------------------- write files
-    manifest = {
-        "manifest_version": 1,
+    manifest_leaf_cells = list(LEAVES) + (list(V2_TRAP_LEAVES) if manifest_version == 2 else [])
+    manifest: dict = {
+        "manifest_version": manifest_version,
         "generation": GEN,
         "schema_version": 1,
         "coordinate_scale": 10000000,
@@ -384,13 +545,24 @@ def build(root_dir: str, con: duckdb.DuckDBPyConnection | None = None) -> Fixtur
         "replication_sequence": 1,
         "source": "synthetic engine-test fixture (tests/fixtures/make_fixture.py)",
         "extent": list(info.total_bbox),
-        "leaf_cells": LEAVES,
+        "leaf_cells": manifest_leaf_cells,
         "tables": {"node": {"cells": {}}, "way": {"cells": {}}, "relation": {"cells": {}}},
         "byid": {"node": [], "way": [], "relation": []},
         "index": {"node_way": [], "member": []},
     }
+    if manifest_version == 2:
+        manifest["ancestor_depths"] = list(V2_ANCESTOR_DEPTHS)
+        manifest["max_depth"] = V2_MAX_DEPTH
+        manifest["producer"] = {"raw": "osmpq raw-py", "build": "osmpq 0.0.1 (tests/fixtures/make_fixture.py)"}
+        # rowgroup_index paths are filled in once the spatial files (and
+        # their row-group footers) exist -- see the bottom of this function.
 
-    def meta_cols_sql(i: int) -> str:
+    def meta_cols_sql(i: int, force_null: bool = False) -> str:
+        if force_null:
+            return (
+                'NULL::INTEGER AS version, NULL::BIGINT AS changeset, '
+                'NULL::TIMESTAMP AS "timestamp", NULL::INTEGER AS uid, NULL::VARCHAR AS "user"'
+            )
         return (
             f"{2 + (i % 5)} AS version, {9000 + i} AS changeset, "
             f"TIMESTAMP '2026-09-01 12:00:00' + INTERVAL ({i}) MINUTE AS \"timestamp\", "
@@ -410,8 +582,11 @@ def build(root_dir: str, con: duckdb.DuckDBPyConnection | None = None) -> Fixtur
             for k in PROMOTED_KEYS
         )
 
-    # -- node spatial partitions (tagged / untagged), per leaf cell
-    for cell in LEAVES:
+    # -- node spatial partitions (tagged / untagged), per cell actually used
+    # (LEAVES for v1; LEAVES + V2_TRAP_LEAVES for v2, but derived from the
+    # data rather than hardcoded so this needs no separate v1/v2 branch).
+    node_cells = sorted({n["cell"] for n in nodes})
+    for cell in node_cells:
         cell_nodes = [n for n in nodes if n["cell"] == cell]
         for tagged in (True, False):
             part = [n for n in cell_nodes if bool(n["tags"]) == tagged]
@@ -424,7 +599,7 @@ def build(root_dir: str, con: duckdb.DuckDBPyConnection | None = None) -> Fixtur
                 rows_sql.append(
                     f"SELECT {n['id']} AS id, {lat_e7} AS lat_e7, {lon_e7} AS lon_e7, "
                     f"{tags_literal(n['tags'])} AS tags, {promoted_cols_sql(n['tags'])}, "
-                    f"{meta_cols_sql(n['id'])}, {h}::UBIGINT AS hilbert"
+                    f"{meta_cols_sql(n['id'], force_null=n['id'] in null_meta_node_ids)}, {h}::UBIGINT AS hilbert"
                 )
             sql = " UNION ALL ".join(rows_sql)
             rel_path = f"spatial/{GEN}/node/cell={cell}/tagged={'true' if tagged else 'false'}/part-0.parquet"
@@ -548,7 +723,7 @@ def build(root_dir: str, con: duckdb.DuckDBPyConnection | None = None) -> Fixtur
             rows_sql.append(
                 f"SELECT {n['id']} AS id, {lat_e7} AS lat_e7, {lon_e7} AS lon_e7, "
                 f"{tags_literal(n['tags'])} AS tags, {promoted_cols_sql(n['tags'])}, "
-                f"{meta_cols_sql(n['id'])}, '{n['cell']}' AS cell"
+                f"{meta_cols_sql(n['id'], force_null=n['id'] in null_meta_node_ids)}, '{n['cell']}' AS cell"
             )
         sql = " UNION ALL ".join(rows_sql)
         rel_path = f"byid/{GEN}/node/part-{k:05d}.parquet"
@@ -641,6 +816,57 @@ def build(root_dir: str, con: duckdb.DuckDBPyConnection | None = None) -> Fixtur
         manifest["index"]["member"].append(
             {"path": rel_path, "rows": len(member_rows), "bytes": out_path.stat().st_size}
         )
+
+    # ------------------------------------------- row-group index (v2 only)
+    # index/<gen>/rowgroups/{node,way,relation}.parquet (m1-contracts.md
+    # section 4): one row per Parquet row group of the *spatial* files,
+    # computed from the files' own footers with pyarrow (not recomputed
+    # from the Python row lists above), exactly as the real Python build
+    # stage is expected to do it.
+    if manifest_version == 2:
+        rg_rows: dict[str, list[dict]] = {"node": [], "way": [], "relation": []}
+        for cell, parts in manifest["tables"]["node"]["cells"].items():
+            for tag_key, entry in parts.items():
+                rg_rows["node"].extend(
+                    _node_rowgroup_rows(root / entry["path"], entry["path"], cell, tag_key == "tagged")
+                )
+        for cell, entry in manifest["tables"]["way"]["cells"].items():
+            rg_rows["way"].extend(_bbox_rowgroup_rows(root / entry["path"], entry["path"], cell))
+        for cell, entry in manifest["tables"]["relation"]["cells"].items():
+            rg_rows["relation"].extend(_bbox_rowgroup_rows(root / entry["path"], entry["path"], cell))
+
+        manifest["rowgroup_index"] = {}
+        for table, rows in rg_rows.items():
+            rel_path = f"index/{GEN}/rowgroups/{table}.parquet"
+            out_path = root / rel_path
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            rows = sorted(rows, key=lambda r: (r["path"], r["rg"]))
+            if rows:
+                rows_sql = " UNION ALL ".join(
+                    f"SELECT '{r['path']}' AS path, '{r['cell']}' AS cell, "
+                    f"{'NULL::BOOLEAN' if r['tagged'] is None else str(r['tagged']).upper()} AS tagged, "
+                    f"{r['rg']} AS rg, {r['rows']} AS rows, "
+                    f"{r['xmin_e7']} AS xmin_e7, {r['ymin_e7']} AS ymin_e7, "
+                    f"{r['xmax_e7']} AS xmax_e7, {r['ymax_e7']} AS ymax_e7"
+                    for r in rows
+                )
+            else:
+                rows_sql = (
+                    "SELECT NULL::VARCHAR AS path, NULL::VARCHAR AS cell, NULL::BOOLEAN AS tagged, "
+                    "NULL::INTEGER AS rg, NULL::INTEGER AS rows, NULL::INTEGER AS xmin_e7, "
+                    "NULL::INTEGER AS ymin_e7, NULL::INTEGER AS xmax_e7, NULL::INTEGER AS ymax_e7 WHERE FALSE"
+                )
+            con.execute(f"COPY ({rows_sql}) TO '{out_path}' (FORMAT PARQUET)")
+            manifest["rowgroup_index"][table] = rel_path
+
+        manifest["stats"] = {
+            "nodes": len(nodes),
+            "tagged_nodes": sum(1 for n in nodes if n["tags"]),
+            "ways": len(ways),
+            "relations": len(relations),
+            "leaf_cells": len(manifest_leaf_cells),
+            "bytes": {"spatial": 0, "byid": 0, "index": 0},
+        }
 
     # -------------------------------------------------------------- manifest
     manifest_dir = root / "manifest"

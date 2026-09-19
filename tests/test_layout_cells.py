@@ -190,3 +190,95 @@ def test_leaf_index_contains():
     assert "2" not in li
     assert len(li) == 6
     assert sorted(li) == ["0", "1", "20", "21", "22", "23"]
+
+
+# --------------------------------------------------------------------------
+# containing_cell_v2 / containing_cells_v2_np, per docs/m1-contracts.md section 2
+# --------------------------------------------------------------------------
+
+
+def test_containing_cell_v2_whole_world_bbox_is_root():
+    leaves = _all_leaves_at_depth(3)
+    li = cells.LeafIndex(leaves)
+    assert cells.containing_cell_v2((-90, -180, 90, 180), li, [0, 3], 13) == "root"
+
+
+def test_containing_cell_v2_bbox_in_one_leaf_uses_that_leaf_exactly():
+    leaves = _all_leaves_at_depth(4)
+    li = cells.LeafIndex(leaves)
+    leaf = "1230"
+    south, west, north, east = cells.cell_bbox(leaf)
+    cx, cy = (west + east) / 2, (south + north) / 2
+    tiny = (cy - 0.001, cx - 0.001, cy + 0.001, cx + 0.001)
+    # ancestor_depths deliberately excludes 4: a leaf is used as-is even when
+    # its own depth isn't one of the allowed ancestor depths.
+    assert cells.containing_cell_v2(tiny, li, [0, 3], 13) == leaf
+
+
+def test_containing_cell_v2_matches_v1_when_ancestor_depths_is_unrestricted():
+    """With every depth allowed and max_depth == the leaf depth, v2 must
+    agree with the unrestricted v1 rule (containing_cell_v2 is a strict
+    generalization of it)."""
+    leaves = _all_leaves_at_depth(4)
+    li = cells.LeafIndex(leaves)
+    rng = np.random.default_rng(1)
+    for _ in range(200):
+        lat1, lat2 = sorted(rng.uniform(-89, 89, 2))
+        lon1, lon2 = sorted(rng.uniform(-179, 179, 2))
+        bbox = (lat1, lon1, lat2, lon2)
+        v1 = cells.containing_cell(bbox, li)
+        v2 = cells.containing_cell_v2(bbox, li, [0, 1, 2, 3, 4], 4)
+        assert v1 == v2, (bbox, v1, v2)
+
+
+def test_containing_cell_v2_spans_two_leaves_under_non_allowed_depth_rounds_up():
+    """A bbox whose unrestricted containing cell C sits at depth 7 (not in
+    ancestor_depths) must round up to the ancestor at depth 6."""
+    key7 = "0123012"  # depth 7, digits in {0,1,2,3}
+    leaves = {key7 + d for d in "0123"}  # depth-8 leaves under key7
+    li = cells.LeafIndex(leaves)
+    s0, w0, n0, e0 = cells.cell_bbox(key7 + "0")
+    cx0, cy0 = (w0 + e0) / 2, (s0 + n0) / 2
+    s1, w1, n1, e1 = cells.cell_bbox(key7 + "1")
+    cx1, cy1 = (w1 + e1) / 2, (s1 + n1) / 2
+    bbox = (min(cy0, cy1), min(cx0, cx1), max(cy0, cy1), max(cx0, cx1))
+    result = cells.containing_cell_v2(bbox, li, cells.DEFAULT_ANCESTOR_DEPTHS, 13)
+    assert result == key7[:6]
+
+
+def test_containing_cell_v2_leaf_deeper_than_12_stays_as_leaf():
+    leaf13 = "0123012301230"
+    assert len(leaf13) == 13
+    li = cells.LeafIndex({leaf13})
+    south, west, north, east = cells.cell_bbox(leaf13)
+    cx, cy = (west + east) / 2, (south + north) / 2
+    tiny = (cy - 1e-7, cx - 1e-7, cy + 1e-7, cx + 1e-7)
+    result = cells.containing_cell_v2(tiny, li, cells.DEFAULT_ANCESTOR_DEPTHS, 13)
+    assert result == leaf13
+
+
+def test_containing_cells_v2_np_batch_matches_scalar():
+    leaves = _all_leaves_at_depth(4)
+    li = cells.LeafIndex(leaves)
+    rng = np.random.default_rng(2)
+    n = 300
+    lat1 = rng.uniform(-89, 89, n)
+    lat2 = rng.uniform(-89, 89, n)
+    lon1 = rng.uniform(-179, 179, n)
+    lon2 = rng.uniform(-179, 179, n)
+    ymin = np.minimum(lat1, lat2)
+    ymax = np.maximum(lat1, lat2)
+    xmin = np.minimum(lon1, lon2)
+    xmax = np.maximum(lon1, lon2)
+    ymin_e7 = np.round(ymin * 1e7).astype(np.int64)
+    xmin_e7 = np.round(xmin * 1e7).astype(np.int64)
+    ymax_e7 = np.round(ymax * 1e7).astype(np.int64)
+    xmax_e7 = np.round(xmax * 1e7).astype(np.int64)
+    batch = cells.containing_cells_v2_np(
+        ymin_e7, xmin_e7, ymax_e7, xmax_e7, li, cells.DEFAULT_ANCESTOR_DEPTHS, 13
+    )
+    for i in range(n):
+        scalar = cells.containing_cell_v2(
+            (ymin[i], xmin[i], ymax[i], xmax[i]), li, cells.DEFAULT_ANCESTOR_DEPTHS, 13
+        )
+        assert batch[i] == scalar, (i, batch[i], scalar)
