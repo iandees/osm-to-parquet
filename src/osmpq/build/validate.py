@@ -162,11 +162,10 @@ def validate(root: str) -> tuple[bool, list[str]]:
                         )
         index_path = root_path / man.areas["index"]["path"]
         if index_path.exists():
-            # Sorted, not *strictly* sorted: `id` (way_id + 2400000000 /
-            # relation_id + 3600000000, docs/m3-contracts.md section 4.1)
-            # is not guaranteed unique -- a way id >= ~1.2 billion (routine
-            # in modern OSM) can coincide with a relation's id plus its own
-            # offset, the same ambiguity real Overpass's own scheme has.
+            # Sorted, not *strictly* sorted: relation ids are unique on
+            # their own, but a non-decreasing check is all the invariant
+            # actually requires and stays correct even if that ever
+            # changes.
             bad_idx = con.execute(f"""
                 SELECT count(*) FROM (
                     SELECT id, lag(id) OVER () AS prev FROM read_parquet('{_esc(index_path)}')
@@ -175,6 +174,21 @@ def validate(root: str) -> tuple[bool, list[str]]:
             if bad_idx:
                 problems.append(f"index/areas.parquet not sorted by id ({bad_idx} out-of-order rows)")
         info.append(f"checked {len(area_cells)} area spatial file(s) + the area index")
+
+    # ---- 4c. way_areas index (docs/m3-contracts.md section 9.2): no
+    # spatial files (no stored geometry), just the index sorted by id. -----
+    way_index = man.areas.get("way_index") if man.areas else None
+    if way_index:
+        way_index_path = root_path / way_index["path"]
+        if way_index_path.exists():
+            bad_way_idx = con.execute(f"""
+                SELECT count(*) FROM (
+                    SELECT id, lag(id) OVER () AS prev FROM read_parquet('{_esc(way_index_path)}')
+                ) WHERE prev IS NOT NULL AND id < prev
+            """).fetchone()[0]
+            if bad_way_idx:
+                problems.append(f"index/way_areas.parquet not sorted by id ({bad_way_idx} out-of-order rows)")
+        info.append("checked the way_areas index")
 
     # ---- 5. row-group index coverage --------------------------------------------
     if is_v2 and man.rowgroup_index:
@@ -252,6 +266,9 @@ def _paths_and_rows(man: manifest_mod.Manifest) -> list[tuple[str, int | None]]:
         index_entry = man.areas.get("index")
         if index_entry:
             out.append((index_entry["path"], index_entry.get("rows")))
+        way_index_entry = man.areas.get("way_index")
+        if way_index_entry:
+            out.append((way_index_entry["path"], way_index_entry.get("rows")))
         for entry in man.areas.get("cells", {}).values():
             out.append((entry["path"], entry.get("rows")))
     return out

@@ -266,7 +266,11 @@ def build_from_raw(opts: BuildFromRawOptions) -> manifest_mod.Manifest:
         acon.close()
         man.manifest_version = 4
         man.stats["areas"] = man.areas["index"]["rows"]
-        _log(f"derived {man.stats['areas']} area(s) across {len(man.areas['cells'])} cell(s)")
+        man.stats["way_areas"] = man.areas["way_index"]["rows"]
+        _log(
+            f"derived {man.stats['areas']} relation area(s) across {len(man.areas['cells'])} cell(s), "
+            f"indexed {man.stats['way_areas']} way area(s)"
+        )
 
     manifest_mod.write_manifest(opts.root, man, gen_number)
     _log(f"wrote manifest/{gen_number}.json and manifest/LATEST")

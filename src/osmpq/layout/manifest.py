@@ -83,12 +83,13 @@ class Manifest:
     # version metadata; a tier absent from ``deltas`` is empty (base only).
     replication_source: Optional[str] = None
     deltas: dict[str, Any] = field(default_factory=dict)
-    # -- v4 fields (docs/m3-contracts.md section 4.2): the `area` table,
-    # additive over v1-v3 (nothing above changes for node/way/relation).
-    # ``areas`` is None/empty for a v1-v3 manifest, or a v4 manifest that
-    # hasn't had `osmpq areas` run against it yet -- readers of either
-    # treat area statements as producing an empty set with a warning
-    # (docs/m3-contracts.md section 4.2).
+    # -- v4 fields (docs/m3-contracts.md section 4.2, amended by section 9):
+    # the `area` table (relation areas only, section 9.1-9.2) plus the
+    # `way_index` (closed ways, no stored geometry -- 9.2), additive over
+    # v1-v3 (nothing above changes for node/way/relation). ``areas`` is
+    # None/empty for a v1-v3 manifest, or a v4 manifest that hasn't had
+    # `osmpq areas` run against it yet -- readers of either treat area
+    # statements as producing an empty set with a warning (section 4.2).
     areas: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -180,6 +181,9 @@ class Manifest:
             index_entry = self.areas.get("index")
             if index_entry and index_entry.get("path"):
                 paths.append(index_entry["path"])
+            way_index_entry = self.areas.get("way_index")
+            if way_index_entry and way_index_entry.get("path"):
+                paths.append(way_index_entry["path"])
             for entry in self.areas.get("cells", {}).values():
                 if entry.get("path"):
                     paths.append(entry["path"])

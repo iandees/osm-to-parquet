@@ -556,47 +556,45 @@ def _flat_rg_files(table_manifest: dict) -> list[dict]:
 
 
 # --------------------------------------------------------------------------
-# areas (docs/m3-contracts.md section 4.3): re-derive touched pivots, merge
-# into the previous generation's area cell files, rewrite the index in full.
+# areas (docs/m3-contracts.md section 9.2): relation areas re-derived for
+# touched pivots, merged into the previous generation's area cell files;
+# the way index is rewritten in full from the compacted way byid table.
 # --------------------------------------------------------------------------
 
 
 def _compact_areas(
     con, root: Path, old_man: dict, new_man: dict, new_generation: str,
     promoted_keys: list[str],
-    has_way_byid: bool, way_byid_winners_view: str,
+    way_byid_manifest: list[dict],
     has_rel_byid: bool, relation_byid_winners_view: str,
 ) -> tuple[Optional[dict], int]:
-    """Re-derives area rows for touched pivots -- winners of type way/
+    """Re-derives relation-area rows for touched pivots -- winners of type
     relation, which already include every relation that lists a touched
     way as a member, since the updater puts those into the touched set too
     (docs/m2-contracts.md's touched-set fixed point) -- merges them into
     the previous generation's area cell files (only cells that actually
     gained/lost a row are rewritten; the rest are hardlinked forward), and
-    rewrites the (small) index file in full. Returns (new `areas` manifest
-    field, bytes written), or (None, 0) when the dataset has no `areas`
-    table yet -- areas then simply stay absent until the first `osmpq
-    areas` run, same as a brand-new v4 manifest (4.2)."""
+    rewrites the (small) relation index file in full. The way index
+    (`way_areas.parquet`) has no per-pivot merge at all: it is rebuilt from
+    scratch by scanning `way_byid_manifest` -- the *new* generation's
+    already-fully-compacted way byid parts (9.2: "the way index is
+    rewritten in full from the compacted way tables"). Returns (new
+    `areas` manifest field, bytes written), or (None, 0) when the dataset
+    has no `areas` table yet -- areas then simply stay absent until the
+    first `osmpq areas` run, same as a brand-new v4 manifest."""
     old_areas = old_man.get("areas") or {}
     if not old_areas.get("index"):
         return None, 0
 
-    touched_way_ids = (
-        [r[0] for r in con.execute(f"SELECT id FROM {way_byid_winners_view}").fetchall()]
-        if has_way_byid else []
-    )
     touched_relation_ids = (
         [r[0] for r in con.execute(f"SELECT id FROM {relation_byid_winners_view}").fetchall()]
         if has_rel_byid else []
     )
-    stale_ids = (
-        [w + areas_mod.WAY_ID_OFFSET for w in touched_way_ids]
-        + [r + areas_mod.RELATION_ID_OFFSET for r in touched_relation_ids]
-    )
+    stale_ids = [r + areas_mod.RELATION_ID_OFFSET for r in touched_relation_ids]
 
     new_cat_manifest = engine_catalog.Manifest(root=str(root), data=new_man)
-    placed_table, _files_read = areas_mod.derive_areas_for_pivots(
-        con, new_cat_manifest, promoted_keys, touched_way_ids, touched_relation_ids,
+    placed_table, _files_read = areas_mod.derive_relation_areas_for_pivots(
+        con, new_cat_manifest, promoted_keys, touched_relation_ids,
     )
 
     old_index_path = root / old_areas["index"]["path"]
@@ -665,7 +663,15 @@ def _compact_areas(
     index_rows, index_size = common.copy_to_parquet(con, index_sel, index_path, row_group_size_bytes=areas_mod.AREA_INDEX_ROW_GROUP_BYTES)
     total_bytes += index_size
 
-    return {"index": {"path": index_rel, "rows": index_rows, "bytes": index_size}, "cells": cells_manifest}, total_bytes
+    way_files = [str(root / p["path"]) for p in way_byid_manifest]
+    way_index_field = areas_mod.build_way_area_index_from_files(con, root, new_generation, way_files, promoted_keys)
+    total_bytes += way_index_field["bytes"]
+
+    return (
+        {"index": {"path": index_rel, "rows": index_rows, "bytes": index_size},
+         "cells": cells_manifest, "way_index": way_index_field},
+        total_bytes,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -807,18 +813,18 @@ def compact(opts: CompactOptions) -> dict:
     new_man["index"] = {"node_way": node_way_manifest, "member": member_manifest}
     new_man["rowgroup_index"] = {"node": node_rg_path, "way": way_rg_path, "relation": relation_rg_path}
 
-    # ---- areas (docs/m3-contracts.md section 4.3) --------------------------------------
+    # ---- areas (docs/m3-contracts.md section 9.2) --------------------------------------
     areas_field, areas_bytes = _compact_areas(
         con, root, old_man, new_man, new_generation, promoted_keys,
-        has_way_byid, "way_byid_winners", has_rel_byid, "relation_byid_winners",
+        way_byid_manifest, has_rel_byid, "relation_byid_winners",
     )
     if areas_field is not None:
         new_man["areas"] = areas_field
         new_man["manifest_version"] = 4
         bytes_by_kind["index"] += areas_bytes
         _log(
-            f"areas: {areas_field['index']['rows']} row(s) across {len(areas_field['cells'])} cell(s) "
-            f"in {timer.lap('areas'):.2f}s"
+            f"areas: {areas_field['index']['rows']} relation area(s) across {len(areas_field['cells'])} cell(s), "
+            f"{areas_field['way_index']['rows']} way area(s) indexed, in {timer.lap('areas'):.2f}s"
         )
 
     n_nodes = sum(p["rows"] for p in node_byid_manifest)
@@ -836,6 +842,7 @@ def compact(opts: CompactOptions) -> dict:
     }
     if areas_field is not None:
         new_man["stats"]["areas"] = areas_field["index"]["rows"]
+        new_man["stats"]["way_areas"] = areas_field["way_index"]["rows"]
 
     gen_number = latest_num + 1
     manifest_dir.mkdir(parents=True, exist_ok=True)

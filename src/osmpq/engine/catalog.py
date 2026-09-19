@@ -226,12 +226,20 @@ class Manifest:
     @property
     def area_index(self) -> Optional[dict]:
         """The single `index/<gen>/areas.parquet` manifest entry
-        ({"path", "rows", "bytes"}), or None when areas are absent
-        (docs/m3-contracts.md section 4.2)."""
+        ({"path", "rows", "bytes"}) -- relation areas only (docs/m3-
+        contracts.md section 9.2) -- or None when absent."""
         return self.data.get("areas", {}).get("index")
 
+    @property
+    def way_area_index(self) -> Optional[dict]:
+        """The single `index/<gen>/way_areas.parquet` manifest entry
+        ({"path", "rows", "bytes"}) -- closed ways carrying a qualifying
+        key, no stored geometry (docs/m3-contracts.md section 9.2) -- or
+        None when absent."""
+        return self.data.get("areas", {}).get("way_index")
+
     def has_areas(self) -> bool:
-        return bool(self.data.get("areas", {}).get("index"))
+        return bool(self.area_index or self.way_area_index)
 
     def byid_parts(self, table: str) -> list[dict]:
         return list(self.data.get("byid", {}).get(table, []))

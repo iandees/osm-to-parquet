@@ -1,29 +1,40 @@
-"""``osmpq areas <root>``: docs/m3-contracts.md section 4 (4.1-4.3).
+"""``osmpq areas <root>``: docs/m3-contracts.md section 4, amended by
+section 9 after probing the reference (Overpass 0.7.62) -- section 9
+replaces 4.1 and changes 4.2-4.5, and is what this module implements.
 
-Derives the `area` table from the current generation's relations
-(``type=multipolygon``/``type=boundary`` whose member ways assemble into at
-least one valid ring) and closed ``is_area`` ways carrying at least one
-qualifying key (4.1), and writes ``spatial/<gen>/area/cell=<cell>/
-part-0.parquet`` plus a single ``index/<gen>/areas.parquet`` (4.2), then a
-new manifest (v4, additive: ``tables``/``byid``/``index`` for node/way/
-relation are untouched, only a top-level ``areas`` field is added and the
-manifest number bumped).
+Two tables, derived independently:
 
-Way-area geometry is a single ``ST_MakePolygon`` over the way's own stored
-LINESTRING -- no assembly needed. Relation-area geometry (multipolygon
-ring assembly, including holes) runs in Python with ``shapely`` (never in
-the engine, per 4.1): member ways are merged into rings with
-``shapely.ops.linemerge``, closed rings become polygons, inner rings are
-subtracted from the outer polygons that contain them, and the result is
-``shapely.validation.make_valid``-ed.
+* **Relation areas** (`index/<gen>/areas.parquet` +
+  `spatial/<gen>/area/cell=<cell>/part-0.parquet`, unchanged shape from
+  4.2): relations that assemble into at least one valid ring *and* match
+  the reference's own `areas.osm3s` recipe (9 fact 3): `type=multipolygon`
+  with a `name`, `type=boundary` with a `name`, an `admin_level` with a
+  `name`, a `postal_code`, or an `addr:postcode`. Ring assembly runs in
+  Python with ``shapely`` (never in the engine): member ways are merged
+  into rings with ``shapely.ops.linemerge``, closed rings become polygons,
+  inner rings are subtracted from the outer polygons that contain them,
+  and the result is ``shapely.validation.make_valid``-ed.
+* **Way areas are not stored as a separate row at all** (9.1): every
+  closed way already *is* an area, as its own canonical row, with no
+  polygon geometry precomputed (the engine builds it on demand from the
+  way's own LINESTRING via `ST_MakePolygon`). This module only writes a
+  lightweight *index* over them, `index/<gen>/way_areas.parquet` (9.2):
+  closed ways (the stored `is_closed` column -- not `is_area`, which the
+  Rust producer additionally excludes highway/barrier loops and
+  `area=no` ways that fact 1 says the reference still treats as areas)
+  carrying at least one of a *small* set of keys area lookups use in
+  practice (`name`, `ref`, `admin_level`, `boundary`, `place`) -- no
+  geometry, no ring assembly, just `id`/tags/meta/bbox/cell/hilbert
+  copied straight from the way's own row, sorted by `id`.
 
 Reads relations/ways through ``osmpq.engine.sources.current_rows`` (the
 same M2 delta-shadowing helper the query engine uses), so this runs
-correctly on a dataset that has replication deltas (4.3): deltas
-themselves carry no area rows, so newly-delta'd pivots are picked up only
-once ``osmpq compact`` folds them into a base generation and re-derives
-areas for the touched pivots (see ``derive_areas_for_pivots`` below, used
-by ``osmpq.build.compact``).
+correctly on a dataset that has replication deltas: deltas themselves
+carry no area rows, so newly-delta'd pivots are picked up only once
+``osmpq compact`` folds them into a base generation and re-derives areas
+for the touched pivots (relation areas: `derive_relation_areas_for_pivots`
+below; the way index is instead rewritten in full from the compacted way
+tables each time, 9.2 -- small, and simpler than merging).
 
 Manifest writes go through the temp-file + ``os.replace`` pattern (dataset
 roots are routinely hardlinked with ``cp -al``; an in-place write would
@@ -53,16 +64,15 @@ from osmpq.layout import hilbert as hilbert_mod
 WAY_ID_OFFSET = 2_400_000_000
 RELATION_ID_OFFSET = 3_600_000_000
 
-# docs/m3-contracts.md section 4.1: a closed `is_area` way is an area only
-# if it carries at least one of these keys (bare buildings are excluded).
-QUALIFYING_KEYS = [
-    "name", "ref", "admin_level", "boundary", "place", "postal_code",
-    "addr:postcode", "landuse", "natural", "leisure", "amenity",
-    "tourism", "historic", "military", "aeroway", "water", "area",
-]
+# docs/m3-contracts.md section 9.2: the keys a *way* index lookup
+# (`area[key=value]`) uses in practice -- much narrower than the set of
+# keys that make a way an area at all (9 fact 1: every closed way is an
+# area for is_in/(area)/(pivot)/map_to_area, regardless of tags).
+WAY_AREA_QUALIFYING_KEYS = ["name", "ref", "admin_level", "boundary", "place"]
 
 AREA_SPATIAL_ROW_GROUP_BYTES = 1_000_000
 AREA_INDEX_ROW_GROUP_BYTES = 4_000_000
+WAY_AREA_INDEX_ROW_GROUP_BYTES = 4_000_000
 
 DEFAULT_PROMOTED_KEYS = [
     "amenity", "shop", "highway", "building", "name", "natural",
@@ -122,22 +132,30 @@ def _connect(threads: Optional[int], memory_limit: Optional[str], tmpdir: Path):
 
 
 # --------------------------------------------------------------------------
-# way-derived areas: pure SQL (ST_MakePolygon on the stored LINESTRING)
+# way areas (9.1-9.2): no stored geometry, no offset id -- just a small
+# index over closed ways carrying a qualifying key, keyed by the way's own
+# `id`, reusing the way's own `cell`/`hilbert` placement verbatim.
 # --------------------------------------------------------------------------
 
 
-def _way_area_candidates(con, manifest: catalog.Manifest, way_ids: Optional[list[int]]) -> tuple[str, int]:
-    """TEMP TABLE of qualifying way rows (4.1: is_area + >=1 qualifying
-    key), restricted to `way_ids` when given (compact's touched-pivot
-    re-derive; None means every way -- the full ``osmpq areas`` derive).
-    An explicit empty `way_ids` (no touched way pivots this compaction)
+def _way_qualifying_sql(tags_expr: str = "tags") -> str:
+    return " OR ".join(f"{tags_expr}['{k}'] IS NOT NULL" for k in WAY_AREA_QUALIFYING_KEYS)
+
+
+def _way_area_index_candidates(con, manifest: catalog.Manifest, way_ids: Optional[list[int]]) -> tuple[str, int]:
+    """TEMP TABLE of closed way rows carrying a qualifying key (9.2):
+    `id, tags, meta cols, bbox, cell, hilbert` -- no geometry (the engine
+    builds the polygon on demand from the way's own LINESTRING).
+    Restricted to `way_ids` when given (unused by the full derive; kept for
+    symmetry with the relation-side helpers). An explicit empty `way_ids`
     short-circuits to an empty table with no file reads at all."""
-    name = "_way_area_cand"
+    name = "_way_area_idx_cand"
     empty_ddl = (
         f"CREATE OR REPLACE TEMP TABLE {name} ("
         "id BIGINT, tags MAP(VARCHAR, VARCHAR), version INTEGER, changeset BIGINT, "
         "timestamp TIMESTAMP, uid INTEGER, \"user\" VARCHAR, "
-        "xmin_e7 INTEGER, ymin_e7 INTEGER, xmax_e7 INTEGER, ymax_e7 INTEGER, geometry GEOMETRY)"
+        "xmin_e7 INTEGER, ymin_e7 INTEGER, xmax_e7 INTEGER, ymax_e7 INTEGER, "
+        "cell VARCHAR, hilbert UBIGINT)"
     )
     if way_ids is not None and not way_ids:
         con.execute(empty_ddl)
@@ -152,10 +170,14 @@ def _way_area_candidates(con, manifest: catalog.Manifest, way_ids: Optional[list
         "version": "version", "changeset": "changeset", "timestamp": "timestamp",
         "uid": "uid", "user": '"user"',
         "xmin_e7": "xmin_e7", "ymin_e7": "ymin_e7", "xmax_e7": "xmax_e7", "ymax_e7": "ymax_e7",
-        "geometry": "geometry", "hilbert": "hilbert",
+        "hilbert": "hilbert",
     }
-    qualifying = " OR ".join(f"tags['{k}'] IS NOT NULL" for k in QUALIFYING_KEYS)
-    where = f"is_area AND ({qualifying})"
+    # `is_closed`, not `is_area`: the Rust producer's `is_area` additionally
+    # excludes highway/barrier loops (roundabouts, closed service ways) and
+    # `area=no` ways -- but 9 fact 1 says the reference still treats those
+    # as areas for is_in/(area)/(pivot)/map_to_area, so the way-area concept
+    # here is purely topological (closed = refs[0] == refs[-1], >=4 refs).
+    where = f"is_closed AND ({_way_qualifying_sql()})"
     if way_ids is not None:
         id_pred = idset.id_predicate(con, "id", way_ids) if way_ids else "FALSE"
         where = f"({where}) AND ({id_pred})"
@@ -163,38 +185,62 @@ def _way_area_candidates(con, manifest: catalog.Manifest, way_ids: Optional[list
     con.execute(
         f"CREATE OR REPLACE TEMP TABLE {name} AS "
         f"SELECT id, tags, version, changeset, timestamp, uid, \"user\", "
-        f"xmin_e7, ymin_e7, xmax_e7, ymax_e7, geometry FROM ({sql}) t "
-        f"WHERE geometry IS NOT NULL AND ST_NPoints(geometry) >= 4"
+        f"xmin_e7, ymin_e7, xmax_e7, ymax_e7, cell, hilbert FROM ({sql}) t"
     )
     return name, nfiles
 
 
-def _way_area_final(con, cand_table: str) -> str:
-    # `is_closed` (raw.py) means refs[0] == refs[-1] by *node id*, which
-    # guarantees the ring is geometrically closed -- but real-world
-    # coordinate round-tripping (float storage, GeoParquet WKB) can leave
-    # the stored first/last vertex a few ULPs apart, which
-    # `ST_MakePolygon` rejects outright ("shell must be closed"). Force
-    # exact closure by replacing the last vertex with an exact copy of the
-    # first, rather than trusting the stored one -- the ring's shape is
-    # unaffected (the same node's coordinates either way).
-    closed_ring_sql = (
-        "ST_MakeLine(list_append("
-        "list_slice(list_transform(range(1, ST_NPoints(geometry)::INTEGER), "
-        "i -> ST_PointN(geometry, i::INTEGER)), 1, ST_NPoints(geometry)::INTEGER - 1), "
-        "ST_PointN(geometry, 1)))"
+def build_way_area_index(
+    con, root: Path, generation: str, manifest: catalog.Manifest, promoted_keys: list[str],
+    way_ids: Optional[list[int]] = None,
+) -> tuple[dict, int]:
+    """Writes `index/<gen>/way_areas.parquet` (9.2) from the current
+    generation's way rows (delta-aware via `current_rows`, like the
+    relation side): closed ways with a qualifying key, sorted by `id`.
+    Returns ({"path", "rows", "bytes"}, files_read)."""
+    cand_table, files_read = _way_area_index_candidates(con, manifest, way_ids)
+    promoted_sql = common.promoted_select(promoted_keys)
+    index_rel = f"index/{generation}/way_areas.parquet"
+    index_path = root / index_rel
+    select_sql = (
+        f"SELECT id, tags, {promoted_sql}, version, changeset, timestamp, uid, \"user\", "
+        f"xmin_e7, ymin_e7, xmax_e7, ymax_e7, cell, hilbert FROM {cand_table} ORDER BY id"
     )
-    name = "_way_area_final"
-    con.execute(f"""
-        CREATE OR REPLACE TEMP TABLE {name} AS
-        SELECT id + {WAY_ID_OFFSET} AS id, 'way' AS pivot_type, id AS pivot_id, tags,
-               version, changeset, timestamp, uid, "user",
-               xmin_e7, ymin_e7, xmax_e7, ymax_e7,
-               ST_MakeValid(ST_MakePolygon({closed_ring_sql})) AS geometry
-        FROM {cand_table}
-    """)
+    rows, size = common.copy_to_parquet(con, select_sql, index_path, row_group_size_bytes=WAY_AREA_INDEX_ROW_GROUP_BYTES)
     con.execute(f"DROP TABLE {cand_table}")
-    return name
+    return {"path": index_rel, "rows": rows, "bytes": size}, files_read
+
+
+def build_way_area_index_from_files(
+    con, root: Path, generation: str, way_files: list[str], promoted_keys: list[str],
+) -> dict:
+    """Full rebuild of `index/<gen>/way_areas.parquet` straight from a
+    list of already-compacted way parquet files (no delta layering --
+    ``osmpq compact`` calls this with the *new* generation's way byid
+    parts, per 9.2: "the way index is rewritten in full from the compacted
+    way tables"). Returns {"path", "rows", "bytes"}."""
+    promoted_sql = common.promoted_select(promoted_keys)
+    index_rel = f"index/{generation}/way_areas.parquet"
+    index_path = root / index_rel
+    if not way_files:
+        empty_sql = (
+            "SELECT NULL::BIGINT AS id, NULL::MAP(VARCHAR, VARCHAR) AS tags, "
+            + ", ".join(f'NULL::VARCHAR AS "{k}"' for k in promoted_keys)
+            + ", NULL::INTEGER AS version, NULL::BIGINT AS changeset, NULL::TIMESTAMP AS \"timestamp\", "
+            "NULL::INTEGER AS uid, NULL::VARCHAR AS \"user\", NULL::INTEGER AS xmin_e7, "
+            "NULL::INTEGER AS ymin_e7, NULL::INTEGER AS xmax_e7, NULL::INTEGER AS ymax_e7, "
+            "NULL::VARCHAR AS cell, NULL::UBIGINT AS hilbert WHERE FALSE"
+        )
+        rows, size = common.copy_to_parquet(con, empty_sql, index_path, row_group_size_bytes=WAY_AREA_INDEX_ROW_GROUP_BYTES)
+        return {"path": index_rel, "rows": rows, "bytes": size}
+    select_sql = (
+        f"SELECT id, tags, {promoted_sql}, version, changeset, timestamp, uid, \"user\", "
+        f"xmin_e7, ymin_e7, xmax_e7, ymax_e7, cell, hilbert "
+        f"FROM read_parquet({_quote_list(way_files)}, union_by_name=true) "
+        f"WHERE is_closed AND ({_way_qualifying_sql()}) ORDER BY id"
+    )
+    rows, size = common.copy_to_parquet(con, select_sql, index_path, row_group_size_bytes=WAY_AREA_INDEX_ROW_GROUP_BYTES)
+    return {"path": index_rel, "rows": rows, "bytes": size}
 
 
 # --------------------------------------------------------------------------
@@ -263,9 +309,24 @@ def _assemble_relation_geometry(outer_way_ids: list[int], inner_way_ids: list[in
     return None if geom.is_empty else geom
 
 
+def _relation_qualifying_sql(tags_expr: str = "tags") -> str:
+    """docs/m3-contracts.md section 9 fact 3: the reference's own
+    `areas.osm3s` recipe -- a relation is *considered* for an area only
+    when it matches one of these tag combinations (it still needs a
+    resolvable ring on top of this, checked separately)."""
+    return (
+        f"(({tags_expr}['type'] = 'multipolygon' AND {tags_expr}['name'] IS NOT NULL) "
+        f"OR ({tags_expr}['type'] = 'boundary' AND {tags_expr}['name'] IS NOT NULL) "
+        f"OR ({tags_expr}['admin_level'] IS NOT NULL AND {tags_expr}['name'] IS NOT NULL) "
+        f"OR {tags_expr}['postal_code'] IS NOT NULL "
+        f"OR {tags_expr}['addr:postcode'] IS NOT NULL)"
+    )
+
+
 def _relation_area_rows(con, manifest: catalog.Manifest, relation_ids: Optional[list[int]]) -> tuple[list[dict], int]:
-    """Python list of area-row dicts for multipolygon/boundary relations
-    (4.1), restricted to `relation_ids` pivots when given (compact's
+    """Python list of area-row dicts for relations matching the
+    `areas.osm3s` rule (9 fact 3) that also assemble into at least one
+    valid ring, restricted to `relation_ids` pivots when given (compact's
     touched-pivot re-derive; None means every relation). An explicit empty
     `relation_ids` short-circuits to no rows with no file reads at all."""
     if relation_ids is not None and not relation_ids:
@@ -282,7 +343,7 @@ def _relation_area_rows(con, manifest: catalog.Manifest, relation_ids: Optional[
         "xmin_e7": "xmin_e7", "ymin_e7": "ymin_e7", "xmax_e7": "xmax_e7", "ymax_e7": "ymax_e7",
         "geometry": "NULL::GEOMETRY", "hilbert": "hilbert",
     }
-    where = "(tags['type'] = 'multipolygon' OR tags['type'] = 'boundary')"
+    where = _relation_qualifying_sql()
     if relation_ids is not None:
         id_pred = idset.id_predicate(con, "id", relation_ids) if relation_ids else "FALSE"
         where = f"({where}) AND ({id_pred})"
@@ -397,30 +458,19 @@ def _relation_area_final(con, area_rows: list[dict]) -> str:
 
 
 # --------------------------------------------------------------------------
-# combine + place (cell/hilbert) + write
+# relation areas: place (cell/hilbert) + write
 # --------------------------------------------------------------------------
 
 
-def derive_areas(
-    con, manifest: catalog.Manifest, way_ids: Optional[list[int]] = None, relation_ids: Optional[list[int]] = None,
-) -> tuple[str, int]:
-    """TEMP TABLE of every derived area row (id, pivot_type, pivot_id, tags,
-    meta cols, bbox, geometry -- no cell/hilbert yet), restricted to
-    `way_ids`/`relation_ids` pivots when given. Returns (table_name,
-    files_read)."""
-    way_cand, nfiles_w = _way_area_candidates(con, manifest, way_ids)
-    way_final = _way_area_final(con, way_cand)
+def derive_relation_areas(con, manifest: catalog.Manifest, relation_ids: Optional[list[int]] = None) -> tuple[str, int]:
+    """TEMP TABLE of every derived relation-area row (id, pivot_type,
+    pivot_id, tags, meta cols, bbox, geometry -- no cell/hilbert yet),
+    restricted to `relation_ids` pivots when given. Returns (table_name,
+    files_read). Way areas are not stored (9.1) -- see `build_way_area_index`
+    for the way side."""
     rel_rows, nfiles_r = _relation_area_rows(con, manifest, relation_ids)
     rel_final = _relation_area_final(con, rel_rows)
-    con.execute(f"""
-        CREATE OR REPLACE TEMP TABLE _area_derived AS
-        SELECT * FROM {way_final}
-        UNION ALL
-        SELECT * FROM {rel_final}
-    """)
-    con.execute(f"DROP TABLE {way_final}")
-    con.execute(f"DROP TABLE {rel_final}")
-    return "_area_derived", nfiles_w + nfiles_r
+    return rel_final, nfiles_r
 
 
 def place_areas(con, table_name: str, manifest: catalog.Manifest, promoted_keys: list[str]) -> str:
@@ -433,16 +483,11 @@ def place_areas(con, table_name: str, manifest: catalog.Manifest, promoted_keys:
     max_depth = manifest.max_depth or cells_mod.DEFAULT_MAX_DEPTH_V2
     leaf_index = cells_mod.LeafIndex(leaves) if leaves else cells_mod.LeafIndex([cells_mod.ROOT])
 
-    # `id` (way_id + WAY_ID_OFFSET / relation_id + RELATION_ID_OFFSET) is
-    # *not* guaranteed unique across pivot types: a way id >= ~1.2 billion
-    # (routine in modern OSM) plus WAY_ID_OFFSET can equal some relation's
-    # id plus RELATION_ID_OFFSET (the same ambiguity real Overpass's own
-    # `way_id+2400000000`/`relation_id+3600000000` scheme has). Joining the
-    # per-row cell/hilbert assignment back by `id` would then cross-
-    # multiply rows for a colliding id (each of the 2 pivots' rows joining
-    # both of the 2 assignment rows), silently corrupting *other* pivots'
-    # cell placement too -- so join on a synthetic unique row key instead,
-    # never on `id`.
+    # `table_name` holds relation areas only (9.1: way areas are never
+    # stored), so `id` (relation_id + RELATION_ID_OFFSET) is unique on its
+    # own -- but join on a synthetic row key rather than `id` anyway, both
+    # because it's cheap and because it keeps this helper correct if it's
+    # ever reused for a table where that isn't true.
     keyed = "_area_keyed"
     con.execute(f"CREATE OR REPLACE TEMP TABLE {keyed} AS SELECT row_number() OVER () AS __rk, * FROM {table_name}")
     con.execute(f"DROP TABLE {table_name}")
@@ -526,28 +571,33 @@ def write_area_layout(con, root: Path, generation: str, placed_table: str, promo
 
 
 def build_areas_for_manifest(con, root: Path, cat_manifest: catalog.Manifest, promoted_keys: list[str]) -> dict:
-    """Full derivation (every qualifying way/relation) against
-    `cat_manifest`'s *current* tables, writing spatial/index files under
-    `cat_manifest.generation`. Returns the new `areas` manifest field to
-    merge into the caller's manifest dict; does not read or write
-    `cat_manifest.data["areas"]` itself, so callers (``osmpq areas``,
-    ``osmpq compact``) control how the result folds into their manifest."""
-    derived, _files_read = derive_areas(con, cat_manifest)
+    """Full derivation (every qualifying relation, plus the way index)
+    against `cat_manifest`'s *current* tables, writing spatial/index files
+    under `cat_manifest.generation`. Returns the new `areas` manifest field
+    ({"index", "cells", "way_index"}) to merge into the caller's manifest
+    dict; does not read or write `cat_manifest.data["areas"]` itself, so
+    callers (``osmpq areas``, ``osmpq compact``, the test fixture) control
+    how the result folds into their manifest."""
+    derived, _files_read = derive_relation_areas(con, cat_manifest)
     placed = place_areas(con, derived, cat_manifest, promoted_keys)
-    return write_area_layout(con, root, cat_manifest.generation, placed, promoted_keys)
+    area_field = write_area_layout(con, root, cat_manifest.generation, placed, promoted_keys)
+    way_index_field, _files_read_w = build_way_area_index(con, root, cat_manifest.generation, cat_manifest, promoted_keys)
+    area_field["way_index"] = way_index_field
+    return area_field
 
 
-def derive_areas_for_pivots(
-    con, cat_manifest: catalog.Manifest, promoted_keys: list[str],
-    way_ids: list[int], relation_ids: list[int],
+def derive_relation_areas_for_pivots(
+    con, cat_manifest: catalog.Manifest, promoted_keys: list[str], relation_ids: list[int],
 ) -> tuple[str, int]:
-    """Re-derives area rows for exactly the given touched pivots (used by
-    ``osmpq compact``, 4.3): returns (TEMP TABLE of new/changed area rows
-    incl. cell/hilbert, files_read). A pivot that no longer qualifies (its
-    way lost its qualifying tag / stopped being closed, its relation lost
-    its ring, or the pivot was deleted) simply produces no row here --
-    callers remove its old area row by id."""
-    derived, files_read = derive_areas(con, cat_manifest, way_ids=way_ids, relation_ids=relation_ids)
+    """Re-derives relation-area rows for exactly the given touched
+    relations (used by ``osmpq compact``, 9.2): returns (TEMP TABLE of
+    new/changed area rows incl. cell/hilbert, files_read). A relation that
+    no longer qualifies (lost its `areas.osm3s` tag combination, lost its
+    ring, or was deleted) simply produces no row here -- callers remove its
+    old area row by id. The way index is not touched-pivot re-derived at
+    all; ``osmpq compact`` rebuilds it in full instead
+    (`build_way_area_index_from_files`)."""
+    derived, files_read = derive_relation_areas(con, cat_manifest, relation_ids=relation_ids)
     placed = place_areas(con, derived, cat_manifest, promoted_keys)
     return placed, files_read
 
@@ -579,6 +629,7 @@ def build_areas(opts: BuildAreasOptions) -> dict:
     new_man["areas"] = area_field
     stats = dict(new_man.get("stats") or {})
     stats["areas"] = area_field["index"]["rows"]
+    stats["way_areas"] = area_field["way_index"]["rows"]
     new_man["stats"] = stats
 
     gen_number = latest_num + 1
@@ -593,7 +644,8 @@ def build_areas(opts: BuildAreasOptions) -> dict:
         tmp.write_text(text)
         os.replace(tmp, manifest_dir / name)
     _log(
-        f"derived {area_field['index']['rows']} area(s) across {len(area_field['cells'])} cell(s) "
+        f"derived {area_field['index']['rows']} relation area(s) across {len(area_field['cells'])} cell(s) "
+        f"and indexed {area_field['way_index']['rows']} way area(s) "
         f"in {time.time() - t_start:.1f}s; wrote manifest/{gen_number}.json"
     )
     return new_man
