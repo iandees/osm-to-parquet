@@ -33,7 +33,11 @@ consecutive minute diffs as one batch.
 | 6 | 7293045-7293104 | 0 / 0 / 0 | 315 / 137 / 14 | 21 s | day v2 |
 
 Six hours of diffs, one compaction in the middle, `osmpq validate` clean
-after every step. Delta tiers are tens of KB: `hour` v3 was 99 KB and `day`
+after every step. A subsequent `osmpq update --follow` run started ten
+hours behind the source, caught up in 60-diff batches, then settled into
+applying one diff per minute at the source's head sequence (each run about
+20 s, one new manifest per minute); it was stopped after a few steady-state
+cycles and the dataset validated clean. Delta tiers are tens of KB: `hour` v3 was 99 KB and `day`
 v2 91 KB against a 2.4 GB base. The ~20 s floor per run is dominated by
 fetching 60 diff files sequentially and by loading the index parts; a
 `--follow` loop applying one diff per minute has a much smaller fetch cost.
