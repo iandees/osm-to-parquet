@@ -186,7 +186,10 @@ def build_relation_spatial_select(
         "ymin_e7": "ymin_e7",
         "xmax_e7": "xmax_e7",
         "ymax_e7": "ymax_e7",
-        "geometry": "geometry",
+        # Relation geometry is always NULL in M0 (contract section 4); the
+        # builder's on-disk column may even be a BLOB of NULLs rather than
+        # GEOMETRY, so we never read it, just project a typed NULL.
+        "geometry": "NULL::GEOMETRY",
         "hilbert": "hilbert",
     }
     sql = (

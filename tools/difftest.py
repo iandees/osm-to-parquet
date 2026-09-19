@@ -454,10 +454,16 @@ def run(args: argparse.Namespace) -> int:
 
     reports: list[QueryRunReport] = []
 
+    tasks = [
+        (qfile, bbox_name) for qfile in files for bbox_name in bboxes_for(qfile.name, bbox_names, args.bbox_name)
+    ]
+    total_tasks = len(tasks)
+
     with httpx.Client() as client:
-        for qfile in files:
+        for task_num, (qfile, bbox_name) in enumerate(tasks, start=1):
             raw_query = qfile.read_text()
-            for bbox_name in bboxes_for(qfile.name, bbox_names, args.bbox_name):
+            if True:
+                print(f"[{task_num}/{total_tasks}] {qfile.name} @ {bbox_name} ...", file=sys.stderr, flush=True)
                 bbox = bboxes[bbox_name]
                 substituted = substitute_bbox(raw_query, bbox)
                 ref_query = force_out_json(substituted)
@@ -489,17 +495,25 @@ def run(args: argparse.Namespace) -> int:
                         )
                         continue
                 else:
-                    ref_result = fetch(
-                        client,
-                        args.reference,
-                        ref_query,
-                        timeout=args.timeout,
-                        retries=args.retries,
-                        sleep_between=args.sleep,
-                        label="reference",
-                    )
-                    cache_write(cpath, ref_result)
-                    time.sleep(args.sleep)
+                    cached = cache_read(cpath)
+                    if cached is not None and cached.ok:
+                        # A previous (possibly interrupted) --reference-only
+                        # run already answered this exact (query, bbox, date)
+                        # combination: reuse it instead of hitting the
+                        # reference again, so a resumed run stays polite.
+                        ref_result = cached
+                    else:
+                        ref_result = fetch(
+                            client,
+                            args.reference,
+                            ref_query,
+                            timeout=args.timeout,
+                            retries=args.retries,
+                            sleep_between=args.sleep,
+                            label="reference",
+                        )
+                        cache_write(cpath, ref_result)
+                        time.sleep(args.sleep)
 
                 if not ref_result.ok:
                     msg = ref_result.remark or ref_result.error or f"HTTP {ref_result.status_code}"
