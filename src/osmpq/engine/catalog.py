@@ -6,7 +6,9 @@ of the builder. See docs/m0-contracts.md.
 """
 from __future__ import annotations
 
+import contextvars
 import json
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -32,27 +34,39 @@ def _read_text_local(path: str) -> str:
     return Path(path).read_text()
 
 
-def _read_text_remote(path: str) -> str:
+def _read_text_remote(path: str, con=None) -> str:
+    """Read a remote (http(s)://, s3://, ...) text file via DuckDB's
+    ``read_text``. When `con` is given (the Engine's shared database, for
+    an s3:// root -- see `executor.Engine`), reuse it through a cursor so
+    any S3 secret created on it applies; a cursor is a separate connection
+    sharing the database, so this is safe to call concurrently with
+    queries running on other cursors. Falls back to a throwaway connection
+    when no `con` is given (e.g. `load_manifest` called directly, without
+    an Engine, as tests do)."""
     import duckdb
 
-    con = duckdb.connect()
+    owns_con = con is None
+    cur = duckdb.connect() if owns_con else con.cursor()
     try:
-        con.execute("LOAD httpfs;")
-    except Exception:
-        try:
-            con.execute("INSTALL httpfs; LOAD httpfs;")
-        except Exception:
-            pass
-    row = con.execute("SELECT content FROM read_text(?)", [path]).fetchone()
-    con.close()
+        if owns_con:
+            try:
+                cur.execute("LOAD httpfs;")
+            except Exception:
+                try:
+                    cur.execute("INSTALL httpfs; LOAD httpfs;")
+                except Exception:
+                    pass
+        row = cur.execute("SELECT content FROM read_text(?)", [path]).fetchone()
+    finally:
+        cur.close()
     if row is None:
         raise FileNotFoundError(path)
     return row[0]
 
 
-def read_text_any(path: str) -> str:
+def read_text_any(path: str, con=None) -> str:
     if is_remote(path):
-        return _read_text_remote(path)
+        return _read_text_remote(path, con=con)
     return _read_text_local(path)
 
 
@@ -62,17 +76,33 @@ class Manifest:
     data: dict
 
     def __post_init__(self) -> None:
-        # Not dataclass fields (excluded from repr/eq on purpose): a small
-        # per-Engine cache of the row-group index (section 5/6 of
-        # docs/m1-contracts.md), lazily populated and reused across
-        # `Engine.run()` calls since a Manifest instance lives for the
-        # Engine's whole lifetime; and a transient per-run accumulator that
-        # `Engine.run_program` sets up before planning and reads back after,
-        # so `catalog.prune_files_by_bbox` can report files-considered vs
-        # files-read without threading an extra return value through every
-        # SQL-builder function in sources.py/recurse.py/planner.py.
+        # Not dataclass fields (excluded from repr/eq on purpose):
+        # - `_rowgroup_cache`: a small per-Engine cache of the row-group
+        #   index (section 5/6 of docs/m1-contracts.md), lazily populated
+        #   and reused across `Engine.run()` calls since a Manifest
+        #   instance lives for the Engine's whole lifetime. `_rowgroup_lock`
+        #   guards first-population of each table's entry so two
+        #   concurrent `Engine.run()` calls racing on the same
+        #   not-yet-cached table don't both kick off a load (each still
+        #   ends up correct even without the lock -- the load is
+        #   idempotent -- but the lock avoids the wasted duplicate work).
+        # - `_db`: the Engine's shared DuckDB database (see
+        #   `executor.Engine`), used so a row-group-index load or a
+        #   manifest-bootstrap read for an `s3://` root goes through the
+        #   connection that carries the S3 secret, instead of a throwaway
+        #   `duckdb.connect()` with no credentials. None when the Manifest
+        #   was built without an Engine (e.g. `load_manifest(root)` in
+        #   tests) -- callers fall back to a throwaway connection then.
+        #
+        # Per-run file-considered/file-read accounting used to live here
+        # too (`_file_stats`), but that made two concurrent `Engine.run()`
+        # calls stomp on each other's counts (FastAPI runs sync endpoints
+        # in a thread pool). It now lives in the `FILE_STATS` ContextVar
+        # below, which `Engine.run_program` sets for the duration of one
+        # run: each thread/run sees only its own value.
         self._rowgroup_cache: dict[str, Optional["RowGroupIndex"]] = {}
-        self._file_stats: Optional["FileStats"] = None
+        self._rowgroup_lock = threading.Lock()
+        self._db = None
 
     @property
     def promoted_keys(self) -> list[str]:
@@ -126,12 +156,20 @@ class Manifest:
         return join_root(self.root, relpath)
 
 
-def load_manifest(root: str) -> Manifest:
+def load_manifest(root: str, con=None) -> Manifest:
+    """Load `root`'s manifest. `con` is the Engine's shared DuckDB database
+    (see `executor.Engine`); when given, remote (`s3://`, `http(s)://`)
+    reads go through it (via a cursor) instead of a throwaway connection,
+    so a secret created on it (S3 credentials) applies. The returned
+    Manifest also keeps `con` for later lazy row-group-index loads
+    (`_rowgroup_index_for`), for the same reason."""
     latest_path = join_root(root, "manifest/LATEST")
-    latest = read_text_any(latest_path).strip()
+    latest = read_text_any(latest_path, con=con).strip()
     manifest_path = join_root(root, f"manifest/{latest}.json")
-    data = json.loads(read_text_any(manifest_path))
-    return Manifest(root=root, data=data)
+    data = json.loads(read_text_any(manifest_path, con=con))
+    manifest = Manifest(root=root, data=data)
+    manifest._db = con
+    return manifest
 
 
 # --------------------------------------------------------------------------
@@ -290,16 +328,34 @@ class RowGroupIndex:
 
 @dataclass
 class FileStats:
-    """Transient per-`Engine.run()` accumulator for the row-group-prunable
-    file selections (see `Manifest.__post_init__` and `prune_files_by_bbox`
-    below): `considered` is the candidate-file count before pruning,
-    `read` the count that survived it. `Engine.run_program` derives
-    `Result.stats["files_considered"]` from this plus the (already-correct,
-    because pruning mutates the file lists in place before anything counts
-    them) existing `files_read` total."""
+    """Per-`Engine.run()` accumulator for the row-group-prunable file
+    selections (see `prune_files_by_bbox` below): `considered` is the
+    candidate-file count before pruning, `read` the count that survived
+    it. `Engine.run_program` derives `Result.stats["files_considered"]`
+    from this plus the (already-correct, because pruning mutates the file
+    lists in place before anything counts them) existing `files_read`
+    total.
+
+    Kept out of two concurrent `Engine.run()` calls' way via `FILE_STATS`
+    below (a ContextVar) rather than being stashed on the shared
+    `Manifest`, since a `Manifest` instance -- and so any attribute on
+    it -- is reused across every `run()` of one `Engine`, including
+    concurrent ones."""
 
     considered: int = 0
     read: int = 0
+
+
+#: The current run's `FileStats`, or None outside of a run. `ContextVar`s
+#: are per-thread by default (each OS thread starts with its own context
+#: unless it explicitly copies another's), so this is safe under
+#: `concurrent.futures.ThreadPoolExecutor`-style concurrent calls to one
+#: `Engine.run()`: each call's `.set()` in `executor.Engine.run_program`
+#: is invisible to any other thread's concurrent run, and `.reset()` in
+#: its `finally` restores whatever was there before (None, normally).
+FILE_STATS: "contextvars.ContextVar[Optional[FileStats]]" = contextvars.ContextVar(
+    "osmpq_file_stats", default=None
+)
 
 
 def _load_rowgroup_index(manifest: Manifest, table: str) -> Optional[RowGroupIndex]:
@@ -309,15 +365,22 @@ def _load_rowgroup_index(manifest: Manifest, table: str) -> Optional[RowGroupInd
     path = manifest.path(relpath)
     import duckdb
 
-    con = duckdb.connect()
+    shared_db = getattr(manifest, "_db", None)
+    # A fresh cursor either way: when `shared_db` is the Engine's shared
+    # database, a cursor is a separate connection sharing it, so this is
+    # safe to run concurrently with queries on other cursors; when there
+    # is no shared database (Manifest built without an Engine), it's a
+    # plain standalone connection like before.
+    con = shared_db.cursor() if shared_db is not None else duckdb.connect()
     try:
-        try:
-            con.execute("LOAD httpfs;")
-        except Exception:
+        if shared_db is None:
             try:
-                con.execute("INSTALL httpfs; LOAD httpfs;")
+                con.execute("LOAD httpfs;")
             except Exception:
-                pass
+                try:
+                    con.execute("INSTALL httpfs; LOAD httpfs;")
+                except Exception:
+                    pass
         try:
             rows = con.execute(
                 "SELECT path, xmin_e7, ymin_e7, xmax_e7, ymax_e7 FROM read_parquet(?)",
@@ -345,8 +408,15 @@ def _rowgroup_index_for(manifest: Manifest, table: str) -> Optional[RowGroupInde
     if cache is None:
         cache = {}
         manifest._rowgroup_cache = cache
-    if table not in cache:
-        cache[table] = _load_rowgroup_index(manifest, table)
+    if table in cache:
+        return cache[table]
+    lock = getattr(manifest, "_rowgroup_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        manifest._rowgroup_lock = lock
+    with lock:
+        if table not in cache:
+            cache[table] = _load_rowgroup_index(manifest, table)
     return cache[table]
 
 
@@ -359,10 +429,11 @@ def prune_files_by_bbox(manifest: Manifest, table: str, files: list[str], bbox_e
     manifest built without one), returns `files` unchanged -- pruning is
     skipped entirely, per contract.
 
-    Updates `manifest._file_stats` (set up for the duration of one
-    `Engine.run()` by `executor.Engine.run_program`) with the candidate
-    count (`considered`) and the surviving count (`read`), when pruning
-    actually runs; callers don't need to touch it themselves."""
+    Updates `FILE_STATS` (the current run's accumulator, set up for the
+    duration of one `Engine.run()` by `executor.Engine.run_program`) with
+    the candidate count (`considered`) and the surviving count (`read`),
+    when pruning actually runs; callers don't need to touch it
+    themselves."""
     if not files:
         return files
     idx = _rowgroup_index_for(manifest, table)
@@ -379,7 +450,7 @@ def prune_files_by_bbox(manifest: Manifest, table: str, files: list[str], bbox_e
         if any(bx0 <= xmax and bx1 <= ymax and bx2 >= xmin and bx3 >= ymin for bx0, bx1, bx2, bx3 in boxes):
             kept.append(f)
 
-    stats = getattr(manifest, "_file_stats", None)
+    stats = FILE_STATS.get()
     if stats is not None:
         stats.considered += len(files)
         stats.read += len(kept)

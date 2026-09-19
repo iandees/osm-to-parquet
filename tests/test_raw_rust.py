@@ -223,25 +223,46 @@ def test_way_geometry_matches_refs_node_coordinates(rawdir, con):
 # --------------------------------------------------------------------------
 
 
+def _v2_rule(bbox, leaf_index: cells_mod.LeafIndex, ancestor_depths: list[int]) -> str:
+    """The docs/m1-contracts.md section 2 rule, written directly from the
+    `osmpq.layout.cells` primitives (per this test's brief) rather than via
+    `cells_mod.containing_cell_v2`: that helper takes a numpy shortcut (each
+    bbox corner's cell via half-open point-grid assignment, then a
+    longest-common-prefix depth) that disagrees with the literal
+    "descend while exactly one child fully contains B" rule -- and with
+    this Rust producer -- when a corner sits exactly on a cell boundary
+    (closed-interval bbox containment vs. half-open point membership).
+    `containing_cell` (v1, unrestricted) implements the literal rule, so
+    C = containing_cell(bbox, leaves); this only adds the v2 ancestor-depth
+    snap.
+    """
+    c = cells_mod.containing_cell(bbox, leaf_index)
+    if c in leaf_index:
+        return c
+    depth = 0 if c == cells_mod.ROOT else len(c)
+    allowed = [d for d in ancestor_depths if d <= depth]
+    target = max(allowed) if allowed else 0
+    return cells_mod.ROOT if target == 0 else c[:target]
+
+
 def test_way_cell_obeys_v2_placement_rule(rawdir, con):
     leaves = json.loads((rawdir / "leaves.json").read_text())
     leaf_index = cells_mod.LeafIndex(leaves["leaves"])
     ancestor_depths = leaves["ancestor_depths"]
-    max_depth = leaves["max_depth"]
     way_files = _way_spatial_files(rawdir)
     rows = con.execute(
         f"SELECT id, cell, ymin_e7, xmin_e7, ymax_e7, xmax_e7 FROM read_parquet({way_files!r}) "
         "WHERE xmin_e7 IS NOT NULL"
     ).fetchall()
     assert rows, "expected at least one way with a resolvable bbox"
+    leaf_set = set(leaves["leaves"])
     for way_id, cell, ymin, xmin, ymax, xmax in rows:
         bbox = (ymin / 1e7, xmin / 1e7, ymax / 1e7, xmax / 1e7)
-        expected = cells_mod.containing_cell_v2(bbox, leaf_index, ancestor_depths, max_depth)
+        expected = _v2_rule(bbox, leaf_index, ancestor_depths)
         assert cell == expected, (way_id, cell, expected, bbox)
 
         # Belt-and-braces: also check the section-2 prose rule directly
         # (leaf, or an ancestor at one of the allowed depths).
-        leaf_set = set(leaves["leaves"])
         depth = 0 if cell == cells_mod.ROOT else len(cell)
         assert cell in leaf_set or depth in set(ancestor_depths)
 
@@ -268,7 +289,7 @@ def test_tags_roundtrip_against_st_readosm_incl_unicode(rawdir, con):
     ref = con.execute(
         f"""
         SELECT id, tags FROM ST_ReadOSM('{PBF_PATH.as_posix()}')
-        WHERE kind = 'node' AND len(tags) > 0
+        WHERE kind = 'node' AND cardinality(tags) > 0
         ORDER BY id
         """
     ).fetchall()
