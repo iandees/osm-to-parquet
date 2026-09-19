@@ -22,12 +22,17 @@ queries work" rather than byte-identical Overpass compatibility; full history
 back to 2012 and earlier as a real goal, prototyped on small regional history
 extracts first. See the decisions table at the top of the design document.
 
-Status: **M1 done on Minnesota, planet build ready to run.** A Rust
-producer (`rust/osmpq-raw`) turns a PBF into the layout, a Python/DuckDB
-stage finishes it, and a Python engine serves Overpass QL over it (local
-disk, HTTP, or R2). 54 of 55 gradable corpus queries match a public Overpass
-instance on a Minnesota extract. The repository name is historical and
-Parquet is a means, not the goal.
+Status: **M3 done on Minnesota.** A Rust producer (`rust/osmpq-raw`)
+turns a PBF into the layout, a Python/DuckDB stage finishes it, a stateless
+updater keeps it current from minutely diffs (rolling delta tiers, periodic
+compaction), and a Python engine serves Overpass QL over it (local disk,
+HTTP, or R2) with tier-1 and tier-2 language support: recursion, areas,
+`around`, `poly`, `is_in`, meta filters, `foreach`/`if`, csv. The service
+has Overpass-shaped rate limits and status endpoints, a container image,
+and a Cloudflare Worker + Containers deployment with a Durable Object
+scheduler for the updater (`deploy/cloudflare`, `docs/m3-runbook.md`). The
+planet build has not been run yet (`docs/m1-runbook.md`). The repository
+name is historical and Parquet is a means, not the goal.
 
 ## Documents
 
@@ -39,6 +44,9 @@ Parquet is a means, not the goal.
 | [docs/m0-contracts.md](docs/m0-contracts.md), [docs/m0-report.md](docs/m0-report.md) | M0: exact layout, schemas, API and the Minnesota results of the first prototype |
 | [docs/m1-contracts.md](docs/m1-contracts.md), [docs/m1-report.md](docs/m1-report.md) | M1: Rust producer, layout v2 (restricted ancestor depths, row-group index, tuned encodings), engine caching, measurements |
 | [docs/m1-runbook.md](docs/m1-runbook.md) | How to build the planet on your own machine and publish it to R2 |
+| [docs/m2-contracts.md](docs/m2-contracts.md), [docs/m2-report.md](docs/m2-report.md) | M2: delta tiers, the stateless minutely updater, compaction, gc, diffcheck against the reference |
+| [docs/m3-contracts.md](docs/m3-contracts.md), [docs/m3-report.md](docs/m3-report.md) | M3: tier-2 language (areas, around, poly, is_in, meta filters, evaluators), service limits, image, updater on R2, Cloudflare deployment |
+| [docs/m3-runbook.md](docs/m3-runbook.md) | From a built dataset on R2 to a public endpoint with minutely updates |
 
 ## Running it
 
@@ -48,7 +56,8 @@ pip install -e '.[dev]'                       # Python side (DuckDB 1.5, pyarrow
 osmpq-raw build extract.osm.pbf raw/          # PBF -> raw layout
 osmpq build --raw raw/ root/                  # raw -> dataset root (relations, indexes, manifest)
 osmpq validate root/
-OSMPQ_ROOT=root/ uvicorn osmpq.server:app --port 8080
+osmpq serve --port 8080                       # OSMPQ_ROOT=root/; /api/interpreter, /api/status, /healthz
+osmpq update root/ --once                     # apply pending minutely diffs (see docs/m2-contracts.md)
 curl 'http://127.0.0.1:8080/api/interpreter' --data-urlencode 'data=[out:json];node(44.97,-93.28,44.985,-93.255)["amenity"="cafe"];out;'
 ```
 

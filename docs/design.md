@@ -226,15 +226,19 @@ mandatory.
 way→relation, relation→relation for the updater, for `<`, `<<` and the
 `(bn|bw|br)` filters.
 
-**`area`** (partitioned by loose cell)
+**`area`** (partitioned by loose cell) and **`way_areas`** index
 
-Derived per Overpass's `areas.osm3s` rules (multipolygon/boundary relations
-with `name`, relations with `admin_level`+`name`, relations with
-`postal_code` / `addr:postcode`, ways with `area=yes`+`name`, ...), with the
-Overpass id convention (`way_id + 2400000000`, `relation_id + 3600000000`),
-polygon geometry, copied tags, and the pivot (source type, id). Regenerated
-for touched pivots at each compaction; Overpass's own area loop takes 4-12
-hours per pass, so hourly/daily is no worse.
+The reference makes every closed way an area and prints it as the way
+itself, so way areas are not stored: a closed way's polygon is built from
+its own LINESTRING when a filter needs it, and `is_in` finds containing
+closed ways in the cells covering the point. Only relation areas are
+materialized, per the reference's `areas.osm3s` rules (multipolygon or
+boundary relations with `name`, relations with `admin_level` and `name`,
+`postal_code`, `addr:postcode`), with `id = relation_id + 3600000000`,
+polygon geometry, copied tags and the pivot. A small id-sorted index of
+closed ways carrying `name`/`ref`/`admin_level`/`boundary`/`place` serves
+`area[...]` lookups by tag. Both are regenerated at compaction; Overpass's
+own area loop takes 4-12 hours per pass, so hourly/daily is no worse.
 
 **`tag_stats`** (small): `(key, value, cell, count)` for key/value pairs
 below an occurrence threshold. Global queries on a rare tag without a bbox go

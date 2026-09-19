@@ -12,6 +12,35 @@ goals; differences are documented rather than chased.
 Legend: T1 = milestone 0/1 (must have for overpass turbo and JOSM to work),
 T2 = milestone 3, T3 = milestone 5, T4 = attic (milestone 4), N = not planned.
 
+## Status after M3
+
+Everything marked T1 and T2 below is implemented and graded against a
+public Overpass instance on Minnesota (`docs/m3-report.md`). Documented
+differences from the reference:
+
+- **Areas.** Closed ways are areas exactly as on the reference (every
+  closed way, printed as the way itself); relation areas follow the
+  reference's `areas.osm3s` rules. `area[...]` finds closed ways only
+  through the keys `name`, `ref`, `admin_level`, `boundary` and `place`
+  (an indexed subset; `is_in`, `(area)`, `(pivot)` and `map_to_area` see
+  every closed way). Relation areas whose rings leave a regional extract's
+  extent (a country, a timezone) do not exist in that extract. Areas
+  refresh at compaction, not with every minute's diff.
+- **`(changed:"a","b")`** uses the current version's timestamp; without
+  attic data, elements edited again after `b`, or whose geometry changed
+  through a node edit, differ from the reference.
+- **`around`** distances use a local equirectangular projection (within
+  0.2% of the spheroid at Minnesota latitudes for the radii people use).
+- **`[out:csv]`** matches the reference, including the header spelling
+  `::id` as `@id`.
+- **`out geom(bbox)`** clips as the reference does: vertices outside the
+  bbox keep coordinates only when adjacent to an inside vertex; JSON emits
+  `null`, XML a bare `<nd ref>`.
+- **`out count`** carries an `areas` tag only when the program used areas,
+  as the reference does.
+- Evaluators: the T2 subset (5.2 in `docs/m3-contracts.md`); `&&`/`||`
+  yield `"1"`/`"0"`, `u()` on a non-unique set yields `""`.
+
 ## Settings
 
 | Feature | Tier | Notes |
@@ -30,7 +59,7 @@ T2 = milestone 3, T3 = milestone 5, T4 = attic (milestone 4), N = not planned.
 | Feature | Tier | Notes |
 | --- | --- | --- |
 | `node`, `way`, `rel`/`relation`, `nwr`, `nw`, `nr`, `wr` | T1 | |
-| `area` (as a query type) | T2 | Reads the derived `area` table |
+| `area` (as a query type) | T2 | Relation areas from the derived `area` table; closed ways from the way-area index |
 | `derived` | T3 | Only meaningful with `make`/`convert` |
 | Tag filters `[k=v]`, `[k!=v]`, `[k]`, `[!k]`, `[k~v]`, `[k!~v]`, `[~k~v]`, `,i` flag | T1 | Promoted columns get pushdown; the rest evaluate on the `tags` map |
 | Bounding box `(s,w,n,e)` | T1 | Cell selection + row-group pruning |
@@ -39,11 +68,11 @@ T2 = milestone 3, T3 = milestone 5, T4 = attic (milestone 4), N = not planned.
 | Recurse filters `(w)`, `(r)`, `(bn)`, `(bw)`, `(br)`, with role `(r:"role")` etc. | T1 | Same machinery as `>`/`<` |
 | `(around:r)`, `(around.set:r)`, `(around:r,lat,lon,...)` | T2 | Bbox pre-filter + spheroid distance |
 | `(poly:"lat lon ...")` | T2 | |
-| `(area)`, `(area.set)`, `(area:id)` | T2 | Point/geometry in polygon against `area` |
+| `(area)`, `(area.set)`, `(area:id)` | T2 | Node: point in polygon; way: any vertex inside; relation: any member vertex inside |
 | `(pivot)`, `(pivot.set)` | T2 | |
-| `(newer:"ts")`, `(changed:"a")`, `(changed:"a","b")` | T2 | Meta columns; `changed` with a range needs history (T4) for exactness, T2 approximates with "last edit in range" like Overpass without attic |
+| `(newer:"ts")`, `(changed:"a")`, `(changed:"a","b")` | T2 | Meta columns; `changed` with a range needs history (T4) for exactness, T2 uses the current version's timestamp |
 | `(user:"name")`, `(uid:n)` | T2 | |
-| `(if: expr)` | T3 | Evaluator subset compiled to SQL |
+| `(if: expr)` | T2 | Element-scoped evaluator subset compiled to SQL (done in M3) |
 | `way_cnt`, `way_link` | T3 | Node-degree filters; needs node→way index or a scan |
 
 ## Standalone statements
