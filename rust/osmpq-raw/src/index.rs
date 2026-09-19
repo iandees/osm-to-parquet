@@ -2,7 +2,7 @@
 
 use crate::rows::NodeWayBuilder;
 use crate::schema;
-use crate::writer::PartWriter;
+use crate::writer::{PartWriter, RowGroupSizing, TableKind};
 use anyhow::Result;
 use arrow::array::{Array, Int64Array, ListArray};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -116,7 +116,13 @@ pub fn build_node_way_index(rawdir: &Path, tmpdir: &Path, threads: usize) -> Res
 
     let out_dir = rawdir.join("node_way");
     let schema = schema::node_way_schema();
-    let mut writer = PartWriter::new(&out_dir, schema.clone(), NODE_WAY_PART_ROWS, 100_000)?;
+    let mut writer = PartWriter::new(
+        &out_dir,
+        schema.clone(),
+        NODE_WAY_PART_ROWS,
+        TableKind::NodeWay,
+        RowGroupSizing::Fixed(100_000),
+    )?;
     let mut batch = NodeWayBuilder::new();
     let mut batch_lo = i64::MAX;
     let mut batch_hi = i64::MIN;

@@ -7,16 +7,31 @@ use crate::rows::{self, WayByIdBuilder, WaySpatialBuilder};
 use crate::schema;
 use crate::spill::{Meta, SpillSet, WaySpillRow};
 use crate::store::NodeStore;
-use crate::writer::{PartInfo, PartWriter, SingleFileWriter};
+use crate::writer::{PartInfo, PartWriter, RowGroupSizing, SingleFileWriter, TableKind};
 use anyhow::Result;
 use osmpbf::{Element, ElementReader};
 use rayon::prelude::*;
 use std::path::Path;
 
 pub const WAY_BYID_PART_ROWS: usize = 1_000_000;
-pub const WAY_BYID_ROW_GROUP_ROWS: usize = 8_000;
-pub const WAY_SPATIAL_ROW_GROUP_ROWS: usize = 10_000;
 pub const BATCH_ROWS: usize = 64_000;
+
+/// Row groups by target compressed bytes (docs/m1-contracts.md section 3 /
+/// M1 tuning brief: "byid ways and spatial ways ~= 2 MB compressed"),
+/// resolved per file from a real sample batch (see
+/// `writer::RowGroupSizing`). Way byid rows carry no geometry; spatial way
+/// rows do (WKB), so bytes/row differ a lot between the two -- each gets
+/// its own resolved row count even though they share the same target.
+const WAY_BYID_ROW_GROUP_SIZING: RowGroupSizing = RowGroupSizing::AdaptiveBytes {
+    target_bytes: 2_000_000,
+    min_rows: 4_000,
+    max_rows: 100_000,
+};
+const WAY_SPATIAL_ROW_GROUP_SIZING: RowGroupSizing = RowGroupSizing::AdaptiveBytes {
+    target_bytes: 2_000_000,
+    min_rows: 2_000,
+    max_rows: 100_000,
+};
 
 pub struct WayPassResult {
     pub byid_parts: Vec<PartInfo>,
@@ -43,7 +58,13 @@ pub fn way_pass(
     let byid_dir = rawdir.join("way");
     let spill_dir = tmpdir.join("spill").join("way");
     let byid_schema = schema::way_byid_schema(promoted_keys);
-    let mut byid_writer = PartWriter::new(&byid_dir, byid_schema.clone(), WAY_BYID_PART_ROWS, WAY_BYID_ROW_GROUP_ROWS)?;
+    let mut byid_writer = PartWriter::new(
+        &byid_dir,
+        byid_schema.clone(),
+        WAY_BYID_PART_ROWS,
+        TableKind::WayById,
+        WAY_BYID_ROW_GROUP_SIZING,
+    )?;
     let mut spill = SpillSet::new(&spill_dir)?;
 
     let mut batch = WayByIdBuilder::new(promoted_keys);
@@ -190,10 +211,36 @@ pub fn way_pass(
                 .join("way")
                 .join(format!("cell={cell}"))
                 .join("part-0.parquet");
+
+            // Row-group sizing resolved from a real sample (a prefix of
+            // this cell's already-sorted rows -- see writer::RowGroupSizing).
+            let sample = if rows_v.is_empty() {
+                None
+            } else {
+                let mut sb = WaySpatialBuilder::new(&promoted_keys_owned);
+                for row in rows_v.iter().take(BATCH_ROWS) {
+                    sb.append(
+                        row.id,
+                        &row.refs,
+                        &row.tags,
+                        &row.meta,
+                        (row.xmin_e7, row.ymin_e7, row.xmax_e7, row.ymax_e7),
+                        row.geometry_wkb.as_deref(),
+                        row.is_closed,
+                        row.is_area,
+                        (row.centroid_lat_e7, row.centroid_lon_e7),
+                        cell,
+                        row.hilbert,
+                    );
+                }
+                Some(sb.finish(spatial_schema.clone()))
+            };
             let mut writer = SingleFileWriter::create(
                 &out_path,
                 spatial_schema.clone(),
-                WAY_SPATIAL_ROW_GROUP_ROWS,
+                TableKind::WaySpatial,
+                WAY_SPATIAL_ROW_GROUP_SIZING,
+                sample.as_ref(),
                 Some(geo_meta.clone()),
             )?;
             let mut b = WaySpatialBuilder::new(&promoted_keys_owned);

@@ -7,15 +7,25 @@ use crate::rows::{NodeByIdBuilder, NodeSpatialBuilder};
 use crate::schema;
 use crate::spill::{Meta, NodeSpillRow, SpillSet};
 use crate::store::{NodeStore, NodeStoreBuilder};
-use crate::writer::{PartInfo, PartWriter, SingleFileWriter};
+use crate::writer::{PartInfo, PartWriter, RowGroupSizing, SingleFileWriter, TableKind};
 use anyhow::Result;
+use arrow::array::RecordBatch;
 use osmpbf::{Element, ElementReader};
 use rayon::prelude::*;
 use std::path::Path;
 
 pub const NODE_BYID_PART_ROWS: usize = 4_000_000;
-pub const NODE_ROW_GROUP_ROWS: usize = 64_000;
 pub const BATCH_ROWS: usize = 64_000;
+
+/// Row groups by target compressed bytes, not a fixed row count
+/// (docs/m1-contracts.md section 3 / M1 tuning brief: "nodes ~= 100k rows
+/// (about 1 MB compressed)"); resolved per file/partition from a real
+/// sample batch (see `writer::RowGroupSizing`).
+const NODE_ROW_GROUP_SIZING: RowGroupSizing = RowGroupSizing::AdaptiveBytes {
+    target_bytes: 1_000_000,
+    min_rows: 20_000,
+    max_rows: 250_000,
+};
 
 pub struct HistogramResult {
     pub counts: Vec<u32>,
@@ -84,7 +94,8 @@ pub fn node_pass(
         &byid_dir,
         schema::node_byid_schema(promoted_keys),
         NODE_BYID_PART_ROWS,
-        NODE_ROW_GROUP_ROWS,
+        TableKind::NodeById,
+        NODE_ROW_GROUP_SIZING,
     )?;
     let mut spill = SpillSet::new(&spill_dir)?;
 
@@ -210,23 +221,45 @@ pub fn node_pass(
             let n_tagged = rows.iter().filter(|r| !r.tags.is_empty()).count();
             let n_untagged = rows.len() - n_tagged;
 
+            // Row-group sizing is resolved from a real sample batch (see
+            // writer::RowGroupSizing), sampled separately for the tagged
+            // and untagged partitions since their per-row byte profiles
+            // differ a lot (tagged rows carry a populated tag map).
+            let probe_sample = |tagged: bool| -> Option<RecordBatch> {
+                let n = if tagged { n_tagged } else { n_untagged };
+                if n == 0 {
+                    return None;
+                }
+                let mut b = NodeSpatialBuilder::new(&promoted_keys_owned);
+                for row in rows.iter().filter(|r| r.tags.is_empty() != tagged).take(BATCH_ROWS) {
+                    b.append(row.id, row.lat_e7, row.lon_e7, &row.tags, &row.meta, row.hilbert);
+                }
+                Some(b.finish(spatial_schema.clone()))
+            };
+
             let mut tagged_batch = NodeSpatialBuilder::new(&promoted_keys_owned);
             let mut untagged_batch = NodeSpatialBuilder::new(&promoted_keys_owned);
             let mut tagged_writer = if n_tagged > 0 {
+                let sample = probe_sample(true);
                 Some(SingleFileWriter::create(
                     &tagged_path,
                     spatial_schema.clone(),
-                    NODE_ROW_GROUP_ROWS,
+                    TableKind::NodeSpatial,
+                    NODE_ROW_GROUP_SIZING,
+                    sample.as_ref(),
                     None,
                 )?)
             } else {
                 None
             };
             let mut untagged_writer = if n_untagged > 0 {
+                let sample = probe_sample(false);
                 Some(SingleFileWriter::create(
                     &untagged_path,
                     spatial_schema.clone(),
-                    NODE_ROW_GROUP_ROWS,
+                    TableKind::NodeSpatial,
+                    NODE_ROW_GROUP_SIZING,
+                    sample.as_ref(),
                     None,
                 )?)
             } else {

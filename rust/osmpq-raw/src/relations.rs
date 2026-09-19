@@ -5,14 +5,17 @@ use crate::pbfutil::{self, BBox};
 use crate::rows::{RelationBuilder, RelationMember};
 use crate::schema;
 use crate::store::NodeStore;
-use crate::writer::{PartInfo, PartWriter};
+use crate::writer::{PartInfo, PartWriter, RowGroupSizing, TableKind};
 use anyhow::Result;
 use osmpbf::{Element, ElementReader, RelMemberType};
 use std::collections::HashSet;
 use std::path::Path;
 
 pub const RELATION_PART_ROWS: usize = 5_000_000;
-pub const RELATION_ROW_GROUP_ROWS: usize = 64_000;
+/// M1 tuning brief: "relations ~= 8k rows" (a fixed row count is fine here
+/// -- relations are a small table, not part of the byte-regression numbers
+/// this pass was tuned against).
+pub const RELATION_ROW_GROUP_ROWS: usize = 8_000;
 pub const BATCH_ROWS: usize = 64_000;
 
 pub struct RelationPassResult {
@@ -31,7 +34,13 @@ pub fn relation_pass(
 ) -> Result<RelationPassResult> {
     let dir = rawdir.join("relation");
     let schema = schema::relation_schema(promoted_keys);
-    let mut writer = PartWriter::new(&dir, schema.clone(), RELATION_PART_ROWS, RELATION_ROW_GROUP_ROWS)?;
+    let mut writer = PartWriter::new(
+        &dir,
+        schema.clone(),
+        RELATION_PART_ROWS,
+        TableKind::Relation,
+        RowGroupSizing::Fixed(RELATION_ROW_GROUP_ROWS),
+    )?;
 
     let mut batch = RelationBuilder::new(promoted_keys);
     let mut batch_lo = i64::MAX;
