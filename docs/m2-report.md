@@ -46,7 +46,11 @@ extent filter doing its job.
   changed elements (200 nodes, 200 ways, 30 relations, including 11
   deletions) match the reference Overpass at `[date:"2026-09-19T03:25:00Z"]`
   on existence, version, tags, coordinates, refs and members.
-- _post-compaction diffcheck and second-round diffcheck: pending_
+- After compaction, the same 430 sampled ids re-checked against the same
+  reference answers: **430 of 430** (compaction preserved every change).
+- After three more hours on the compacted generation, all 170 changed
+  elements of that round (165 nodes, 5 ways) checked at
+  `[date:"2026-09-19T06:28:20Z"]`: **170 of 170**.
 - _harness at the updated timestamp: pending_
 
 ## Delta overhead per query
