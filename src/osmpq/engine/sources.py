@@ -395,6 +395,120 @@ def build_byid_select(
     return sql, len(files)
 
 
+def _union_bbox_e7(con, selects: list[str]) -> Optional[BBox]:
+    """Union bbox (south, west, north, east) in degrees over the
+    xmin_e7/ymin_e7/xmax_e7/ymax_e7 columns of one or more SQL fragments
+    (each ``SELECT xmin_e7, ymin_e7, xmax_e7, ymax_e7 FROM ...``), or None
+    if there is nothing to union (no fragments, or every row's bbox is
+    NULL, e.g. a way with fewer than 2 resolvable nodes)."""
+    selects = [s for s in selects if s]
+    if not selects:
+        return None
+    union_sql = "\nUNION ALL\n".join(selects)
+    row = con.execute(
+        f"SELECT min(xmin_e7), min(ymin_e7), max(xmax_e7), max(ymax_e7) FROM ({union_sql}) __bbox"
+    ).fetchone()
+    xmin, ymin, xmax, ymax = row
+    if None in (xmin, ymin, xmax, ymax):
+        return None
+    return (ymin / 1e7, xmin / 1e7, ymax / 1e7, xmax / 1e7)
+
+
+def build_node_hydrate_via_bbox_select(
+    con,
+    manifest: catalog.Manifest,
+    node_ids_table: str,
+    bbox_source_selects: list[str],
+    promoted_keys: set[str],
+    tag_filters: Optional[list[TagFilter]] = None,
+    max_cell_fraction: float = 0.5,
+) -> tuple[Optional[str], int]:
+    """design.md 3.1 "spatially scoped id lookups": resolve node ids in
+    `node_ids_table` (a TEMP TABLE with at least an ``id`` column) from the
+    spatial node files of the leaf cells intersecting the union bbox of
+    `bbox_source_selects` -- SQL fragments over rows that carry
+    xmin_e7/ymin_e7/xmax_e7/ymax_e7 and are known to bound these node ids
+    (a way's nodes lie inside the way's own bbox; a relation's member
+    nodes lie inside the relation's own bbox, both already columns on the
+    row) -- instead of scanning the id-sorted byid copy end to end, which a
+    handful of scattered ids forces to read almost in full.
+
+    Falls back to byid for whatever the spatial pass does not find, so
+    correctness never depends on the bbox hint being exact or even present
+    (`bbox_source_selects` empty, or every candidate bbox NULL, just skips
+    straight to byid, unchanged from before this existed).
+
+    `max_cell_fraction` is the planet-scale caveat: a way stored in an
+    ancestor cell can have a bbox spanning many leaves (a continent-wide
+    coastline, or -- worst case -- the root cell). Reading that many leaf
+    cell files (two each, tagged/untagged) stops being cheaper than the
+    byid scan it exists to avoid, so past this fraction of all leaf cells
+    the spatial attempt is skipped entirely."""
+    total_ids = con.execute(f"SELECT count(*) FROM {node_ids_table}").fetchone()[0]
+    if not total_ids:
+        return None, 0
+
+    files_total = 0
+    selects: list[str] = []
+    found_table: Optional[str] = None
+
+    bbox = _union_bbox_e7(con, bbox_source_selects)
+    if bbox is not None:
+        cells = catalog.cells_for_bbox(manifest, "node", bbox)
+        total_leaves = len(manifest.leaf_cells) or 1
+        if cells and len(cells) <= max_cell_fraction * total_leaves:
+            node_files = _node_files(manifest, cells, "tagged") + _node_files(manifest, cells, "untagged")
+            if node_files:
+                files_total += len(node_files)
+                found_table = idset.fresh_table_name("bboxnodehits")
+                cols = {
+                    "type": "'node'",
+                    "id": "n.id",
+                    "cell": "n.cell",
+                    "lat_e7": "n.lat_e7",
+                    "lon_e7": "n.lon_e7",
+                    "tags": "n.tags",
+                    "version": "n.version",
+                    "changeset": "n.changeset",
+                    "timestamp": 'n."timestamp"',
+                    "uid": "n.uid",
+                    "user": 'n."user"',
+                    "hilbert": "n.hilbert",
+                }
+                tag_where = tagsql.tag_filters_sql(tag_filters or [], promoted_keys, prefix="n.")
+                con.execute(
+                    f"CREATE TEMP TABLE {found_table} AS\n"
+                    f"SELECT {project(cols)}\n"
+                    f"FROM read_parquet({_quote_list(node_files)}, hive_partitioning=true, union_by_name=true) n\n"
+                    f"JOIN (SELECT DISTINCT id FROM {node_ids_table}) ids ON n.id = ids.id\n"
+                    f"WHERE {tag_where}"
+                )
+                selects.append(f"SELECT * FROM {found_table}")
+
+    if found_table is not None:
+        remainder_sql = (
+            f"SELECT DISTINCT id FROM {node_ids_table} "
+            f"WHERE id NOT IN (SELECT id FROM {found_table})"
+        )
+    else:
+        remainder_sql = f"SELECT DISTINCT id FROM {node_ids_table}"
+    remainder_table = idset.fresh_table_name("bboxnoderem")
+    con.execute(f"CREATE TEMP TABLE {remainder_table} AS {remainder_sql}")
+    n_remaining = con.execute(f"SELECT count(*) FROM {remainder_table}").fetchone()[0]
+    if n_remaining:
+        lo, hi = con.execute(f"SELECT min(id), max(id) FROM {remainder_table}").fetchone()
+        byid_sql, nfiles = build_byid_select_from_ids_query(
+            manifest, "node", f"SELECT id FROM {remainder_table}", lo, hi, tag_filters or [], promoted_keys
+        )
+        files_total += nfiles
+        if byid_sql:
+            selects.append(byid_sql)
+
+    if not selects:
+        return None, files_total
+    return "\nUNION ALL\n".join(selects), files_total
+
+
 def build_byid_select_from_ids_query(
     manifest: catalog.Manifest,
     element_type: str,

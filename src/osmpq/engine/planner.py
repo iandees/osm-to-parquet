@@ -145,6 +145,20 @@ def execute_query(ctx: Context, q: Query) -> None:
         id_table = _recurse_filter_ids_table(ctx, rf)
         if id_table is None:
             base_select = empty_set_sql()
+        elif rf.kind == "w" and "node" in types:
+            # design.md 3.1: `(w)`'s ids are the node refs of ways in
+            # `rf.set_name`, so they lie inside those ways' own bboxes --
+            # the same spatially-scoped hydration as the `>` forward hop
+            # (recurse.build_forward_one_hop), instead of a byid scan.
+            bbox_selects = [
+                f"SELECT xmin_e7, ymin_e7, xmax_e7, ymax_e7 FROM set_{rf.set_name} WHERE type = 'way'"
+            ]
+            base_select, nfiles = sources.build_node_hydrate_via_bbox_select(
+                ctx.con, ctx.manifest, id_table, bbox_selects, ctx.promoted_keys, tag_filters=tag_filters
+            )
+            ctx.files_read += nfiles
+            if base_select is None:
+                base_select = empty_set_sql()
         else:
             base_select, nfiles = recurse.hydrate_ids_table(
                 ctx.con, ctx.manifest, id_table, tag_filters, ctx.promoted_keys, only_types=set(types)

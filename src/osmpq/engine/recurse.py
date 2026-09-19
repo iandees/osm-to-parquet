@@ -187,12 +187,18 @@ def build_forward_one_hop(con, manifest: catalog.Manifest, source_table: str, pr
 
     # Nodes directly in hop_table (nodes of ways-in-source, or direct node
     # members of relations-in-source) plus nodes referenced by the
-    # relation-member ways above, hydrated together in a *single* pass over
-    # the node byid parts -- node ids from a `>` hop are typically scattered
-    # across the whole id space, so a byid part covering their min..max
-    # range usually covers most of the table; hydrating node ids in two
-    # separate passes (as an earlier version of this function did) doubles
-    # that scan for no reason.
+    # relation-member ways above, hydrated together in a *single* pass.
+    # design.md 3.1: a way's nodes lie inside the way's own bbox, so
+    # instead of a byid scan (node ids from a `>` hop are typically
+    # scattered across the whole id space, so a byid part covering their
+    # min..max range usually covers most of the table), resolve them from
+    # the spatial node files of exactly the leaf cells that intersect the
+    # union bbox of the ways they came from (source ways' bbox columns,
+    # already on the row; relation-member ways' bbox columns, from the
+    # byid hydration above), falling back to byid for anything that isn't
+    # found there (should be none for consistent data). Direct node
+    # members of relations-in-source carry no such bbox guarantee and
+    # simply fall through to that byid fallback, unchanged.
     node_id_parts = [f"SELECT id FROM {hop_table} WHERE type = 'node'"]
     if way_rows_table is not None:
         way_node_ids = forward_new_ids_table(con, way_rows_table, restrict_source_types={"way"})
@@ -203,7 +209,16 @@ def build_forward_one_hop(con, manifest: catalog.Manifest, source_table: str, pr
         f"CREATE TEMP TABLE {node_ids_table} AS "
         f"SELECT DISTINCT 'node' AS type, id FROM ({' UNION ALL '.join(node_id_parts)}) __u"
     )
-    node_sql, nfiles_n = hydrate_ids_table(con, manifest, node_ids_table, [], promoted_keys, only_types={"node"})
+    bbox_source_selects = [
+        f"SELECT xmin_e7, ymin_e7, xmax_e7, ymax_e7 FROM {source_table} WHERE type = 'way'"
+    ]
+    if way_rows_table is not None:
+        bbox_source_selects.append(
+            f"SELECT xmin_e7, ymin_e7, xmax_e7, ymax_e7 FROM {way_rows_table}"
+        )
+    node_sql, nfiles_n = sources.build_node_hydrate_via_bbox_select(
+        con, manifest, node_ids_table, bbox_source_selects, promoted_keys
+    )
     total_files += nfiles_n
     if node_sql:
         selects.append(node_sql)

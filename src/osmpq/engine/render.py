@@ -8,7 +8,7 @@ from typing import Optional
 
 from osmpq.ql.ast import Out
 
-from . import catalog, idset
+from . import catalog, idset, sources
 from .schema import CANONICAL_COLUMNS
 
 MEMBER_TYPE_NAME = {"n": "node", "w": "way", "r": "relation"}
@@ -140,19 +140,38 @@ def hydrate_way_geometry(con, manifest: catalog.Manifest, rows: list[dict]) -> N
             r["geometry_wkt"] = resolved[r["id"]]
 
 
-def resolve_node_coords(con, manifest: catalog.Manifest, ids: list[int]) -> dict[int, tuple[int, int]]:
+def resolve_node_coords(
+    con,
+    manifest: catalog.Manifest,
+    ids: list[int],
+    bbox_hints: Optional[list[tuple[int, int, int, int]]] = None,
+) -> dict[int, tuple[int, int]]:
+    """Node coordinates for `out geom` on relations: a relation's member
+    nodes lie inside the relation's own bbox (xmin_e7/ymin_e7/xmax_e7/
+    ymax_e7, already on the row -- contract section 4), so when the
+    caller passes the bboxes of the relations these ids came from
+    (`bbox_hints`), resolve from the spatial node files of the leaf cells
+    those bboxes touch (design.md 3.1) instead of a byid scan, falling
+    back to byid for anything not found there. `bbox_hints` omitted or
+    empty (e.g. plain node-member ids with no known bounding relation)
+    skips straight to byid, same as before this existed."""
     ids = sorted(set(ids))
     if not ids:
         return {}
-    lo, hi = idset.id_range(ids)
-    parts = catalog.byid_parts_for_range(manifest, "node", lo, hi)
-    files = [manifest.path(p["path"]) for p in parts]
-    if not files:
+    ids_table = idset.register_ids_table(con, ids)
+    bbox_selects: list[str] = []
+    if bbox_hints:
+        xmin = min(b[0] for b in bbox_hints)
+        ymin = min(b[1] for b in bbox_hints)
+        xmax = max(b[2] for b in bbox_hints)
+        ymax = max(b[3] for b in bbox_hints)
+        bbox_selects = [
+            f"SELECT {xmin} AS xmin_e7, {ymin} AS ymin_e7, {xmax} AS xmax_e7, {ymax} AS ymax_e7"
+        ]
+    sql, _nfiles = sources.build_node_hydrate_via_bbox_select(con, manifest, ids_table, bbox_selects, set())
+    if not sql:
         return {}
-    pred = idset.id_predicate(con, "id", ids)
-    rows = con.execute(
-        f"SELECT id, lat_e7, lon_e7 FROM read_parquet({_quote_list(files)}) WHERE {pred}"
-    ).fetchall()
+    rows = con.execute(f"SELECT id, lat_e7, lon_e7 FROM ({sql}) __r").fetchall()
     return {i: (lat, lon) for i, lat, lon in rows}
 
 
@@ -218,6 +237,7 @@ def build_elements(con, manifest: catalog.Manifest, target_set: str, out: Out) -
         hydrate_way_geometry(con, manifest, rows)
         node_ids_needed: set[int] = set()
         way_ids_needed: set[int] = set()
+        relation_bboxes: list[tuple[int, int, int, int]] = []
         for r in rows:
             if r["type"] == "relation" and r.get("members"):
                 for m in r["members"]:
@@ -225,7 +245,14 @@ def build_elements(con, manifest: catalog.Manifest, target_set: str, out: Out) -
                         node_ids_needed.add(m["ref"])
                     elif m["type"] == "w":
                         way_ids_needed.add(m["ref"])
-        node_coords = resolve_node_coords(con, manifest, list(node_ids_needed)) if node_ids_needed else {}
+                bbox = (r.get("xmin_e7"), r.get("ymin_e7"), r.get("xmax_e7"), r.get("ymax_e7"))
+                if None not in bbox:
+                    relation_bboxes.append(bbox)
+        node_coords = (
+            resolve_node_coords(con, manifest, list(node_ids_needed), relation_bboxes)
+            if node_ids_needed
+            else {}
+        )
         way_geoms = resolve_way_geometries(con, manifest, list(way_ids_needed)) if way_ids_needed else {}
     else:
         node_coords = {}

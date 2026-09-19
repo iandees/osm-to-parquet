@@ -1,4 +1,4 @@
-[out:json][timeout:180][maxsize:1073741824];
+[out:json][timeout:180];
 (
   node["highway"="residential"]({{bbox}});
   way["highway"="residential"]({{bbox}});

@@ -283,6 +283,30 @@ def test_forward_recurse_way_spans_byid_parts(engine, fixture):
     assert ids[0] <= mid < ids[1]  # the other ref: in the high byid part
 
 
+def test_forward_recurse_way_ancestor_cell_resolves_nodes_in_two_leaves(engine, fixture):
+    # `spanning_way_id` (110) is stored at ancestor cell "00" because its
+    # own bbox spans leaf "000" (node 1) and leaf "002" (the other ref).
+    # design.md 3.1: `>` must resolve those nodes from the *leaf* cells
+    # intersecting the way's own bbox (which is on its row), not from the
+    # way's own storage cell -- exercising the spatially-scoped node
+    # hydration in recurse.build_forward_one_hop across two distinct
+    # leaves within a single hop.
+    r = engine.run(f"[out:json];way({fixture.spanning_way_id});>;out;")
+    nodes = [e for e in r.elements if e["type"] == "node"]
+    assert len(nodes) == 2
+
+    def in_bbox(lat, lon, bbox):
+        s, w, n, e = bbox
+        return s <= lat <= n and w <= lon <= e
+
+    leaves_hit = set()
+    for el in nodes:
+        for leaf, bbox in fixture.leaf_bbox.items():
+            if in_bbox(el["lat"], el["lon"], bbox):
+                leaves_hit.add(leaf)
+    assert leaves_hit == {"000", "002"}
+
+
 # -------------------------------------------------------------------- out
 
 
