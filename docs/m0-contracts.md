@@ -198,12 +198,20 @@ the Minnesota bbox of the Midwest extract (about 60 million nodes) within the
 sandbox's 4 cores / 15 GB RAM / ~25 GB scratch, spilling to `--tmpdir`.
 Writes `manifest/1.json` and `manifest/LATEST` last.
 
-Reading the PBF: use DuckDB's community `osmium` extension
-(`INSTALL osmium FROM community; LOAD osmium; SELECT ... FROM osmium_read('file.pbf')`),
-which yields `kind ('node'|'way'|'relation'), id, tags MAP, geometry
-(POINT for nodes), version, timestamp, changeset, uid, username, refs
-BIGINT[], ref_roles VARCHAR[], ref_types VARCHAR[]`. pyosmium is the fallback
-if the extension misbehaves.
+Reading the PBF (verified on DuckDB 1.5.5): the spatial extension's
+built-in `ST_ReadOSM('file.pbf')` returns **raw** objects: `kind
+ENUM('node','way','relation','changeset'), id BIGINT, tags MAP, refs BIGINT[]
+(way node refs in order / relation member ids), lat DOUBLE, lon DOUBLE,
+ref_roles VARCHAR[], ref_types ENUM('node','way','relation')[]`, including
+untagged nodes, but **no metadata**. The community `osmium` extension's
+`osmium_read('file.pbf')` returns **assembled features** (`kind` in
+node/line/area/relation, tagged nodes only, no way refs) but carries
+`type, id, version, timestamp (TIMESTAMPTZ), changeset, uid, username`.
+The M0 builder takes structure from `ST_ReadOSM` and metadata by joining
+`osmium_read` on `(type, id)` (deduplicated: a way can be both a line and an
+area row). Untagged nodes therefore have NULL metadata in M0; that is a
+known gap fixed by the Rust reader in M1. Member types are mapped to
+`n`/`w`/`r`.
 
 ## 6. Engine API (Python) and HTTP API
 
