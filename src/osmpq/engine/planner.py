@@ -100,23 +100,25 @@ def _check_unsupported_filters(q: Query) -> None:
             raise UnsupportedError(f"filter {type(f).__name__} is not supported in M0")
 
 
-def _recurse_filter_candidate_ids(ctx: Context, rf: RecurseFilter, types: list[str]) -> dict[str, list[int]]:
+def _recurse_filter_ids_table(ctx: Context, rf: RecurseFilter) -> Optional[str]:
+    """One hop for an inline recurse filter ((w)/(r)/(bn)/(bw)/(br)):
+    returns a fresh TEMP TABLE(type, id) name, or None if it produced
+    nothing. See recurse.py: this never inlines ids as a SQL literal list
+    or fetches them into Python."""
     source_table = f"set_{rf.set_name}"
     _require_set(ctx, rf.set_name)
-    type_set = set(types)
     if rf.kind == "w":
-        ids = recurse.forward_new_ids(ctx.con, source_table, restrict_source_types={"way"})
+        return recurse.forward_new_ids_table(ctx.con, source_table, restrict_source_types={"way"})
     elif rf.kind == "r":
-        ids = recurse.forward_new_ids(ctx.con, source_table, restrict_source_types={"relation"}, role=rf.role)
+        return recurse.forward_new_ids_table(ctx.con, source_table, restrict_source_types={"relation"}, role=rf.role)
     elif rf.kind == "bn":
-        ids = recurse.backward_new_ids(ctx.con, ctx.manifest, source_table, restrict_source_types={"node"}, role=rf.role)
+        return recurse.backward_new_ids_table(ctx.con, ctx.manifest, source_table, restrict_source_types={"node"}, role=rf.role)
     elif rf.kind == "bw":
-        ids = recurse.backward_new_ids(ctx.con, ctx.manifest, source_table, restrict_source_types={"way"}, role=rf.role)
+        return recurse.backward_new_ids_table(ctx.con, ctx.manifest, source_table, restrict_source_types={"way"}, role=rf.role)
     elif rf.kind == "br":
-        ids = recurse.backward_new_ids(ctx.con, ctx.manifest, source_table, restrict_source_types={"relation"}, role=rf.role)
+        return recurse.backward_new_ids_table(ctx.con, ctx.manifest, source_table, restrict_source_types={"relation"}, role=rf.role)
     else:
         raise UnsupportedError(f"recurse filter ({rf.kind}) is not supported")
-    return {t: v for t, v in ids.items() if t in type_set and v}
 
 
 def _require_set(ctx: Context, name: str) -> None:
@@ -140,20 +142,20 @@ def execute_query(ctx: Context, q: Query) -> None:
 
     if recurse_filters:
         rf = recurse_filters[0]
-        candidates = _recurse_filter_candidate_ids(ctx, rf, types)
-        selects = []
-        for t in types:
-            t_ids = candidates.get(t) or []
-            if not t_ids:
-                continue
-            sql, nfiles = sources.build_byid_select(ctx.manifest, t, t_ids, tag_filters, ctx.promoted_keys)
+        id_table = _recurse_filter_ids_table(ctx, rf)
+        if id_table is None:
+            base_select = empty_set_sql()
+        else:
+            base_select, nfiles = recurse.hydrate_ids_table(
+                ctx.con, ctx.manifest, id_table, tag_filters, ctx.promoted_keys, only_types=set(types)
+            )
             ctx.files_read += nfiles
-            selects.append(sql)
-        base_select = "\nUNION ALL\n".join(selects) if selects else empty_set_sql()
+            if base_select is None:
+                base_select = empty_set_sql()
     elif q.input_sets:
         for name in q.input_sets:
             _require_set(ctx, name)
-        base_select = sources.build_from_set_select(q.input_sets, types, tag_filters, ids, bbox)
+        base_select = sources.build_from_set_select(ctx.con, q.input_sets, types, tag_filters, ids, bbox)
     else:
         if bbox is None and not ids:
             ctx.warnings.append(
@@ -162,10 +164,10 @@ def execute_query(ctx: Context, q: Query) -> None:
         selects = []
         for t in types:
             if ids and bbox is None:
-                sql, nfiles = sources.build_byid_select(ctx.manifest, t, ids, tag_filters, ctx.promoted_keys)
+                sql, nfiles = sources.build_byid_select(ctx.con, ctx.manifest, t, ids, tag_filters, ctx.promoted_keys)
             else:
                 builder = sources.SPATIAL_BUILDERS[t]
-                sql, nfiles = builder(ctx.manifest, bbox, tag_filters, ids, ctx.promoted_keys)
+                sql, nfiles = builder(ctx.con, ctx.manifest, bbox, tag_filters, ids, ctx.promoted_keys)
             ctx.files_read += nfiles
             selects.append(sql)
         base_select = "\nUNION ALL\n".join(selects)

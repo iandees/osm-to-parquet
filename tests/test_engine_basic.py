@@ -186,6 +186,20 @@ def test_id_lookup_spans_byid_parts(engine, fixture):
     assert sorted(e["id"] for e in r.elements) == sorted([lo, hi])
 
 
+def test_forward_recurse_way_spans_byid_parts(engine, fixture):
+    # `spanning_way_id` (fixture: refs include node 1 and a leaf "002" node)
+    # has endpoints in different byid/node parts: the fixture splits byid
+    # node into 2 parts by contiguous id, low half / high half. `>` must
+    # hydrate both ends via a single query, not miss the one in the other
+    # part.
+    r = engine.run(f"[out:json];way({fixture.spanning_way_id});>;out ids;")
+    ids = sorted(e["id"] for e in r.elements)
+    assert len(ids) == 2
+    mid = len(fixture.all_node_ids) // 2
+    assert ids[0] == fixture.cafe_node_id  # ref 1: in the low byid part
+    assert ids[0] <= mid < ids[1]  # the other ref: in the high byid part
+
+
 # -------------------------------------------------------------------- out
 
 
@@ -370,3 +384,82 @@ def test_xml_render_remark():
     result = Result(elements=[], settings=Settings(out_format="xml"), remark="runtime error: boom")
     body, _ = result.render()
     assert "<remark>runtime error: boom</remark>" in body
+
+
+# ------------------------------------------------ id lookups: no literal IN-lists
+#
+# id-based lookups (`>`, `<`, `>>`, `<<`, recurse filters, `(id:...)`, and
+# render.py's lazy way-geometry hydration) used to inline every id as a SQL
+# literal (`WHERE id IN (1,2,3,...)`); past a few tens of thousands of ids
+# that alone took tens of seconds just to parse/plan (see the module
+# docstrings in osmpq.engine.idset/recurse/hilbert). These tests aren't
+# timing-sensitive: they check the *shape* of what gets executed (a bounded
+# predicate backed by a temp table) rather than a wall-clock budget, so they
+# stay meaningful on any machine.
+
+
+def test_id_predicate_uses_temp_table_not_literal_list_for_many_ids():
+    import duckdb
+
+    from osmpq.engine import idset
+
+    con = duckdb.connect()
+    try:
+        ids = list(range(1, 501))  # comfortably above idset.INLINE_ID_LIMIT
+        pred = idset.id_predicate(con, "id", ids)
+        assert len(ids) > idset.INLINE_ID_LIMIT
+        # Bounded in size regardless of how many ids there are: a handful of
+        # SQL keywords plus one generated table name, not 500 literals.
+        assert len(pred) < 200
+        assert "IN (SELECT id FROM" in pred
+        table_name = pred[pred.index("FROM ") + len("FROM ") : pred.rindex(")")]
+        # The temp table really holds every id, not a truncated sample.
+        n = con.execute(f"SELECT count(*) FROM {table_name}").fetchone()[0]
+        assert n == len(ids)
+    finally:
+        con.close()
+
+
+def test_id_predicate_stays_inline_for_a_handful_of_ids():
+    import duckdb
+
+    from osmpq.engine import idset
+
+    con = duckdb.connect()
+    try:
+        pred = idset.id_predicate(con, "id", [1, 2, 3])
+        assert pred == "id IN (1,2,3)"
+    finally:
+        con.close()
+
+
+def test_forward_recurse_hop_uses_temp_table_for_many_ids():
+    import duckdb
+
+    from osmpq.engine import idset, recurse
+
+    con = duckdb.connect()
+    try:
+        n_ways = 150  # -> 300 distinct referenced node ids, past INLINE_ID_LIMIT
+        rows_sql = " UNION ALL ".join(
+            f"SELECT 'way' AS type, {i} AS id, "
+            f"[{1000 + 2 * i}, {1001 + 2 * i}]::BIGINT[] AS refs, "
+            f"NULL::STRUCT(type VARCHAR, ref BIGINT, role VARCHAR)[] AS members"
+            for i in range(n_ways)
+        )
+        con.execute(f"CREATE TEMP TABLE set_src AS {rows_sql}")
+
+        table = recurse.forward_new_ids_table(con, "set_src", restrict_source_types={"way"})
+        assert table is not None
+        assert 2 * n_ways > idset.INLINE_ID_LIMIT
+        n = con.execute(f"SELECT count(*) FROM {table} WHERE type = 'node'").fetchone()[0]
+        assert n == 2 * n_ways  # every ref here is distinct
+
+        # A real materialized TEMP TABLE (what a join/semi-join can hash),
+        # not a stand-in that still hides an inlined literal list somewhere.
+        is_temp = con.execute(
+            "SELECT temporary FROM duckdb_tables() WHERE table_name = ?", [table]
+        ).fetchone()[0]
+        assert is_temp is True
+    finally:
+        con.close()

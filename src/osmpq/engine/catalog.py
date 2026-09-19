@@ -162,20 +162,34 @@ def cells_for_bbox(manifest: Manifest, table: str, bbox: Optional[BBox]) -> list
     return sorted(c for c in wanted if c in present)
 
 
+def parts_for_range(parts: list[dict], lo: Optional[int], hi: Optional[int]) -> list[dict]:
+    """Filter manifest parts (each with min_id/max_id) to those whose id
+    range can overlap [lo, hi]. Parts lacking min_id/max_id (e.g. the member
+    index, which is not sorted by a single id) are always kept."""
+    if lo is None or hi is None:
+        return []
+    if not all("min_id" in p and "max_id" in p for p in parts):
+        return parts
+    return [p for p in parts if p["max_id"] >= lo and p["min_id"] <= hi]
+
+
+def byid_parts_for_range(manifest: Manifest, table: str, lo: Optional[int], hi: Optional[int]) -> list[dict]:
+    return parts_for_range(manifest.byid_parts(table), lo, hi)
+
+
 def byid_parts_for_ids(manifest: Manifest, table: str, ids: Iterable[int]) -> list[dict]:
     ids = list(ids)
     if not ids:
         return []
-    lo, hi = min(ids), max(ids)
-    out = []
-    for part in manifest.byid_parts(table):
-        if part["max_id"] >= lo and part["min_id"] <= hi:
-            out.append(part)
-    return out
+    return byid_parts_for_range(manifest, table, min(ids), max(ids))
 
 
 def all_byid_parts(manifest: Manifest, table: str) -> list[dict]:
     return manifest.byid_parts(table)
+
+
+def index_parts_for_range(manifest: Manifest, name: str, lo: Optional[int], hi: Optional[int]) -> list[dict]:
+    return parts_for_range(manifest.index_parts(name), lo, hi)
 
 
 def index_parts_for_ids(manifest: Manifest, name: str, ids: Iterable[int]) -> list[dict]:
@@ -186,7 +200,4 @@ def index_parts_for_ids(manifest: Manifest, name: str, ids: Iterable[int]) -> li
     parts = manifest.index_parts(name)
     if not ids or not parts:
         return parts if ids else []
-    if not all("min_id" in p and "max_id" in p for p in parts):
-        return parts
-    lo, hi = min(ids), max(ids)
-    return [p for p in parts if p["max_id"] >= lo and p["min_id"] <= hi]
+    return index_parts_for_range(manifest, name, min(ids), max(ids))

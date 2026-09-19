@@ -4,12 +4,11 @@ formatting over this same list.
 """
 from __future__ import annotations
 
-from collections import defaultdict
 from typing import Optional
 
 from osmpq.ql.ast import Out
 
-from . import catalog
+from . import catalog, idset
 from .schema import CANONICAL_COLUMNS
 
 MEMBER_TYPE_NAME = {"n": "node", "w": "way", "r": "relation"}
@@ -113,25 +112,29 @@ def fetch_counts(con, target_set: str) -> dict:
 
 
 def hydrate_way_geometry(con, manifest: catalog.Manifest, rows: list[dict]) -> None:
+    """Fill in `geometry_wkt` for byid-sourced way rows (no geometry column
+    there; contract section 4) by (cell, id). The rows already know their
+    own cell, so this is one registered (cell, id) TEMP TABLE plus one
+    join across the handful of spatial way files those cells need --
+    instead of a Python loop doing one `id IN (<n literals>)` query per
+    cell."""
     missing = [r for r in rows if r["type"] == "way" and not r.get("geometry_wkt") and r.get("cell")]
     if not missing:
         return
-    by_cell: dict[str, list[int]] = defaultdict(list)
-    for r in missing:
-        by_cell[r["cell"]].append(r["id"])
     tc = manifest.table_cells("way")
-    resolved: dict[int, str] = {}
-    for cell, ids in by_cell.items():
-        entry = tc.get(cell)
-        if not entry:
-            continue
-        path = manifest.path(entry["path"])
-        idlist = ",".join(str(i) for i in ids)
+    needed_cells = sorted({r["cell"] for r in missing if r["cell"] in tc})
+    if not needed_cells:
+        return
+    files = [manifest.path(tc[c]["path"]) for c in needed_cells]
+    pairs_table = idset.register_pairs_table(con, [(r["cell"], r["id"]) for r in missing])
+    resolved = {
+        wid: wkt
         for wid, wkt in con.execute(
-            f"SELECT id, ST_AsText(geometry) FROM read_parquet({_quote_list([path])}) WHERE id IN ({idlist})"
-        ).fetchall():
-            if wkt:
-                resolved[wid] = wkt
+            f"SELECT t.id, ST_AsText(t.geometry) FROM read_parquet({_quote_list(files)}) t "
+            f"JOIN {pairs_table} p ON t.cell = p.cell AND t.id = p.id"
+        ).fetchall()
+        if wkt
+    }
     for r in missing:
         if r["id"] in resolved:
             r["geometry_wkt"] = resolved[r["id"]]
@@ -141,47 +144,50 @@ def resolve_node_coords(con, manifest: catalog.Manifest, ids: list[int]) -> dict
     ids = sorted(set(ids))
     if not ids:
         return {}
-    parts = catalog.byid_parts_for_ids(manifest, "node", ids)
+    lo, hi = idset.id_range(ids)
+    parts = catalog.byid_parts_for_range(manifest, "node", lo, hi)
     files = [manifest.path(p["path"]) for p in parts]
     if not files:
         return {}
-    idlist = ",".join(str(i) for i in ids)
+    pred = idset.id_predicate(con, "id", ids)
     rows = con.execute(
-        f"SELECT id, lat_e7, lon_e7 FROM read_parquet({_quote_list(files)}) WHERE id IN ({idlist})"
+        f"SELECT id, lat_e7, lon_e7 FROM read_parquet({_quote_list(files)}) WHERE {pred}"
     ).fetchall()
     return {i: (lat, lon) for i, lat, lon in rows}
 
 
 def resolve_way_geometries(con, manifest: catalog.Manifest, ids: list[int]) -> dict[int, list[tuple[float, float]]]:
+    """(way id) -> geometry points, for relation members: look up each way's
+    cell via byid, then group by cell *in SQL* (one join across the needed
+    spatial files) instead of issuing one `id IN (...)` query per cell."""
     ids = sorted(set(ids))
     if not ids:
         return {}
-    parts = catalog.byid_parts_for_ids(manifest, "way", ids)
+    lo, hi = idset.id_range(ids)
+    parts = catalog.byid_parts_for_range(manifest, "way", lo, hi)
     files = [manifest.path(p["path"]) for p in parts]
     if not files:
         return {}
-    idlist = ",".join(str(i) for i in ids)
+    pred = idset.id_predicate(con, "id", ids)
     id_cell = con.execute(
-        f"SELECT id, cell FROM read_parquet({_quote_list(files)}) WHERE id IN ({idlist})"
+        f"SELECT id, cell FROM read_parquet({_quote_list(files)}) WHERE {pred} AND cell IS NOT NULL"
     ).fetchall()
-    by_cell: dict[str, list[int]] = defaultdict(list)
-    for wid, cell in id_cell:
-        if cell:
-            by_cell[cell].append(wid)
+    if not id_cell:
+        return {}
     tc = manifest.table_cells("way")
+    needed_cells = sorted({cell for _, cell in id_cell if cell in tc})
+    if not needed_cells:
+        return {}
+    spatial_files = [manifest.path(tc[c]["path"]) for c in needed_cells]
+    pairs_table = idset.register_pairs_table(con, [(cell, wid) for wid, cell in id_cell])
     out: dict[int, list[tuple[float, float]]] = {}
-    for cell, wids in by_cell.items():
-        entry = tc.get(cell)
-        if not entry:
-            continue
-        path = manifest.path(entry["path"])
-        idlist2 = ",".join(str(i) for i in wids)
-        for wid, wkt in con.execute(
-            f"SELECT id, ST_AsText(geometry) FROM read_parquet({_quote_list([path])}) WHERE id IN ({idlist2})"
-        ).fetchall():
-            pts = parse_linestring_wkt(wkt)
-            if pts is not None:
-                out[wid] = pts
+    for wid, wkt in con.execute(
+        f"SELECT t.id, ST_AsText(t.geometry) FROM read_parquet({_quote_list(spatial_files)}) t "
+        f"JOIN {pairs_table} p ON t.cell = p.cell AND t.id = p.id"
+    ).fetchall():
+        pts = parse_linestring_wkt(wkt)
+        if pts is not None:
+            out[wid] = pts
     return out
 
 

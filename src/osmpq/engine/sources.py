@@ -9,7 +9,7 @@ from typing import Optional
 
 from osmpq.ql.ast import TagFilter
 
-from . import catalog, tagsql
+from . import catalog, idset, tagsql
 from .schema import empty_set_sql, project
 
 BBox = tuple[float, float, float, float]
@@ -50,6 +50,7 @@ def _relation_files(manifest: catalog.Manifest, cells: list[str]) -> list[str]:
 
 
 def build_node_spatial_select(
+    con,
     manifest: catalog.Manifest,
     bbox: Optional[BBox],
     tag_filters: list[TagFilter],
@@ -71,7 +72,7 @@ def build_node_spatial_select(
             f"lat_e7 BETWEEN {to_e7(s)} AND {to_e7(n)} AND lon_e7 BETWEEN {to_e7(w)} AND {to_e7(e)}"
         )
     if ids:
-        where.append(f"id IN ({','.join(str(i) for i in ids)})")
+        where.append(idset.id_predicate(con, "id", ids))
     where.append(tagsql.tag_filters_sql(tag_filters, promoted_keys))
     where_sql = " AND ".join(f"({w})" for w in where)
 
@@ -98,6 +99,7 @@ def build_node_spatial_select(
 
 
 def build_way_spatial_select(
+    con,
     manifest: catalog.Manifest,
     bbox: Optional[BBox],
     tag_filters: list[TagFilter],
@@ -117,7 +119,7 @@ def build_way_spatial_select(
             f"xmax_e7 >= {we} AND xmin_e7 <= {ee} AND ymax_e7 >= {se} AND ymin_e7 <= {ne}"
         )
     if ids:
-        where.append(f"id IN ({','.join(str(i) for i in ids)})")
+        where.append(idset.id_predicate(con, "id", ids))
     where.append(tagsql.tag_filters_sql(tag_filters, promoted_keys))
     where_sql = " AND ".join(f"({w})" for w in where)
 
@@ -148,6 +150,7 @@ def build_way_spatial_select(
 
 
 def build_relation_spatial_select(
+    con,
     manifest: catalog.Manifest,
     bbox: Optional[BBox],
     tag_filters: list[TagFilter],
@@ -167,7 +170,7 @@ def build_relation_spatial_select(
             f"xmax_e7 >= {we} AND xmin_e7 <= {ee} AND ymax_e7 >= {se} AND ymin_e7 <= {ne}"
         )
     if ids:
-        where.append(f"id IN ({','.join(str(i) for i in ids)})")
+        where.append(idset.id_predicate(con, "id", ids))
     where.append(tagsql.tag_filters_sql(tag_filters, promoted_keys))
     where_sql = " AND ".join(f"({w})" for w in where)
 
@@ -212,24 +215,9 @@ SPATIAL_BUILDERS = {
 # --------------------------------------------------------------------------
 
 
-def build_byid_select(
-    manifest: catalog.Manifest,
-    element_type: str,
-    ids: list[int],
-    tag_filters: list[TagFilter],
-    promoted_keys: set[str],
-) -> tuple[str, int]:
-    parts = catalog.byid_parts_for_ids(manifest, element_type, ids)
-    files = [manifest.path(p["path"]) for p in parts]
-    if not files or not ids:
-        return empty_set_sql(), 0
-
-    idlist = ",".join(str(i) for i in ids)
-    where = [f"id IN ({idlist})", tagsql.tag_filters_sql(tag_filters, promoted_keys)]
-    where_sql = " AND ".join(f"({w})" for w in where)
-
+def _byid_cols(element_type: str) -> dict[str, str]:
     if element_type == "node":
-        cols = {
+        return {
             "type": "'node'",
             "id": "id",
             "cell": "cell",
@@ -244,7 +232,7 @@ def build_byid_select(
             "hilbert": "opq_node_hilbert(lon_e7, lat_e7)",
         }
     elif element_type == "way":
-        cols = {
+        return {
             "type": "'way'",
             "id": "id",
             "cell": "cell",
@@ -262,7 +250,7 @@ def build_byid_select(
             "hilbert": "opq_bbox_hilbert(xmin_e7, ymin_e7, xmax_e7, ymax_e7)",
         }
     else:
-        cols = {
+        return {
             "type": "'relation'",
             "id": "id",
             "cell": "cell",
@@ -279,6 +267,59 @@ def build_byid_select(
             "ymax_e7": "ymax_e7",
             "hilbert": "opq_bbox_hilbert(xmin_e7, ymin_e7, xmax_e7, ymax_e7)",
         }
+
+
+def build_byid_select(
+    con,
+    manifest: catalog.Manifest,
+    element_type: str,
+    ids: list[int],
+    tag_filters: list[TagFilter],
+    promoted_keys: set[str],
+) -> tuple[str, int]:
+    ids = list(ids)
+    if not ids:
+        return empty_set_sql(), 0
+    lo, hi = idset.id_range(ids)
+    parts = catalog.byid_parts_for_range(manifest, element_type, lo, hi)
+    files = [manifest.path(p["path"]) for p in parts]
+    if not files:
+        return empty_set_sql(), 0
+
+    where = [idset.id_predicate(con, "id", ids), tagsql.tag_filters_sql(tag_filters, promoted_keys)]
+    where_sql = " AND ".join(f"({w})" for w in where)
+    cols = _byid_cols(element_type)
+    sql = (
+        f"SELECT {project(cols)}\n"
+        f"FROM read_parquet({_quote_list(files)}, union_by_name=true)\n"
+        f"WHERE {where_sql}"
+    )
+    return sql, len(files)
+
+
+def build_byid_select_from_ids_query(
+    manifest: catalog.Manifest,
+    element_type: str,
+    id_subquery_sql: str,
+    lo: Optional[int],
+    hi: Optional[int],
+    tag_filters: list[TagFilter],
+    promoted_keys: set[str],
+) -> tuple[str, int]:
+    """Like `build_byid_select`, but the ids are already a SQL relation
+    (`id_subquery_sql`, a `SELECT id FROM ...` producing the wanted ids for
+    `element_type`) instead of a Python list -- used by recurse.py so a `>`,
+    `<`, `>>`, `<<` or inline recurse filter never pulls ids into Python at
+    all. `lo`/`hi` (from a SQL aggregate on that same relation, not a Python
+    id scan) pick which byid parts can contain them."""
+    parts = catalog.byid_parts_for_range(manifest, element_type, lo, hi)
+    files = [manifest.path(p["path"]) for p in parts]
+    if not files:
+        return empty_set_sql(), 0
+
+    where = [f"id IN ({id_subquery_sql})", tagsql.tag_filters_sql(tag_filters, promoted_keys)]
+    where_sql = " AND ".join(f"({w})" for w in where)
+    cols = _byid_cols(element_type)
     sql = (
         f"SELECT {project(cols)}\n"
         f"FROM read_parquet({_quote_list(files)}, union_by_name=true)\n"
@@ -293,6 +334,7 @@ def build_byid_select(
 
 
 def build_from_set_select(
+    con,
     set_names: list[str],
     types: list[str],
     tag_filters: list[TagFilter],
@@ -305,7 +347,7 @@ def build_from_set_select(
     type_list = ",".join(f"'{t}'" for t in types)
     where = [f"{base}.type IN ({type_list})"]
     if ids:
-        where.append(f"{base}.id IN ({','.join(str(i) for i in ids)})")
+        where.append(idset.id_predicate(con, f"{base}.id", ids))
     if bbox is not None:
         s, w, n, e = bbox
         se, we, ne, ee = to_e7(s), to_e7(w), to_e7(n), to_e7(e)
