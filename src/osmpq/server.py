@@ -66,17 +66,21 @@ def _error_html(message: str, line: int = 1) -> str:
 def _extract_query(data: Optional[str], body: bytes) -> str:
     if data:
         return data
-    if body:
-        text = body.decode("utf-8", errors="replace")
-        # Accept `data=<query>` form-encoded bodies too.
-        if text.startswith("data="):
-            from urllib.parse import parse_qs
+    if not body:
+        return ""
+    text = body.decode("utf-8", errors="replace")
+    # Accept `data=<query>` form-encoded bodies too; otherwise the raw body
+    # *is* the query (contract: "raw POST body also accepted when no data
+    # field").
+    try:
+        from urllib.parse import parse_qs
 
-            parsed = parse_qs(text)
-            if "data" in parsed:
-                return parsed["data"][0]
-        return text
-    return ""
+        parsed = parse_qs(text, keep_blank_values=True)
+        if parsed.get("data"):
+            return parsed["data"][0]
+    except Exception:
+        pass
+    return text
 
 
 async def _handle_interpreter(request: Request, data: Optional[str]) -> Response:
