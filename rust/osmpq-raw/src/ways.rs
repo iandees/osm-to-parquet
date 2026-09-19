@@ -28,7 +28,7 @@ const WAY_BYID_ROW_GROUP_SIZING: RowGroupSizing = RowGroupSizing::AdaptiveBytes 
     max_rows: 100_000,
 };
 const WAY_SPATIAL_ROW_GROUP_SIZING: RowGroupSizing = RowGroupSizing::AdaptiveBytes {
-    target_bytes: 2_000_000,
+    target_bytes: 4_000_000,
     min_rows: 2_000,
     max_rows: 100_000,
 };
