@@ -1,0 +1,10 @@
+# docs/m3-contracts.md section 6.4
+data/
+rust/osmpq-raw/target/
+tests/corpus/.cache/
+
+# common hygiene, not otherwise needed in the build context
+.git/
+**/__pycache__/
+*.pyc
+.pytest_cache/

@@ -46,6 +46,7 @@ from typing import Any, Optional
 
 import numpy as np
 
+from osmpq import store as store_mod
 from osmpq.build import common
 from osmpq.layout import cells as cells_mod
 from osmpq.layout import hilbert as hilbert_mod
@@ -233,7 +234,8 @@ def run(opts: UpdateOptions) -> None:
 
 def run_once(opts: UpdateOptions) -> Optional[RunSummary]:
     t0 = time.time()
-    root = Path(opts.root)
+    store = store_mod.for_root(opts.root)
+    is_remote = store_mod.is_remote_root(opts.root)
     man = manifest_mod.load_latest(opts.root)
     source = opts.source or man.replication_source
     if not source:
@@ -250,6 +252,21 @@ def run_once(opts: UpdateOptions) -> Optional[RunSummary]:
     tmpdir = Path(opts.tmpdir) if opts.tmpdir else Path.cwd() / ".osmpq-update-tmp"
     tmpdir.mkdir(parents=True, exist_ok=True)
     osc_cache = tmpdir / "osc-cache"
+
+    # contract section 6.2: on a local root, new tier files are written
+    # straight into their final place under the root, exactly as before
+    # (byte-for-byte unchanged -- `write_root` *is* the root). `Path(opts.
+    # root)` isn't a usable filesystem path at all for an `s3://` root, so
+    # there `write_root` is a local staging directory instead; once
+    # `_write_tiers` has written this run's new tier files there, they're
+    # uploaded to `store` (`_upload_new_tier_files`) before the manifest is
+    # written (which always goes through `manifest_mod.write_manifest`,
+    # itself store-backed for either root kind).
+    if is_remote:
+        write_root = tmpdir / "staging"
+        write_root.mkdir(parents=True, exist_ok=True)
+    else:
+        write_root = Path(opts.root)
 
     from_seq = (man.replication_sequence or 0) + 1
 
@@ -279,10 +296,20 @@ def run_once(opts: UpdateOptions) -> Optional[RunSummary]:
     con.execute("SET preserve_insertion_order=false")
     con.execute("INSTALL spatial")
     con.execute("LOAD spatial")
+    if is_remote:
+        # Same S3 secret the query engine issues (docs/m3-contracts.md
+        # section 6.2: `store.s3_secret_sql`, shared with
+        # `osmpq.engine.executor`), so `read_parquet(store.url(...))` below
+        # can reach the bucket.
+        con.execute("INSTALL httpfs")
+        con.execute("LOAD httpfs")
+        secret_sql = store_mod.s3_secret_sql()
+        if secret_sql:
+            con.execute(secret_sql)
 
     try:
         result = _run_once_impl(
-            con, root, man, promoted_keys, ancestor_depths, max_depth, leaf_index,
+            con, write_root, store, is_remote, man, promoted_keys, ancestor_depths, max_depth, leaf_index,
             (south_e7, west_e7, north_e7, east_e7), batch, fetched, batch_timestamp, opts,
         )
     finally:
@@ -312,7 +339,7 @@ def _max_element_timestamp(batch: osc_mod.BatchResult) -> Optional[str]:
 
 
 def _run_once_impl(
-    con, root: Path, man: manifest_mod.Manifest, promoted_keys: list[str],
+    con, root: Path, store, is_remote: bool, man: manifest_mod.Manifest, promoted_keys: list[str],
     ancestor_depths: list[int], max_depth: int, leaf_index: cells_mod.LeafIndex,
     extent_e7: tuple[int, int, int, int], batch: osc_mod.BatchResult,
     fetched: list, batch_timestamp: Optional[str], opts: UpdateOptions,
@@ -326,30 +353,40 @@ def _run_once_impl(
     con.register("batch_relation_raw", batch.relation)
 
     # ---- step 1: load current delta tiers (byid ⊕ tombstones) -----------------
-    tier_state = _load_tiers(con, root, man, promoted_keys)
+    tier_state = _load_tiers(con, store, man, promoted_keys)
     _build_delta_indexes(con, tier_state)
 
     # ---- correctness rule: drop rows whose version is not newer ----------------
-    _drop_stale_versions(con, tier_state, root, man)
+    _drop_stale_versions(con, tier_state, store, man)
 
     # ---- step 3: extent filter --------------------------------------------------
-    kept, dropped_counts = _extent_filter(con, tier_state, root, man, promoted_keys, south_e7, west_e7, north_e7, east_e7)
+    kept, dropped_counts = _extent_filter(con, tier_state, store, man, promoted_keys, south_e7, west_e7, north_e7, east_e7)
 
     # ---- step 4: touched set -----------------------------------------------------
-    touched_way_ids, touched_relation_ids = _touched_set(con, root, man, tier_state, kept)
+    touched_way_ids, touched_relation_ids = _touched_set(con, store, man, tier_state, kept)
 
     # ---- step 5/6: fetch current state + node coords, re-resolve ---------------
     resolved = _resolve(
-        con, root, man, promoted_keys, tier_state, kept, touched_way_ids, touched_relation_ids,
+        con, store, man, promoted_keys, tier_state, kept, touched_way_ids, touched_relation_ids,
         leaf_index, ancestor_depths, max_depth, last_seq,
     )
 
     rows_touched = {t: con.execute(f"SELECT count(*) FROM {resolved[t]}").fetchone()[0] for t in _TYPES}
 
-    # ---- step 7: rolling tiers ----------------------------------------------------
+    # ---- step 7: rolling tiers ------------------------------------------------
+    # `root` is the local write target for freshly-written Parquet files:
+    # the real dataset root for a local `Store`, or a scratch staging
+    # directory for an `s3://` one (`run_once`) -- `_write_tiers`/
+    # `_write_tier_version` always write local files with DuckDB's `COPY`,
+    # identically on both.
     tier_versions, tier_bytes, new_deltas = _write_tiers(
-        con, root, man, promoted_keys, tier_state, resolved, first_seq, last_seq, batch_timestamp,
+        con, root, store, man, promoted_keys, tier_state, resolved, first_seq, last_seq, batch_timestamp,
     )
+    if is_remote:
+        # Those files only exist in the local staging dir so far (contract
+        # 6.2: "tier files are written to the local tmpdir and uploaded
+        # with upload_file"); push the ones this run actually (re)wrote.
+        _upload_new_tier_files(store, root, new_deltas, tier_versions)
 
     # ---- step 8: manifest -----------------------------------------------------------
     source = opts.source or man.replication_source
@@ -375,8 +412,12 @@ def _run_once_impl(
         replication_source=source,
         deltas=new_deltas,
     )
-    gen_number = manifest_mod.next_manifest_number(opts_root_str(root))
-    manifest_mod.write_manifest(opts_root_str(root), new_man, gen_number)
+    # `opts.root`, not `root` (the local write target above, a staging dir
+    # for `s3://`): this is the actual root string, and
+    # `manifest_mod.write_manifest`/`next_manifest_number` are store-backed
+    # for either root kind (contract section 6.2).
+    gen_number = manifest_mod.next_manifest_number(opts.root)
+    manifest_mod.write_manifest(opts.root, new_man, gen_number)
 
     return RunSummary(
         applied=len(fetched), first_seq=first_seq, last_seq=last_seq, timestamp=batch_timestamp,
@@ -384,8 +425,23 @@ def _run_once_impl(
     )
 
 
-def opts_root_str(root: Path) -> str:
-    return str(root)
+def _upload_new_tier_files(store, write_root: Path, new_deltas: dict, tier_versions: dict) -> None:
+    """After `_write_tiers` writes this run's freshly-created tier files
+    under `write_root` (an s3:// root's local staging dir -- see
+    `run_once`), upload each one to `store` at its manifest-relative path.
+    Only tiers this run actually (re)wrote (`tier_versions`'s keys) have
+    new files to push; an untouched tier keeps whatever's already at its
+    old paths in `store`."""
+    for tier_name in tier_versions:
+        files = (new_deltas.get(tier_name) or {}).get("files", {})
+        for typ, entry in files.items():
+            if typ == "tombstones":
+                if entry:
+                    store.upload_file(str(write_root / entry), entry)
+                continue
+            for _kind, relpath in (entry or {}).items():
+                if relpath:
+                    store.upload_file(str(write_root / relpath), relpath)
 
 
 # --------------------------------------------------------------------------
@@ -422,7 +478,7 @@ def _empty_delta_table_sql(typ: str, promoted_keys: list[str]) -> str:
     return f"SELECT {select} WHERE FALSE"
 
 
-def _load_tiers(con, root: Path, man: manifest_mod.Manifest, promoted_keys: list[str]) -> TierState:
+def _load_tiers(con, store, man: manifest_mod.Manifest, promoted_keys: list[str]) -> TierState:
     state = TierState()
     for typ in _TYPES:
         pieces = []
@@ -433,13 +489,12 @@ def _load_tiers(con, root: Path, man: manifest_mod.Manifest, promoted_keys: list
             fpath = entry.get("files", {}).get(typ, {}).get("byid")
             if not fpath:
                 continue
-            full = root / fpath
-            if not full.exists():
+            if not store.exists(fpath):
                 continue
             cols = delta_byid_columns(typ, promoted_keys)
             col_sql = ", ".join(cols)
             rank = {"hour": 3, "day": 2, "week": 1}[tier]
-            pieces.append(f"SELECT {col_sql}, {rank} AS __tier_rank FROM read_parquet('{_esc(full)}')")
+            pieces.append(f"SELECT {col_sql}, {rank} AS __tier_rank FROM read_parquet('{_esc(store.url(fpath))}')")
             state.present_tiers[tier] = entry
         raw_name = f"delta_raw_{typ}"
         if pieces:
@@ -484,7 +539,7 @@ def _build_delta_indexes(con, state: TierState) -> None:
 # --------------------------------------------------------------------------
 
 
-def _fetch_current(con, root: Path, typ: str, man: manifest_mod.Manifest, promoted_keys: list[str],
+def _fetch_current(con, store, typ: str, man: manifest_mod.Manifest, promoted_keys: list[str],
                     state: TierState, ids_table: str, out_table: str) -> None:
     """``out_table`` <- current alive effective row (delta shadows base) for
     every id in ``ids_table`` that currently exists. Columns =
@@ -497,7 +552,7 @@ def _fetch_current(con, root: Path, typ: str, man: manifest_mod.Manifest, promot
         return
     parts = _select_parts(man.byid.get(typ, []), lo, hi)
     if parts:
-        paths = [str(root / p) for p in parts]
+        paths = [store.url(p) for p in parts]
         base_sql = (
             f"SELECT {col_sql} FROM read_parquet({paths!r}) b "
             f"WHERE b.id IN (SELECT id FROM {ids_table}) AND b.id NOT IN (SELECT id FROM {state.raw_view[typ]})"
@@ -517,13 +572,13 @@ def _fetch_current(con, root: Path, typ: str, man: manifest_mod.Manifest, promot
 # --------------------------------------------------------------------------
 
 
-def _drop_stale_versions(con, state: TierState, root: Path, man: manifest_mod.Manifest) -> None:
+def _drop_stale_versions(con, state: TierState, store, man: manifest_mod.Manifest) -> None:
     for typ in _TYPES:
         raw = f"batch_{typ}_raw"
         n = con.execute(f"SELECT count(*) FROM {raw}").fetchone()[0]
         _register_ids(con, f"__ver_ids_{typ}", con.execute(f"SELECT id FROM {raw}").fetchnumpy()["id"] if n else np.array([], dtype=np.int64))
         prior = f"__ver_prior_{typ}"
-        _fetch_current(con, root, typ, man, man.promoted_keys, state, f"__ver_ids_{typ}", prior)
+        _fetch_current(con, store, typ, man, man.promoted_keys, state, f"__ver_ids_{typ}", prior)
         con.execute(f"""
             CREATE OR REPLACE TEMP TABLE batch_{typ} AS
             SELECT b.* FROM {raw} b LEFT JOIN {prior} p ON p.id = b.id
@@ -547,7 +602,7 @@ def _member_ids(con, table: str, mtype: str) -> str:
     return name
 
 
-def _extent_filter(con, state: TierState, root: Path, man: manifest_mod.Manifest, promoted_keys: list[str],
+def _extent_filter(con, state: TierState, store, man: manifest_mod.Manifest, promoted_keys: list[str],
                     south_e7: int, west_e7: int, north_e7: int, east_e7: int) -> tuple[dict[str, str], dict[str, int]]:
     # ids needed for existence ("known") checks, per type
     mrel_n = _member_ids(con, "batch_relation", "n")
@@ -572,9 +627,9 @@ def _extent_filter(con, state: TierState, root: Path, man: manifest_mod.Manifest
     _register_ids(con, "__way_ids_check_t", con.execute("SELECT id FROM __way_ids_check").fetchnumpy()["id"])
     _register_ids(con, "__rel_ids_check_t", con.execute("SELECT id FROM __rel_ids_check").fetchnumpy()["id"])
 
-    _fetch_current(con, root, "node", man, promoted_keys, state, "__node_ids_check_t", "exists_node")
-    _fetch_current(con, root, "way", man, promoted_keys, state, "__way_ids_check_t", "exists_way")
-    _fetch_current(con, root, "relation", man, promoted_keys, state, "__rel_ids_check_t", "exists_relation")
+    _fetch_current(con, store, "node", man, promoted_keys, state, "__node_ids_check_t", "exists_node")
+    _fetch_current(con, store, "way", man, promoted_keys, state, "__way_ids_check_t", "exists_way")
+    _fetch_current(con, store, "relation", man, promoted_keys, state, "__rel_ids_check_t", "exists_relation")
 
     # kept_node: id_in_exists_before OR (NOT deleted AND inside extent)
     con.execute(f"""
@@ -623,10 +678,10 @@ def _extent_filter(con, state: TierState, root: Path, man: manifest_mod.Manifest
 # --------------------------------------------------------------------------
 
 
-def _touched_set(con, root: Path, man: manifest_mod.Manifest, state: TierState, kept: dict[str, str]) -> tuple[np.ndarray, np.ndarray]:
+def _touched_set(con, store, man: manifest_mod.Manifest, state: TierState, kept: dict[str, str]) -> tuple[np.ndarray, np.ndarray]:
     node_way_parts = man.index.get("node_way", [])
     member_parts = man.index.get("member", [])
-    member_paths = [str(root / p["path"]) for p in member_parts if (root / p["path"]).exists()]
+    member_paths = [store.url(p["path"]) for p in member_parts if store.exists(p["path"])]
 
     kept_node_ids = con.execute(f"SELECT id FROM {kept['node']}").fetchnumpy()["id"]
     kept_way_ids = con.execute(f"SELECT id FROM {kept['way']}").fetchnumpy()["id"]
@@ -638,7 +693,7 @@ def _touched_set(con, root: Path, man: manifest_mod.Manifest, state: TierState, 
         parts = _select_parts(node_way_parts, lo, hi)
         _register_ids(con, "__kept_node_ids_t", kept_node_ids)
         if parts:
-            paths = [str(root / p) for p in parts]
+            paths = [store.url(p) for p in parts]
             base_pw = con.execute(
                 f"SELECT DISTINCT way_id FROM read_parquet({paths!r}) WHERE node_id IN (SELECT id FROM __kept_node_ids_t)"
             ).fetchnumpy()["way_id"]
@@ -656,7 +711,7 @@ def _touched_set(con, root: Path, man: manifest_mod.Manifest, state: TierState, 
     # verify touched-only (not in kept_way) way candidates actually exist
     not_in_batch_way = np.setdiff1d(touched_way_candidate, kept_way_ids, assume_unique=False)
     _register_ids(con, "__touched_way_check_t", not_in_batch_way)
-    _fetch_current(con, root, "way", man, man.promoted_keys, state, "__touched_way_check_t", "__touched_way_exists")
+    _fetch_current(con, store, "way", man, man.promoted_keys, state, "__touched_way_check_t", "__touched_way_exists")
     alive_touched_only_way = con.execute("SELECT id FROM __touched_way_exists").fetchnumpy()["id"]
     touched_way_ids = np.unique(np.concatenate([kept_way_ids, np.asarray(alive_touched_only_way, dtype=np.int64)]))
 
@@ -691,7 +746,7 @@ def _touched_set(con, root: Path, man: manifest_mod.Manifest, state: TierState, 
 
     not_in_batch_rel = np.setdiff1d(touched_relation_ids, kept_relation_ids, assume_unique=False)
     _register_ids(con, "__touched_rel_check_t", not_in_batch_rel)
-    _fetch_current(con, root, "relation", man, man.promoted_keys, state, "__touched_rel_check_t", "__touched_rel_exists")
+    _fetch_current(con, store, "relation", man, man.promoted_keys, state, "__touched_rel_check_t", "__touched_rel_exists")
     alive_touched_only_rel = con.execute("SELECT id FROM __touched_rel_exists").fetchnumpy()["id"]
     touched_relation_ids_final = np.unique(np.concatenate([kept_relation_ids.astype(np.int64), np.asarray(alive_touched_only_rel, dtype=np.int64)]))
 
@@ -722,7 +777,7 @@ def _filled_i64(col) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _resolve(
-    con, root: Path, man: manifest_mod.Manifest, promoted_keys: list[str], state: TierState,
+    con, store, man: manifest_mod.Manifest, promoted_keys: list[str], state: TierState,
     kept: dict[str, str], touched_way_ids: np.ndarray, touched_relation_ids: np.ndarray,
     leaf_index: cells_mod.LeafIndex, ancestor_depths: list[int], max_depth: int, last_seq: int,
 ) -> dict[str, str]:
@@ -736,8 +791,8 @@ def _resolve(
 
     _register_ids(con, "touched_way_ids_t", touched_way_ids)
     _register_ids(con, "touched_relation_ids_t", touched_relation_ids)
-    _fetch_current(con, root, "way", man, promoted_keys, state, "touched_way_ids_t", "prior_way_all")
-    _fetch_current(con, root, "relation", man, promoted_keys, state, "touched_relation_ids_t", "prior_relation_all")
+    _fetch_current(con, store, "way", man, promoted_keys, state, "touched_way_ids_t", "prior_way_all")
+    _fetch_current(con, store, "relation", man, promoted_keys, state, "touched_relation_ids_t", "prior_relation_all")
 
     con.execute(f"""
         CREATE OR REPLACE TEMP TABLE touched_way_base AS
@@ -773,7 +828,7 @@ def _resolve(
     """)
     node_ids_needed = _union_ids_sql(con, kept["node"], "__way_refs_needed", "__rel_member_nodes_needed")
     _register_ids(con, "node_ids_needed_t", node_ids_needed)
-    _fetch_current(con, root, "node", man, promoted_keys, state, "node_ids_needed_t", "prior_node_all")
+    _fetch_current(con, store, "node", man, promoted_keys, state, "node_ids_needed_t", "prior_node_all")
     con.execute(f"""
         CREATE OR REPLACE TEMP TABLE node_coords_all AS
         SELECT id, lat_e7, lon_e7 FROM {kept['node']} WHERE NOT deleted
@@ -789,7 +844,7 @@ def _resolve(
         WHERE NOT deleted AND m.type = 'w' AND m.ref NOT IN (SELECT id FROM touched_way_ids_t)
     """)
     _register_ids(con, "extra_way_ids_t", con.execute("SELECT id FROM __rel_member_ways_needed").fetchnumpy()["id"])
-    _fetch_current(con, root, "way", man, promoted_keys, state, "extra_way_ids_t", "extra_way_bbox")
+    _fetch_current(con, store, "way", man, promoted_keys, state, "extra_way_ids_t", "extra_way_bbox")
 
     con.execute("""
         CREATE OR REPLACE TEMP VIEW __rel_member_rels_needed AS
@@ -797,7 +852,7 @@ def _resolve(
         WHERE NOT deleted AND m.type = 'r' AND m.ref NOT IN (SELECT id FROM touched_relation_ids_t)
     """)
     _register_ids(con, "extra_rel_ids_t", con.execute("SELECT id FROM __rel_member_rels_needed").fetchnumpy()["id"])
-    _fetch_current(con, root, "relation", man, promoted_keys, state, "extra_rel_ids_t", "extra_relation_bbox")
+    _fetch_current(con, store, "relation", man, promoted_keys, state, "extra_rel_ids_t", "extra_relation_bbox")
 
     # ---- way geometry/bbox (mirrors osmpq.build.raw's way_pts logic) -----------
     con.execute("""
@@ -1108,15 +1163,15 @@ def _floor_day(dt):
     return dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-def _load_old(con, root: Path, typ: str, meta: Optional[dict]) -> tuple[Optional[str], Optional[str]]:
+def _load_old(con, store, typ: str, meta: Optional[dict]) -> tuple[Optional[str], Optional[str]]:
     if meta is None:
         return None, None
-    byid_path = root / meta["files"][typ]["byid"]
-    spatial_path = root / meta["files"][typ]["spatial"]
+    byid_url = store.url(meta["files"][typ]["byid"])
+    spatial_url = store.url(meta["files"][typ]["spatial"])
     byid_name = f"__old_byid_{typ}_{_uid()}"
     spatial_name = f"__old_spatial_{typ}_{_uid()}"
-    con.execute(f"CREATE OR REPLACE TEMP VIEW {byid_name} AS SELECT * FROM read_parquet('{_esc(byid_path)}')")
-    con.execute(f"CREATE OR REPLACE TEMP VIEW {spatial_name} AS SELECT * FROM read_parquet('{_esc(spatial_path)}')")
+    con.execute(f"CREATE OR REPLACE TEMP VIEW {byid_name} AS SELECT * FROM read_parquet('{_esc(byid_url)}')")
+    con.execute(f"CREATE OR REPLACE TEMP VIEW {spatial_name} AS SELECT * FROM read_parquet('{_esc(spatial_url)}')")
     return byid_name, spatial_name
 
 
@@ -1224,7 +1279,7 @@ def _write_tier_version(
 
 
 def _write_tiers(
-    con, root: Path, man: manifest_mod.Manifest, promoted_keys: list[str], state: TierState,
+    con, root: Path, store, man: manifest_mod.Manifest, promoted_keys: list[str], state: TierState,
     resolved: dict[str, str], first_seq: int, last_seq: int, batch_timestamp: Optional[str],
 ) -> tuple[dict[str, int], dict[str, int], dict[str, Any]]:
     hour_old_meta = man.deltas.get("hour") if man.deltas else None
@@ -1252,7 +1307,7 @@ def _write_tiers(
     if not hour_crossed:
         merged_hour = {}
         for typ in _TYPES:
-            old_byid, old_spatial = _load_old(con, root, typ, hour_old_meta)
+            old_byid, old_spatial = _load_old(con, store, typ, hour_old_meta)
             merged_hour[typ] = _merge_type(con, typ, promoted_keys, f"batch_byid_{typ}", old_byid, resolved[typ], old_spatial)
         seq_from = hour_old_meta["seq_from"] if hour_old_meta else first_seq
         version = (hour_old_meta["version"] if hour_old_meta else 0) + 1
@@ -1267,8 +1322,8 @@ def _write_tiers(
     # ---- hour boundary crossed: fold hour_old into day, hour' = batch alone ---
     merged_day = {}
     for typ in _TYPES:
-        hour_byid, hour_spatial = _load_old(con, root, typ, hour_old_meta)
-        day_byid, day_spatial = _load_old(con, root, typ, day_old_meta)
+        hour_byid, hour_spatial = _load_old(con, store, typ, hour_old_meta)
+        day_byid, day_spatial = _load_old(con, store, typ, day_old_meta)
         merged_day[typ] = _merge_type(con, typ, promoted_keys, hour_byid, day_byid, hour_spatial, day_spatial)
     day_seq_from = min(x for x in [(day_old_meta or {}).get("seq_from"), hour_old_meta["seq_from"]] if x is not None)
     day_seq_to = hour_old_meta["seq_to"]
@@ -1278,7 +1333,7 @@ def _write_tiers(
     if day_crossed:
         merged_week = {}
         for typ in _TYPES:
-            week_byid, week_spatial = _load_old(con, root, typ, week_old_meta)
+            week_byid, week_spatial = _load_old(con, store, typ, week_old_meta)
             mb, ms = merged_day[typ]
             merged_week[typ] = _merge_type(con, typ, promoted_keys, mb, week_byid, ms, week_spatial)
         week_seq_from = min(x for x in [(week_old_meta or {}).get("seq_from"), day_seq_from] if x is not None)

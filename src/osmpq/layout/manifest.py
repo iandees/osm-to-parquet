@@ -12,6 +12,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from osmpq import store as store_mod
+
 MANIFEST_VERSION = 1
 CURRENT_MANIFEST_VERSION = 3
 SCHEMA_VERSION = 1
@@ -189,13 +191,14 @@ def next_manifest_number(root: str) -> int:
 
 
 def _read_latest(root: str) -> Optional[int]:
-    if _is_remote(root):
-        text = _s3_read_text(_join(root, "manifest/LATEST"))
-        return int(text.strip()) if text is not None else None
-    path = local_root_path(root) / "manifest" / "LATEST"
-    if not path.exists():
+    """``manifest/LATEST``'s integer contents, or None when it doesn't
+    exist yet (a brand-new root) -- for either root kind, via ``Store``
+    (contract section 6.2: ``write_manifest``/``load_latest`` accept
+    either root kind)."""
+    store = store_mod.for_root(root)
+    if not store.exists("manifest/LATEST"):
         return None
-    return int(path.read_text().strip())
+    return int(store.read_bytes("manifest/LATEST").decode("utf-8").strip())
 
 
 def _atomic_write_text(path: Path, body: str) -> None:
@@ -232,82 +235,36 @@ def _atomic_write_text(path: Path, body: str) -> None:
 
 
 def write_manifest(root: str, manifest: Manifest, number: int) -> None:
-    """Write ``manifest/<number>.json``, then update ``manifest/LATEST`` last."""
-    body = json.dumps(manifest.to_dict(), indent=2, sort_keys=False)
-    if _is_remote(root):
-        _s3_write_text(_join(root, f"manifest/{number}.json"), body)
-        _s3_write_text(_join(root, "manifest/LATEST"), str(number))
-        return
-    manifest_dir = local_root_path(root) / "manifest"
-    manifest_dir.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text(manifest_dir / f"{number}.json", body)
+    """Write ``manifest/<number>.json``, then update ``manifest/LATEST``
+    last -- for either root kind (contract section 6.2), through
+    ``Store.write_bytes``. For a local root, ``LocalStore.write_bytes``
+    uses the same temp-file + ``os.replace`` pattern the old
+    local-only implementation did, so this is byte-for-byte the same on
+    disk as before (in particular, ``manifest/LATEST`` is never truncated
+    in place -- see ``store._atomic_write_bytes``)."""
+    body = json.dumps(manifest.to_dict(), indent=2, sort_keys=False).encode("utf-8")
+    store = store_mod.for_root(root)
+    store.write_bytes(f"manifest/{number}.json", body)
     # Written last: an engine that already loaded manifest n stays consistent
     # even while n+1 is being written.
-    _atomic_write_text(manifest_dir / "LATEST", str(number))
+    store.write_bytes("manifest/LATEST", str(number).encode("utf-8"))
 
 
 def load(root: str, number: int) -> Manifest:
-    if _is_remote(root):
-        text = _s3_read_text(_join(root, f"manifest/{number}.json"))
-        if text is None:
-            raise FileNotFoundError(f"{root}/manifest/{number}.json")
-        return Manifest.from_dict(json.loads(text))
-    path = local_root_path(root) / "manifest" / f"{number}.json"
-    return Manifest.from_dict(json.loads(path.read_text()))
+    store = store_mod.for_root(root)
+    rel = f"manifest/{number}.json"
+    if not store.exists(rel):
+        raise FileNotFoundError(f"{root}/{rel}")
+    return Manifest.from_dict(json.loads(store.read_bytes(rel)))
 
 
 def load_latest(root: str) -> Manifest:
     """Load the manifest named by ``manifest/LATEST`` under ``root``.
 
-    ``root`` may be a local directory or an ``s3://`` URL (read via DuckDB's
-    ``httpfs`` extension; s3 support is best-effort for M0).
+    ``root`` may be a local directory or an ``s3://`` URL, via ``Store``
+    (contract section 6.2).
     """
     number = _read_latest(root)
     if number is None:
         raise FileNotFoundError(f"{root}/manifest/LATEST not found")
     return load(root, number)
-
-
-# --------------------------------------------------------------------------
-# S3 access via DuckDB httpfs (best-effort for M0)
-# --------------------------------------------------------------------------
-
-
-def _s3_read_text(url: str) -> Optional[str]:
-    # Round-tripped through DuckDB's CSV reader (not read_text, which returns
-    # raw bytes) so arbitrary JSON content written by _s3_write_text below
-    # comes back exactly, including embedded quotes/newlines.
-    import duckdb
-
-    con = duckdb.connect()
-    try:
-        con.execute("INSTALL httpfs")
-        con.execute("LOAD httpfs")
-        try:
-            escaped_url = url.replace("'", "''")
-            row = con.execute(
-                f"SELECT content FROM read_csv('{escaped_url}', "
-                "columns={'content': 'VARCHAR'}, header=false, quote='\"', escape='\"')"
-            ).fetchone()
-        except Exception:
-            return None
-        return row[0] if row else None
-    finally:
-        con.close()
-
-
-def _s3_write_text(url: str, body: str) -> None:
-    import duckdb
-
-    con = duckdb.connect()
-    try:
-        con.execute("INSTALL httpfs")
-        con.execute("LOAD httpfs")
-        escaped_url = url.replace("'", "''")
-        con.execute(
-            f"COPY (SELECT ? AS content) TO '{escaped_url}' "
-            "(FORMAT CSV, HEADER false, QUOTE '\"', ESCAPE '\"')",
-            [body],
-        )
-    finally:
-        con.close()

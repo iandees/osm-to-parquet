@@ -155,6 +155,29 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def _cmd_serve(args: argparse.Namespace) -> int:
+    """`osmpq serve` (docs/m3-contracts.md section 6.1): run `osmpq.server`
+    (`/api/interpreter`, `/api/status`, `/api/kill_my_queries`,
+    `/healthz`, ...) under uvicorn. The dataset root and every other
+    behaviour knob come from the `OSMPQ_*` environment variables the app
+    itself reads (see `osmpq.server`'s module docstring); this subcommand
+    only owns the bind address, port and worker count."""
+    import uvicorn
+
+    uvicorn.run("osmpq.server:app", host=args.host, port=args.port, workers=args.workers)
+    return 0
+
+
+def _cmd_updater_server(args: argparse.Namespace) -> int:
+    """`osmpq updater-server` (docs/m3-contracts.md section 6.3): run
+    `osmpq.update.server` (`POST /run`, `GET /status`, `GET /healthz`)
+    under uvicorn."""
+    import uvicorn
+
+    uvicorn.run("osmpq.update.server:app", host=args.host, port=args.port, workers=args.workers)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     if argv[:1] == ["compact"]:
@@ -222,6 +245,20 @@ def main(argv: list[str] | None = None) -> int:
     p_update.add_argument("--memory-limit", default=None)
     p_update.add_argument("--poll-interval", type=float, default=30.0, help="seconds between --follow polls")
     p_update.set_defaults(func=_cmd_update)
+
+    p_serve = sub.add_parser("serve", help="run the query API server (docs/m3-contracts.md section 6.1)")
+    p_serve.add_argument("--host", default="0.0.0.0")
+    p_serve.add_argument("--port", type=int, default=8080)
+    p_serve.add_argument("--workers", type=int, default=1)
+    p_serve.set_defaults(func=_cmd_serve)
+
+    p_updater_server = sub.add_parser(
+        "updater-server", help="run the updater's control API (docs/m3-contracts.md section 6.3)"
+    )
+    p_updater_server.add_argument("--host", default="0.0.0.0")
+    p_updater_server.add_argument("--port", type=int, default=8081)
+    p_updater_server.add_argument("--workers", type=int, default=1)
+    p_updater_server.set_defaults(func=_cmd_updater_server)
 
     args = parser.parse_args(argv)
     return args.func(args)
