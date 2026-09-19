@@ -318,3 +318,26 @@ def test_date_at_run2_timestamp_sees_latest(hinfo, compacted):
     state = _state_at(con, paths, 1, t2)
     assert state is not None
     assert state["tags"]["name"] == "Aroma Cafe (renamed run3)"
+
+
+# --------------------------------------------------------------------------
+# integration: the engine's attic reads over the compacted base history
+# (no tiers left: docs/m4-contracts.md sections 3.1 on 5.2's output)
+# --------------------------------------------------------------------------
+
+
+def test_engine_date_over_compacted_history(hinfo, compacted):
+    from osmpq.engine.executor import Engine
+
+    eng = Engine(hinfo.root)
+    assert not eng.manifest.data["history"].get("tiers")
+    r0 = eng.run(f'[out:json][date:"{hinfo.since}"];node({hinfo.move_node_id});out meta;')
+    r1 = eng.run(f'[out:json][date:"2026-09-19T01:15:00Z"];node({hinfo.move_node_id});out meta;')
+    assert [e["version"] for e in r0.elements] == [hinfo.move_node_version]
+    assert [e["version"] for e in r1.elements] == [hinfo.move_node_version + 1]
+    assert r1.elements[0]["tags"]["name"] == "Coffee HOUSE moved"
+    w = eng.run(f'[out:json][date:"2026-09-19T01:15:00Z"];way({hinfo.minor_way_id});out meta geom;')
+    assert [e["version"] for e in w.elements] == [hinfo.minor_way_version]
+    assert w.elements[0].get("geometry")
+    gone = eng.run(f'[out:json][date:"2026-09-19T01:15:00Z"];node({hinfo.delete_node_id});out ids;')
+    assert gone.elements == []
