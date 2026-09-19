@@ -505,12 +505,15 @@ def _write_node_spatial(con, root: str, generation: str, promoted_keys: list[str
     out: dict = {"cells": {}}
     for (cell,) in cells_rows:
         entry: dict = {}
+        untagged_promoted_sql = ", ".join(f'NULL::VARCHAR AS "{k}"' for k in promoted_keys)
         for tagged, suffix in ((True, "true"), (False, "false")):
             tag_cond = "tags IS NOT NULL" if tagged else "tags IS NULL"
+            tags_col = "tags" if tagged else "NULL::MAP(VARCHAR,VARCHAR)"
+            this_promoted_sql = promoted_sql if tagged else untagged_promoted_sql
             select_cols = (
                 f"id, lat_e7, lon_e7, "
-                f"{'tags' if tagged else 'NULL::MAP(VARCHAR,VARCHAR)'} AS tags, "
-                f"{promoted_sql if tagged else ', '.join(f'NULL::VARCHAR AS \"{k}\"' for k in promoted_keys)}, "
+                f"{tags_col} AS tags, "
+                f"{this_promoted_sql}, "
                 f"version, changeset, timestamp, uid, \"user\", hilbert"
             )
             select_sql = (
