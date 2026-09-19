@@ -80,9 +80,13 @@ fn no_dict(b: WriterPropertiesBuilder, path: &[&str], encoding: Encoding) -> Wri
 /// despite being in the M1 brief's suggested DELTA list; see
 /// docs/m1-report.md for the measurements. `version` is a coin flip
 /// either way (tiny column) so it follows the brief's suggestion of DELTA.
-/// Coordinate/bbox/centroid `*_e7` columns and `refs`/`member.ref` measure
-/// smaller under DELTA in every table sampled, so those follow the brief
-/// as given.
+/// Coordinate/bbox/centroid `*_e7` columns measure smaller under DELTA in
+/// every table sampled, so those follow the brief as given. `refs`
+/// (way node ids) and `member.ref` do not -- a referenced id has no
+/// relation to its position in the list or to the containing way's/
+/// relation's id, so PLAIN measures smaller there too (verified against
+/// DuckDB's own choice of PLAIN for the same column); see the per-kind
+/// comments below and docs/m1-report.md.
 fn apply_column_properties(mut b: WriterPropertiesBuilder, kind: TableKind) -> WriterPropertiesBuilder {
     let id_encoding = match kind {
         TableKind::NodeById | TableKind::WayById | TableKind::Relation | TableKind::NodeWay => {
@@ -127,7 +131,15 @@ fn apply_column_properties(mut b: WriterPropertiesBuilder, kind: TableKind) -> W
             for f in ["xmin_e7", "ymin_e7", "xmax_e7", "ymax_e7"] {
                 b = no_dict(b, &[f], Encoding::DELTA_BINARY_PACKED);
             }
-            b = no_dict(b, &["refs", "list", "item"], Encoding::DELTA_BINARY_PACKED);
+            // `refs` node ids: measured *worse* under DELTA_BINARY_PACKED
+            // on the full Minnesota way tables (a node id has no relation
+            // to its position within a way's ref list, so deltas are as
+            // large/random as the raw ids -- 26.1-26.2 B/row PLAIN vs
+            // 27.2-32.5 B/row DELTA measured on the real byid/spatial way
+            // files; matches DuckDB's own PLAIN choice here). This is one
+            // of the few places this module disagrees with the M1 tuning
+            // brief's suggested column list; see docs/m1-report.md.
+            b = no_dict(b, &["refs", "list", "item"], Encoding::PLAIN);
             if kind == TableKind::WaySpatial {
                 b = no_dict(b, &["centroid_lat_e7"], Encoding::DELTA_BINARY_PACKED);
                 b = no_dict(b, &["centroid_lon_e7"], Encoding::DELTA_BINARY_PACKED);
@@ -139,7 +151,11 @@ fn apply_column_properties(mut b: WriterPropertiesBuilder, kind: TableKind) -> W
             }
         }
         TableKind::Relation => {
-            b = no_dict(b, &["members", "list", "item", "ref"], Encoding::DELTA_BINARY_PACKED);
+            // Same reasoning as `refs` above: a member ref has no relation
+            // to its position in the member list or to the relation's id;
+            // PLAIN measured smaller (30.1 vs 41.2 B/row) on the real
+            // Minnesota relation table.
+            b = no_dict(b, &["members", "list", "item", "ref"], Encoding::PLAIN);
             // members.type / members.role keep dictionary encoding
             // (default): low-cardinality strings ("n"/"w"/"r", common
             // role names).
