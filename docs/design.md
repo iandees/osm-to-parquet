@@ -425,6 +425,18 @@ earlier. Modelled as an append-only **`history`** dataset with one row per
   scans compared. Prototype on a regional history extract (osmium
   `extract --with-history` of a small area) before touching the planet.
 
+**M4 amendment (September 2026).** History is stored as Parquet under the
+dataset's own manifest (`history/<gen>/…`, manifest v5 `history` key,
+`docs/m4-contracts.md` section 2), not as an Iceberg table: the engine
+container reads it through the same `read_parquet` + manifest path as the
+current tables with no catalog round trip, the M2 rolling tiers give
+cheap append-only writes per minute, and DuckDB can only write Iceberg
+through a REST catalog. An Iceberg export of the same rows for the
+analytical copy remains an option. Two details differ from the sketch
+above: `valid_to` is an optimization (tier rows leave it NULL and readers
+pick the state at `t` with a window function), and cell moves write a
+tombstone into the vacated cell so cell-scoped scans stay correct.
+
 ### 4.6 Initial load
 
 Runs once on a laptop or a rented node with a few hundred GB of scratch
