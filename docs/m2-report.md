@@ -55,7 +55,11 @@ extent filter doing its job.
 - After three more hours on the compacted generation, all 170 changed
   elements of that round (165 nodes, 5 ways) checked at
   `[date:"2026-09-19T06:28:20Z"]`: **170 of 170**.
-- _harness at the updated timestamp: pending_
+- The full corpus harness against the updated dataset, with the reference
+  pinned to `[date:"2026-09-19T03:25:00Z"]`: **54 of 55 gradable entries**,
+  the same set as M0 and M1 (the miss is Lake Superior's multipolygon
+  extending outside the extract; the same eight entries the reference
+  instance cannot answer remain ungradable).
 
 ## Delta overhead per query
 
