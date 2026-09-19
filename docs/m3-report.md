@@ -46,31 +46,47 @@ Findings that changed the design during the milestone:
 
 | item | result |
 | --- | --- |
-| unit tests | (filled after the areas redesign) |
-| `osmpq areas` on Minnesota (relation areas + way index) | (filled after the areas redesign) |
-| harness at the dataset timestamp | (filled after the areas redesign; the pre-redesign run is in section 3) |
-| `is_in` at a downtown Minneapolis point, cold | (filled after the areas redesign) |
-| `node(around:500)` from 50 cafés, cold | 0.11 s, 6 files, 110 elements |
-| `area[name="Minneapolis"]->.a; way[highway=primary](area.a)` cold | (filled after the areas redesign) |
+| unit tests | 563 passed (M0–M3), `python3 -m pytest -q`, 66 s |
+| `osmpq areas` on Minnesota | 136 s wall clock; 9,919 relation areas in 150 cells, 43.2 MB of polygon files + 0.67 MB index; way-area index 93,089 closed ways, 6.1 MB; `osmpq validate` clean. (The first, wrong rule had produced 1,021,803 stored areas in 354 MB in 462 s.) |
+| harness at the dataset timestamp | 69 of 80 query × bbox rows pass; all 11 others are explained in section 3. Of the 17 new tier-2 entries, 15 pass and 2 differ for documented reasons (39, 43) |
+| `is_in(44.9778,-93.2650)` cold | 0.47 s, 10 files, 6 areas (Minneapolis, Minnesota, Hennepin County, Metropolitan Council, Central, Downtown West) |
+| `node(id:…); is_in` cold | 0.51 s, 10 files, 9 elements: the 2 closed ways containing the node printed as ways, 7 relation areas |
+| `node(around:500)` from 50 cafés, cold | 0.07 s, 2 files, 110 elements |
+| `area[name="Minneapolis"]->.a; node[amenity=cafe](area.a)` cold | 0.10 s, 9 files, 186 elements (reference: 186) |
+| `area[name="Minneapolis"]->.a; way[highway=primary](area.a)` cold | 0.24 s, 15 files, 652 elements (reference: 652; the three river bridges with only boundary vertices are correctly excluded) |
+| `area[name="Minneapolis"]->.a; rel[route=bus](area.a)` cold | 1.95 s, 128 files, 236 elements (reference: 236). Member geometry is resolved for the 236 tag-filtered candidates only; resolving it for every relation in the area's cells, as the first version did, exceeded the default 512 MB `[maxsize:]` |
 | server limits | third concurrent query from one IP: HTTP 429 in 0.08 s while the first two ran (35 s and 54 s); `/api/status` showed `Rate limit: 2`, `0 slots available now.` and both running queries as `<id> <maxsize> <timeout> <start>`; `kill_my_queries` interrupts a running query (tested in `tests/test_server_limits.py`) |
 | manifest refresh | `osmpq updater-server` applied 5 diffs per `POST /run` on a copy of the M2 dataset (manifest 25 → 26 → 27, timestamp 17:00:36Z → 17:05:41Z); a running `osmpq serve` with a 5 s refresh interval reported the new timestamp on `/api/timestamp`, `/healthz` and `X-OSMPQ-Manifest` without restart |
 | updater on `s3://` | full `run_once` through `LocalStore` on a fixture root and the S3 write path through `botocore.stub.Stubber` (tests); the real bucket is left to the runbook |
 | image | the docker daemon is unavailable in the sandbox, so `docker build` was not run; each step was exercised by hand: `pip install .` into a clean venv gives a working CLI, extensions install into the image's HOME at build time, and `LOAD spatial; LOAD httpfs` succeeds with the network disabled |
 | deployment code | `tsc --noEmit` clean; 30 pure-function vitest tests; 4 Workers-runtime tests (Miniflare) for routing, admin auth and the scheduler round trip; container-backed routes cannot run without Docker |
 
-## 3. Harness before the areas redesign
+## 3. Harness rows that do not pass
 
 Full corpus (80 query × bbox rows) against the cached reference answers,
-served from the base dataset with the first areas implementation:
-67 of 80 rows pass. The 13 non-passing rows:
+served from the base dataset with the final areas implementation:
 
 | rows | cause |
 | --- | --- |
+| 04 `highway=residential` (6 bboxes), 26, 28 | reference unavailable (out of memory / dispatcher timeout on the mirror), as in M0–M2; ungradable |
 | 06 `natural=water` at `duluth_harbor` | pre-existing: the reference returns Lake Superior nodes outside the extract |
-| 26, 28 | reference unavailable (dispatcher timeout / OOM), as in M0–M2 |
-| 37 `way[highway=primary](area.a)` | 3 extra bridges: `ST_Intersects` instead of any-vertex-inside (fixed by the redesign) |
-| 39 `is_in` | reference returns closed ways as `way` elements, we returned `area` ids; 7 relation areas (United States, timezones, CONUS, …) extend beyond the extract (documented) |
-| 40 `way(pivot.a)` | the corpus query lacked a bbox and the reference is worldwide; fixed the query, now passes |
-| 43 `(changed:"a","b")` | 19 vs 16 ways: attic-only difference (documented) |
+| 39 `is_in` | 5 relation areas missing (United States, America/Chicago timezone, Contiguous United States, UTC−06:00, Minneapolis–Saint Paul): their rings leave the Minnesota extract, so they cannot be assembled; everything else (2 closed ways as `way` elements, 7 relation areas) matches |
+| 43 `(changed:"a","b")` | 19 vs 16 ways: attic-only difference (elements edited again after `b`, or changed through node edits) |
 
-Every other tier-2 entry (33–36, 38, 41, 42, 44–49) passes.
+Rows fixed during the milestone: 37 (bridges, any-vertex rule), 40 (the
+corpus query needed a bbox because the reference is worldwide), the
+`out count` `areas` tag on 41/42/45/48.
+
+## 4. Follow-ups
+
+- **`area[...]` by tag without a bbox at planet scale.** The way-area
+  index (closed ways with `name`/`ref`/`admin_level`/`boundary`/`place`)
+  is 6 MB for Minnesota; the planet's would be around a gigabyte, too much
+  to scan per query. Sort a copy by `name` (row-group pruning makes
+  `area[name=X]` a one-row-group read) or keep only admin/place ways.
+- **`(changed:a,b)`** needs attic data (M4) to match the reference.
+- **Relation areas at an extract's edge** are absent; the planet build
+  does not have this problem.
+- **`osmpq manifest`** does not print the way-area index yet.
+- Compaction rewrites the way-area index in full (6 MB here; fine until
+  the planet, where it joins the byid-rewrite concern from M2).

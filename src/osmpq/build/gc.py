@@ -39,6 +39,8 @@ def _referenced_paths(man: dict) -> set[str]:
     areas = man.get("areas") or {}
     if areas.get("index"):
         paths.add(areas["index"]["path"])
+    if areas.get("way_index"):
+        paths.add(areas["way_index"]["path"])
     for entry in (areas.get("cells") or {}).values():
         if "path" in entry:
             paths.add(entry["path"])

@@ -315,6 +315,11 @@ def _relation_candidate_geom_table(ctx, q) -> Optional[str]:
     a relation's geometry by id if that id is actually a candidate row)."""
     if "relation" not in q.types:
         return None
+    base_tbl = getattr(ctx, "current_base_table", None)
+    if base_tbl is not None:
+        # The planner materialized this query's filtered candidates before
+        # calling predicates: resolve member geometry for those only.
+        return relation_geometry_table(ctx, f"SELECT * FROM {base_tbl} WHERE type = 'relation'")
     bbox = _effective_bbox_for_query(ctx, q)
     cand_sql, nfiles = sources.build_relation_spatial_select(ctx.con, ctx.manifest, bbox, [], None, ctx.promoted_keys)
     ctx.files_read += nfiles

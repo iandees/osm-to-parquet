@@ -213,14 +213,22 @@ def _way_polygon_expr(geom_expr: str) -> str:
 
 
 def _any_vertex_within_sql(geom_expr: str, poly_expr: str) -> str:
-    """9.3 / 9 fact 4: "any vertex ST_Within", never ST_Intersects.
-    `ST_Points` reduces a LINESTRING, a GEOMETRYCOLLECTION (a relation's
-    member nodes + member way linestrings) or a plain POINT alike to a
-    MULTIPOINT of every vertex; `ST_Dump` explodes that into rows so each
-    vertex can be tested independently."""
+    """9.3 / 9 fact 4: a way (or a relation's member geometry) matches when
+    at least one of its *vertices* lies strictly inside the polygon:
+    neither a segment crossing the boundary nor a vertex sitting on it
+    counts (city boundaries routinely share nodes with the roads along
+    them). `ST_Points` reduces a LINESTRING, a GEOMETRYCOLLECTION (a
+    relation's member nodes + member way linestrings) or a POINT alike to
+    a MULTIPOINT of every vertex. The cheap `ST_Intersects` test runs
+    first; only rows that pass it pay for removing the boundary vertices
+    (`ST_Difference` with the polygon's boundary) and re-testing. Set-based
+    per row: exploding vertices into rows inside a correlated subquery ran
+    out of memory on a few hundred bus routes."""
+    pts = f"ST_Points({geom_expr})"
     return (
-        f"EXISTS (SELECT 1 FROM UNNEST(ST_Dump(ST_Points({geom_expr}))) AS __pv(pt) "
-        f"WHERE ST_Within(__pv.pt.geom, {poly_expr}))"
+        f"(CASE WHEN ST_Intersects({pts}, {poly_expr}) "
+        f"THEN ST_Intersects(ST_Difference({pts}, ST_Boundary({poly_expr})), {poly_expr}) "
+        f"ELSE FALSE END)"
     )
 
 
@@ -463,6 +471,11 @@ def _relation_candidate_geometry(ctx, area_bbox: Optional[BBox]) -> Optional[str
     except Exception:
         _warn_once(ctx, "relation geometry (geofilters) is not available; using a bbox test for (area)/(pivot)/is_in on relations")
         return None
+    base_tbl = getattr(ctx, "current_base_table", None)
+    if base_tbl is not None:
+        # The planner materialized this query's (tag/bbox/id filtered)
+        # candidates: resolve member geometry for those relations only.
+        return relation_geometry_table(ctx, f"SELECT * FROM {base_tbl} WHERE type = 'relation'")
     rel_sql, nfiles = sources.build_relation_spatial_select(ctx.con, ctx.manifest, area_bbox, [], None, ctx.promoted_keys)
     ctx.files_read += nfiles
     return relation_geometry_table(ctx, rel_sql)
@@ -476,7 +489,13 @@ def _node_match_sql(alias: str, geom_tbl: str) -> str:
 
 
 def _way_match_sql(ctx, alias: str, geom_tbl: str) -> str:
-    _warn_once(ctx, "way geometry is unavailable for some ways; falling back to a bbox overlap test for (area)/(pivot)/is_in")
+    base_tbl = getattr(ctx, "current_base_table", None)
+    if base_tbl is not None:
+        n_null = ctx.con.execute(
+            f"SELECT count(*) FROM {base_tbl} WHERE type = 'way' AND geometry IS NULL"
+        ).fetchone()[0]
+        if n_null:
+            _warn_once(ctx, f"way geometry is unavailable for {n_null} way(s); falling back to a bbox overlap test for (area)/(pivot)/is_in")
     vertex_test = _any_vertex_within_sql(f"{alias}.geometry", "g.geometry")
     return (
         f"({alias}.type = 'way' AND ("

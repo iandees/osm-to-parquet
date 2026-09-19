@@ -78,6 +78,9 @@ class Context:
     # (pivot) filters, is_in, map_to_area): Overpass then adds an `areas`
     # tag to every `out count` element, and omits it otherwise.
     areas_used: bool = False
+    # Set while hook predicates run for a query: the TEMP TABLE holding
+    # that query's candidate rows (see execute_query). None otherwise.
+    current_base_table: Optional[str] = None
     _counter: "count" = field(default_factory=lambda: count(1))
 
     def fresh_name(self, prefix: str) -> str:
@@ -267,9 +270,20 @@ def execute_query(ctx: Context, q: Query) -> None:
             selects.append(sql)
         base_select = "\nUNION ALL\n".join(selects)
 
-    preds = _hook_predicates(ctx, q, "__q")
-    if preds:
-        base_select = f"SELECT * FROM ({base_select}) __q WHERE " + " AND ".join(f"({p})" for p in preds)
+    if any(type(f) in hooks.FILTER_HOOKS for f in q.filters):
+        # Materialize the candidate rows first (bbox/tag/id filtered), so
+        # hook predicates that need candidate-derived geometry (relations'
+        # member geometry for (around)/(poly)/(area)) resolve it for these
+        # rows only, through `ctx.current_base_table`, instead of every
+        # relation in the query's cells.
+        base_tbl = ctx.fresh_name("qbase")
+        ctx.con.execute(f"CREATE TEMP TABLE {base_tbl} AS {base_select}")
+        ctx.current_base_table = base_tbl
+        try:
+            preds = _hook_predicates(ctx, q, "__q")
+        finally:
+            ctx.current_base_table = None
+        base_select = f"SELECT * FROM {base_tbl} __q WHERE " + " AND ".join(f"({p})" for p in preds)
     setops.materialize(ctx.con, q.output_set, base_select)
 
 
