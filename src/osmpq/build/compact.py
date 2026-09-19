@@ -1,0 +1,736 @@
+"""``osmpq compact <root>``: docs/m2-contracts.md section 6.
+
+Folds every present delta tier into a new base generation: touched spatial
+cells and byid parts are rewritten (base rows minus the touched-id shadow,
+plus the newest tier's live delta rows), untouched files are hardlinked;
+``node_way``/``member`` indexes and the row-group index are rebuilt; a new
+manifest v3 is written with ``deltas: {}``.
+
+Reads the manifest as plain JSON (``json.load``) rather than through
+``osmpq.layout.manifest.Manifest`` so this module does not depend on that
+dataclass gaining v3 fields, and writes the new manifest the same way
+(copy the loaded dict, edit the fields that changed, dump it).
+
+Everything streams through DuckDB (``COPY ... TO parquet`` / filtered scans,
+never ``fetchall`` of a whole table) so memory stays bounded regardless of
+dataset size; delta tiers themselves are assumed small (m2-contracts.md
+section 3), so they are read directly with plain ``read_parquet`` calls
+rather than chunked.
+"""
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import os
+import shutil
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+from osmpq.build import common
+from osmpq.build import rowgroups as rowgroups_mod
+
+TIER_ORDER = ["hour", "day", "week"]  # precedence high (0) to low
+
+NODE_SPATIAL_ROW_GROUP = 100_000
+NODE_BYID_ROW_GROUP = 64_000
+WAY_BYID_ROW_GROUP_BYTES = 1_000_000
+WAY_SPATIAL_ROW_GROUP_BYTES = 1_500_000
+RELATION_ROW_GROUP = 100_000
+INDEX_ROW_GROUP = 100_000
+
+DEFAULT_PROMOTED_KEYS = [
+    "amenity", "shop", "highway", "building", "name", "natural",
+    "landuse", "leisure", "railway", "waterway", "place", "tourism",
+]
+
+_META_COLS = 'version, changeset, timestamp, uid, "user"'
+
+
+def _log(msg: str) -> None:
+    common.log("osmpq compact", msg)
+
+
+@dataclass
+class CompactOptions:
+    root: str
+    generation: Optional[str] = None
+    threads: Optional[int] = None
+    memory_limit: Optional[str] = None
+    tmpdir: Optional[str] = None
+
+
+# --------------------------------------------------------------------------
+# column lists (physical schemas -- see docs/m0-contracts.md section 4 and
+# docs/m1-contracts.md sections 3-4 for base; docs/m2-contracts.md section 3
+# for the delta augmentation)
+# --------------------------------------------------------------------------
+
+
+def _node_spatial_cols(promoted_sql: str) -> str:
+    return f"id, lat_e7, lon_e7, tags, {promoted_sql}, {_META_COLS}, hilbert"
+
+
+def _node_byid_cols(promoted_sql: str) -> str:
+    return f"id, lat_e7, lon_e7, tags, {promoted_sql}, {_META_COLS}, cell, hilbert"
+
+
+def _way_spatial_cols(promoted_sql: str) -> str:
+    return (
+        f"id, refs, tags, {promoted_sql}, {_META_COLS}, "
+        f"xmin_e7, ymin_e7, xmax_e7, ymax_e7, geometry, is_closed, is_area, "
+        f"centroid_lat_e7, centroid_lon_e7, cell, hilbert"
+    )
+
+
+def _way_byid_cols(promoted_sql: str) -> str:
+    return (
+        f"id, refs, tags, {promoted_sql}, {_META_COLS}, "
+        f"xmin_e7, ymin_e7, xmax_e7, ymax_e7, is_closed, is_area, cell, hilbert"
+    )
+
+
+def _relation_spatial_cols(promoted_sql: str) -> str:
+    return (
+        f"id, members, tags, {promoted_sql}, {_META_COLS}, "
+        f"xmin_e7, ymin_e7, xmax_e7, ymax_e7, geometry, "
+        f"centroid_lat_e7, centroid_lon_e7, cell, hilbert"
+    )
+
+
+def _relation_byid_cols(promoted_sql: str) -> str:
+    return f"id, members, tags, {promoted_sql}, {_META_COLS}, xmin_e7, ymin_e7, xmax_e7, ymax_e7, cell"
+
+
+# --------------------------------------------------------------------------
+# small filesystem / parquet-footer helpers (mirrors builder.py's, kept
+# local so this module has no coupling to another agent's file)
+# --------------------------------------------------------------------------
+
+
+def _esc(path: Path) -> str:
+    return str(path).replace("'", "''")
+
+
+def _place_file(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        dst.unlink()
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def _parquet_id_range(path: Path, col: str = "id") -> tuple[Optional[int], Optional[int]]:
+    import pyarrow.parquet as pq
+
+    md = pq.ParquetFile(str(path)).metadata
+    schema = md.schema
+    idx = next((i for i in range(len(schema)) if schema.column(i).name == col), None)
+    if idx is None:
+        return None, None
+    lo = hi = None
+    for rg in range(md.num_row_groups):
+        stats = md.row_group(rg).column(idx).statistics
+        if stats is None or not stats.has_min_max:
+            continue
+        lo = stats.min if lo is None else min(lo, stats.min)
+        hi = stats.max if hi is None else max(hi, stats.max)
+    return (int(lo) if lo is not None else None), (int(hi) if hi is not None else None)
+
+
+# --------------------------------------------------------------------------
+# delta reading: tier-precedence winners, touched cells
+# --------------------------------------------------------------------------
+
+
+def _delta_paths(man_deltas: dict, table: str, kind: str) -> list[tuple[str, int]]:
+    out = []
+    for rank, tier in enumerate(TIER_ORDER):
+        tier_info = man_deltas.get(tier)
+        if not tier_info:
+            continue
+        files = (tier_info.get("files") or {}).get(table)
+        if not files:
+            continue
+        path = files.get(kind)
+        if path:
+            out.append((path, rank))
+    return out
+
+
+def _tombstone_paths(man_deltas: dict) -> list[str]:
+    out = []
+    for tier in TIER_ORDER:
+        tier_info = man_deltas.get(tier)
+        if tier_info and (tier_info.get("files") or {}).get("tombstones"):
+            out.append(tier_info["files"]["tombstones"])
+    return out
+
+
+def _build_winners(con, root: Path, man_deltas: dict, table: str, kind: str, view_name: str) -> bool:
+    """Materializes ``view_name``: one row per touched (table, kind) id,
+    newest tier wins, delta file columns as-is (incl. deleted/prev_cell/
+    seq). Returns False (and leaves no table) if no tier has this file."""
+    paths = _delta_paths(man_deltas, table, kind)
+    con.execute(f"DROP TABLE IF EXISTS {view_name}")
+    if not paths:
+        return False
+    parts = [f"SELECT *, {rank} AS __tier_rank FROM read_parquet('{_esc(root / p)}')" for p, rank in paths]
+    union_sql = " UNION ALL BY NAME ".join(parts)
+    con.execute(f"""
+        CREATE TABLE {view_name} AS
+        SELECT * EXCLUDE (__rn, __tier_rank) FROM (
+            SELECT *, row_number() OVER (PARTITION BY id ORDER BY __tier_rank ASC) AS __rn
+            FROM ({union_sql})
+        ) WHERE __rn = 1
+    """)
+    return True
+
+
+def _touched_cells(con, root: Path, man_deltas: dict, table: str, winners_view: str, has_spatial: bool) -> set[str]:
+    cells: set[str] = set()
+    if has_spatial:
+        rows = con.execute(f"""
+            SELECT DISTINCT cell FROM {winners_view}
+            UNION SELECT DISTINCT prev_cell FROM {winners_view} WHERE prev_cell IS NOT NULL
+        """).fetchall()
+        cells.update(r[0] for r in rows)
+    for p in _tombstone_paths(man_deltas):
+        rows = con.execute(
+            f"SELECT DISTINCT prev_cell FROM read_parquet('{_esc(root / p)}') "
+            f"WHERE type = '{table}' AND prev_cell IS NOT NULL"
+        ).fetchall()
+        cells.update(r[0] for r in rows)
+    cells.discard(None)
+    return cells
+
+
+# --------------------------------------------------------------------------
+# spatial rewrite: node (tagged/untagged split) and flat (way/relation)
+# --------------------------------------------------------------------------
+
+
+def _compact_node_spatial(
+    con, root: Path, old_cells: dict, new_generation: str, promoted_sql: str,
+    winners_view: str, has_winners: bool, touched_cells: set[str],
+) -> tuple[dict, int]:
+    all_cells = set(old_cells) | touched_cells
+    new_cells: dict = {}
+    total_bytes = 0
+    cols = _node_spatial_cols(promoted_sql)
+    for cell in sorted(all_cells):
+        old_entry = old_cells.get(cell, {})
+        if cell not in touched_cells:
+            new_entry = {}
+            for part, suffix in (("tagged", "true"), ("untagged", "false")):
+                if part in old_entry:
+                    old_path = root / old_entry[part]["path"]
+                    rel = f"spatial/{new_generation}/node/cell={cell}/tagged={suffix}/part-0.parquet"
+                    _place_file(old_path, root / rel)
+                    new_entry[part] = {"path": rel, "rows": old_entry[part]["rows"], "bytes": old_entry[part]["bytes"]}
+                    total_bytes += old_entry[part]["bytes"]
+            if new_entry:
+                new_cells[cell] = new_entry
+            continue
+
+        base_parts = []
+        for part in ("tagged", "untagged"):
+            if part in old_entry:
+                p = root / old_entry[part]["path"]
+                base_parts.append(f"SELECT {cols} FROM read_parquet('{_esc(p)}') WHERE id NOT IN (SELECT id FROM {winners_view})")
+        if has_winners:
+            base_parts.append(f"SELECT {cols} FROM {winners_view} WHERE cell = '{cell}' AND NOT deleted")
+        if not base_parts:
+            continue
+        con.execute(f"CREATE OR REPLACE TABLE _cell_combined AS {' UNION ALL '.join(base_parts)}")
+        new_entry = {}
+        for tagged, suffix, cond in ((True, "true", "tags IS NOT NULL"), (False, "false", "tags IS NULL")):
+            sel = f"SELECT * FROM _cell_combined WHERE {cond} ORDER BY hilbert, id"
+            rel = f"spatial/{new_generation}/node/cell={cell}/tagged={suffix}/part-0.parquet"
+            path = root / rel
+            rows, size = common.copy_to_parquet(con, sel, path, row_group_size=NODE_SPATIAL_ROW_GROUP)
+            if rows == 0:
+                path.unlink()
+                continue
+            new_entry[("tagged" if tagged else "untagged")] = {"path": rel, "rows": rows, "bytes": size}
+            total_bytes += size
+        con.execute("DROP TABLE _cell_combined")
+        if new_entry:
+            new_cells[cell] = new_entry
+    return {"cells": new_cells}, total_bytes
+
+
+def _compact_flat_spatial(
+    con, root: Path, old_cells: dict, table: str, new_generation: str,
+    spatial_cols: str, winners_view: str, has_winners: bool,
+    touched_cells: set[str], row_group_kwargs: dict,
+) -> tuple[dict, int]:
+    all_cells = set(old_cells) | touched_cells
+    new_cells: dict = {}
+    total_bytes = 0
+    for cell in sorted(all_cells):
+        old_entry = old_cells.get(cell)
+        if cell not in touched_cells:
+            if old_entry:
+                old_path = root / old_entry["path"]
+                rel = f"spatial/{new_generation}/{table}/cell={cell}/part-0.parquet"
+                _place_file(old_path, root / rel)
+                new_cells[cell] = {"path": rel, "rows": old_entry["rows"], "bytes": old_entry["bytes"], "bbox": old_entry.get("bbox")}
+                total_bytes += old_entry["bytes"]
+            continue
+
+        parts = []
+        if old_entry:
+            p = root / old_entry["path"]
+            parts.append(f"SELECT {spatial_cols} FROM read_parquet('{_esc(p)}') WHERE id NOT IN (SELECT id FROM {winners_view})")
+        if has_winners:
+            parts.append(f"SELECT {spatial_cols} FROM {winners_view} WHERE cell = '{cell}' AND NOT deleted")
+        if not parts:
+            continue
+        sel = " UNION ALL ".join(parts) + " ORDER BY hilbert, id"
+        rel = f"spatial/{new_generation}/{table}/cell={cell}/part-0.parquet"
+        path = root / rel
+        rows, size = common.copy_to_parquet(con, sel, path, **row_group_kwargs)
+        if rows == 0:
+            path.unlink()
+            continue
+        bbox = con.execute(
+            f"SELECT min(ymin_e7)/1e7, min(xmin_e7)/1e7, max(ymax_e7)/1e7, max(xmax_e7)/1e7 "
+            f"FROM read_parquet('{_esc(path)}') WHERE xmin_e7 IS NOT NULL"
+        ).fetchone()
+        new_cells[cell] = {"path": rel, "rows": rows, "bytes": size, "bbox": [float(x) if x is not None else None for x in bbox]}
+        total_bytes += size
+    return {"cells": new_cells}, total_bytes
+
+
+# --------------------------------------------------------------------------
+# byid rewrite (node/way/relation, all id-ranged parts)
+# --------------------------------------------------------------------------
+
+
+def _assign_target_parts(con, name: str, old_parts: list[dict], winners_view: str) -> str:
+    """Creates and returns ``{name}_assign``: winners_view's rows plus a
+    ``__target_part`` column (the part index each winner id belongs to --
+    the part whose [min_id, max_id] contains it, else the nearest lower
+    part, else the first part)."""
+    parts_df = f"{name}_parts_df"
+    con.execute(f"DROP TABLE IF EXISTS {parts_df}")
+    con.execute(f"CREATE TABLE {parts_df} (idx INTEGER, min_id BIGINT, max_id BIGINT)")
+    con.executemany(
+        f"INSERT INTO {parts_df} VALUES (?, ?, ?)",
+        [(i, p["min_id"], p["max_id"]) for i, p in enumerate(old_parts)],
+    )
+    assign_name = f"{name}_assign"
+    con.execute(f"""
+        CREATE OR REPLACE TABLE {assign_name} AS
+        SELECT w.*,
+          COALESCE(
+            (SELECT idx FROM {parts_df} WHERE w.id BETWEEN min_id AND max_id),
+            (SELECT idx FROM {parts_df} WHERE max_id < w.id ORDER BY max_id DESC LIMIT 1),
+            (SELECT idx FROM {parts_df} ORDER BY idx ASC LIMIT 1)
+          ) AS __target_part
+        FROM {winners_view} w
+    """)
+    return assign_name
+
+
+def _compact_byid_table(
+    con, root: Path, old_parts: list[dict], table: str, new_generation: str,
+    byid_cols: str, winners_view: str, has_winners: bool, row_group_kwargs: dict,
+) -> tuple[list[dict], int]:
+    if not has_winners:
+        new_parts, total_bytes = [], 0
+        for i, p in enumerate(old_parts):
+            rel = f"byid/{new_generation}/{table}/part-{i:05d}.parquet"
+            _place_file(root / p["path"], root / rel)
+            new_parts.append({"path": rel, "min_id": p["min_id"], "max_id": p["max_id"], "rows": p["rows"], "bytes": p["bytes"]})
+            total_bytes += p["bytes"]
+        return new_parts, total_bytes
+
+    if not old_parts:
+        rel = f"byid/{new_generation}/{table}/part-00000.parquet"
+        path = root / rel
+        sel = f"SELECT {byid_cols} FROM {winners_view} WHERE NOT deleted ORDER BY id"
+        rows, size = common.copy_to_parquet(con, sel, path, **row_group_kwargs)
+        if rows == 0:
+            path.unlink()
+            return [], 0
+        min_id, max_id = _parquet_id_range(path)
+        return [{"path": rel, "min_id": min_id, "max_id": max_id, "rows": rows, "bytes": size}], size
+
+    assign_name = _assign_target_parts(con, f"_{table}_byid", old_parts, winners_view)
+    touched_idxs = {r[0] for r in con.execute(f"SELECT DISTINCT __target_part FROM {assign_name}").fetchall()}
+
+    new_parts, total_bytes = [], 0
+    for i, p in enumerate(old_parts):
+        rel = f"byid/{new_generation}/{table}/part-{i:05d}.parquet"
+        new_path = root / rel
+        if i not in touched_idxs:
+            _place_file(root / p["path"], new_path)
+            new_parts.append({"path": rel, "min_id": p["min_id"], "max_id": p["max_id"], "rows": p["rows"], "bytes": p["bytes"]})
+            total_bytes += p["bytes"]
+            continue
+        old_path = root / p["path"]
+        sel = (
+            f"SELECT {byid_cols} FROM read_parquet('{_esc(old_path)}') "
+            f"WHERE id NOT IN (SELECT id FROM {winners_view}) "
+            f"UNION ALL "
+            f"SELECT {byid_cols} FROM {assign_name} WHERE __target_part = {i} AND NOT deleted "
+            f"ORDER BY id"
+        )
+        rows, size = common.copy_to_parquet(con, sel, new_path, **row_group_kwargs)
+        if rows == 0:
+            new_path.unlink()
+            continue
+        min_id, max_id = _parquet_id_range(new_path)
+        new_parts.append({"path": rel, "min_id": min_id, "max_id": max_id, "rows": rows, "bytes": size})
+        total_bytes += size
+    con.execute(f"DROP TABLE IF EXISTS {assign_name}")
+    con.execute(f"DROP TABLE IF EXISTS _{table}_byid_parts_df")
+    return new_parts, total_bytes
+
+
+# --------------------------------------------------------------------------
+# node_way index: rebuild only the parts covering touched node ids
+# --------------------------------------------------------------------------
+
+
+def _hardlink_index_parts(root: Path, old_parts: list[dict], new_generation: str, index_name: str) -> tuple[list[dict], int]:
+    new_parts, total_bytes = [], 0
+    for i, p in enumerate(old_parts):
+        rel = f"index/{new_generation}/{index_name}/part-{i:05d}.parquet"
+        _place_file(root / p["path"], root / rel)
+        new_parts.append({"path": rel, "min_id": p.get("min_id"), "max_id": p.get("max_id"), "rows": p["rows"], "bytes": p["bytes"]})
+        total_bytes += p["bytes"]
+    return new_parts, total_bytes
+
+
+def _compact_node_way_index(
+    con, root: Path, old_node_way_parts: list[dict], old_way_byid_parts: list[dict],
+    new_way_byid_manifest: list[dict], new_generation: str,
+    has_way_winners: bool, way_winners_view: str, has_node_winners: bool, node_winners_view: str,
+) -> tuple[list[dict], int]:
+    if not old_node_way_parts:
+        return [], 0  # nothing to rebuild from (m1-contracts.md: "may be an empty list")
+    if not has_way_winners and not has_node_winners:
+        return _hardlink_index_parts(root, old_node_way_parts, new_generation, "node_way")
+
+    old_way_paths = [str(root / p["path"]) for p in old_way_byid_parts]
+    new_way_paths = [str(root / p["path"]) for p in new_way_byid_manifest]
+
+    con.execute("DROP TABLE IF EXISTS _touched_node_ids")
+    union_parts = []
+    if has_way_winners and old_way_paths:
+        union_parts.append(
+            f"SELECT unnest(refs) AS node_id FROM read_parquet({old_way_paths!r}) "
+            f"WHERE id IN (SELECT id FROM {way_winners_view}) AND refs IS NOT NULL"
+        )
+    if has_way_winners:
+        union_parts.append(f"SELECT unnest(refs) AS node_id FROM {way_winners_view} WHERE NOT deleted AND refs IS NOT NULL")
+    if has_node_winners:
+        union_parts.append(f"SELECT id AS node_id FROM {node_winners_view}")
+    if not union_parts:
+        return _hardlink_index_parts(root, old_node_way_parts, new_generation, "node_way")
+    con.execute(f"CREATE TABLE _touched_node_ids AS SELECT DISTINCT node_id FROM ({' UNION ALL '.join(union_parts)})")
+    n_touched = con.execute("SELECT count(*) FROM _touched_node_ids").fetchone()[0]
+    if n_touched == 0:
+        con.execute("DROP TABLE _touched_node_ids")
+        return _hardlink_index_parts(root, old_node_way_parts, new_generation, "node_way")
+
+    if new_way_paths:
+        con.execute(f"""
+            CREATE TABLE _new_node_way_pairs AS
+            SELECT w.node_id, w.way_id FROM (
+                SELECT unnest(refs) AS node_id, id AS way_id FROM read_parquet({new_way_paths!r}) WHERE refs IS NOT NULL
+            ) w JOIN _touched_node_ids t ON t.node_id = w.node_id
+        """)
+    else:
+        con.execute("CREATE TABLE _new_node_way_pairs (node_id BIGINT, way_id BIGINT)")
+
+    parts_df = "_node_way_parts_df"
+    con.execute(f"DROP TABLE IF EXISTS {parts_df}")
+    con.execute(f"CREATE TABLE {parts_df} (idx INTEGER, min_id BIGINT, max_id BIGINT)")
+    con.executemany(
+        f"INSERT INTO {parts_df} VALUES (?, ?, ?)",
+        [(i, p["min_id"], p["max_id"]) for i, p in enumerate(old_node_way_parts)],
+    )
+    con.execute(f"""
+        CREATE TABLE _touched_node_target AS
+        SELECT t.node_id,
+          COALESCE(
+            (SELECT idx FROM {parts_df} WHERE t.node_id BETWEEN min_id AND max_id),
+            (SELECT idx FROM {parts_df} WHERE max_id < t.node_id ORDER BY max_id DESC LIMIT 1),
+            (SELECT idx FROM {parts_df} ORDER BY idx ASC LIMIT 1)
+          ) AS target_part
+        FROM _touched_node_ids t
+    """)
+    touched_idxs = {r[0] for r in con.execute("SELECT DISTINCT target_part FROM _touched_node_target").fetchall()}
+
+    new_parts, total_bytes = [], 0
+    for i, p in enumerate(old_node_way_parts):
+        rel = f"index/{new_generation}/node_way/part-{i:05d}.parquet"
+        new_path = root / rel
+        if i not in touched_idxs:
+            _place_file(root / p["path"], new_path)
+            new_parts.append({"path": rel, "min_id": p["min_id"], "max_id": p["max_id"], "rows": p["rows"], "bytes": p["bytes"]})
+            total_bytes += p["bytes"]
+            continue
+        old_path = str(root / p["path"])
+        sel = f"""
+            SELECT node_id, way_id FROM read_parquet('{old_path.replace(chr(39), chr(39) * 2)}')
+            WHERE node_id NOT IN (SELECT node_id FROM _touched_node_ids)
+            UNION ALL
+            SELECT p2.node_id, p2.way_id FROM _new_node_way_pairs p2
+            JOIN _touched_node_target tt ON tt.node_id = p2.node_id
+            WHERE tt.target_part = {i}
+            ORDER BY node_id, way_id
+        """
+        rows, size = common.copy_to_parquet(con, sel, new_path, row_group_size=INDEX_ROW_GROUP)
+        if rows == 0:
+            new_path.unlink()
+            continue
+        min_id, max_id = _parquet_id_range(new_path, col="node_id")
+        new_parts.append({"path": rel, "min_id": min_id, "max_id": max_id, "rows": rows, "bytes": size})
+        total_bytes += size
+
+    for t in ("_touched_node_ids", "_new_node_way_pairs", parts_df, "_touched_node_target"):
+        con.execute(f"DROP TABLE IF EXISTS {t}")
+    return new_parts, total_bytes
+
+
+# --------------------------------------------------------------------------
+# member index: full rebuild from the new relation state (small)
+# --------------------------------------------------------------------------
+
+
+def _compact_member_index(con, root: Path, relation_byid_manifest: list[dict], new_generation: str) -> tuple[list[dict], int]:
+    if not relation_byid_manifest:
+        return [], 0
+    rel_paths = [str(root / p["path"]) for p in relation_byid_manifest]
+    con.execute(f"""
+        CREATE OR REPLACE TABLE _new_members AS
+        SELECT m.type AS member_type, m.ref AS member_id, r.id AS parent_id, m.role AS role, r.cell AS parent_cell
+        FROM read_parquet({rel_paths!r}) r, UNNEST(r.members) AS t(m)
+    """)
+    total = con.execute("SELECT count(*) FROM _new_members").fetchone()[0]
+    member_manifest, member_bytes = [], 0
+    if total > 0:
+        for k, (lo, hi) in enumerate(common.range_bounds(con, "_new_members", "member_id", total)):
+            cond = common.range_cond("member_id", lo, hi)
+            sel = (
+                f"SELECT member_type, member_id, parent_id, role, parent_cell FROM _new_members "
+                f"WHERE {cond} ORDER BY member_type, member_id, parent_id"
+            )
+            rel = f"index/{new_generation}/member/part-{k:05d}.parquet"
+            path = root / rel
+            rows, size = common.copy_to_parquet(con, sel, path, row_group_size=INDEX_ROW_GROUP)
+            member_manifest.append({"path": rel, "rows": rows, "bytes": size})
+            member_bytes += size
+    con.execute("DROP TABLE _new_members")
+    return member_manifest, member_bytes
+
+
+# --------------------------------------------------------------------------
+# row-group index file lists (mirrors builder.py's private helpers)
+# --------------------------------------------------------------------------
+
+
+def _node_rg_files(node_table_manifest: dict) -> list[dict]:
+    out = []
+    for cell, entry in node_table_manifest["cells"].items():
+        for key, tagged_bool in (("tagged", True), ("untagged", False)):
+            if key in entry:
+                out.append({"rel_path": entry[key]["path"], "cell": cell, "tagged": tagged_bool})
+    return out
+
+
+def _flat_rg_files(table_manifest: dict) -> list[dict]:
+    return [{"rel_path": e["path"], "cell": cell, "tagged": None} for cell, e in table_manifest["cells"].items()]
+
+
+# --------------------------------------------------------------------------
+# top-level orchestration
+# --------------------------------------------------------------------------
+
+
+def compact(opts: CompactOptions) -> dict:
+    t_start = time.time()
+    timer = common.Timer()
+    root = Path(opts.root)
+    manifest_dir = root / "manifest"
+    latest_num = int((manifest_dir / "LATEST").read_text().strip())
+    old_man = json.loads((manifest_dir / f"{latest_num}.json").read_text())
+    old_generation = old_man["generation"]
+    man_deltas = old_man.get("deltas") or {}
+    promoted_keys = list(old_man.get("promoted_keys") or DEFAULT_PROMOTED_KEYS)
+
+    new_generation = opts.generation or f"g{(latest_num + 1):04d}"
+    _log(f"compacting {root} generation {old_generation} -> {new_generation} ...")
+
+    tmpdir = Path(opts.tmpdir) if opts.tmpdir else Path.cwd() / ".osmpq-compact-tmp"
+    tmpdir.mkdir(parents=True, exist_ok=True)
+
+    import duckdb
+
+    db_path = tmpdir / "compact.duckdb"
+    if db_path.exists():
+        db_path.unlink()
+    con = duckdb.connect(str(db_path))
+    con.execute("SET TimeZone='UTC'")
+    if opts.threads:
+        con.execute(f"SET threads={int(opts.threads)}")
+    if opts.memory_limit:
+        con.execute(f"SET memory_limit='{opts.memory_limit}'")
+    con.execute(f"SET temp_directory='{tmpdir.as_posix()}'")
+    con.execute("SET preserve_insertion_order=false")
+    con.execute("INSTALL spatial")
+    con.execute("LOAD spatial")
+
+    promoted_sql = common.promoted_select(promoted_keys)
+    bytes_by_kind = {"spatial": 0, "byid": 0, "index": 0}
+
+    # ---- node -------------------------------------------------------------------
+    has_node_spatial = _build_winners(con, root, man_deltas, "node", "spatial", "node_spatial_winners")
+    has_node_byid = _build_winners(con, root, man_deltas, "node", "byid", "node_byid_winners")
+    node_touched_cells = _touched_cells(con, root, man_deltas, "node", "node_spatial_winners", has_node_spatial)
+    node_table_manifest, node_spatial_bytes = _compact_node_spatial(
+        con, root, old_man.get("tables", {}).get("node", {}).get("cells", {}), new_generation,
+        promoted_sql, "node_spatial_winners", has_node_spatial, node_touched_cells,
+    )
+    bytes_by_kind["spatial"] += node_spatial_bytes
+    _log(f"node spatial: {len(node_touched_cells)} touched cell(s) rewritten in {timer.lap('node_spatial'):.2f}s")
+
+    node_byid_manifest, node_byid_bytes = _compact_byid_table(
+        con, root, old_man.get("byid", {}).get("node", []) or [], "node", new_generation,
+        _node_byid_cols(promoted_sql), "node_byid_winners", has_node_byid, {"row_group_size": NODE_BYID_ROW_GROUP},
+    )
+    bytes_by_kind["byid"] += node_byid_bytes
+    _log(f"node byid: {len(node_byid_manifest)} part(s) in {timer.lap('node_byid'):.2f}s")
+
+    # ---- way ----------------------------------------------------------------------
+    has_way_spatial = _build_winners(con, root, man_deltas, "way", "spatial", "way_spatial_winners")
+    has_way_byid = _build_winners(con, root, man_deltas, "way", "byid", "way_byid_winners")
+    way_touched_cells = _touched_cells(con, root, man_deltas, "way", "way_spatial_winners", has_way_spatial)
+    way_table_manifest, way_spatial_bytes = _compact_flat_spatial(
+        con, root, old_man.get("tables", {}).get("way", {}).get("cells", {}), "way", new_generation,
+        _way_spatial_cols(promoted_sql), "way_spatial_winners", has_way_spatial, way_touched_cells,
+        {"row_group_size_bytes": WAY_SPATIAL_ROW_GROUP_BYTES},
+    )
+    bytes_by_kind["spatial"] += way_spatial_bytes
+    _log(f"way spatial: {len(way_touched_cells)} touched cell(s) rewritten in {timer.lap('way_spatial'):.2f}s")
+
+    old_way_byid_parts = old_man.get("byid", {}).get("way", []) or []
+    way_byid_manifest, way_byid_bytes = _compact_byid_table(
+        con, root, old_way_byid_parts, "way", new_generation,
+        _way_byid_cols(promoted_sql), "way_byid_winners", has_way_byid, {"row_group_size_bytes": WAY_BYID_ROW_GROUP_BYTES},
+    )
+    bytes_by_kind["byid"] += way_byid_bytes
+    _log(f"way byid: {len(way_byid_manifest)} part(s) in {timer.lap('way_byid'):.2f}s")
+
+    # ---- relation -------------------------------------------------------------------
+    has_rel_spatial = _build_winners(con, root, man_deltas, "relation", "spatial", "relation_spatial_winners")
+    has_rel_byid = _build_winners(con, root, man_deltas, "relation", "byid", "relation_byid_winners")
+    rel_touched_cells = _touched_cells(con, root, man_deltas, "relation", "relation_spatial_winners", has_rel_spatial)
+    relation_table_manifest, rel_spatial_bytes = _compact_flat_spatial(
+        con, root, old_man.get("tables", {}).get("relation", {}).get("cells", {}), "relation", new_generation,
+        _relation_spatial_cols(promoted_sql), "relation_spatial_winners", has_rel_spatial, rel_touched_cells,
+        {"row_group_size": RELATION_ROW_GROUP},
+    )
+    bytes_by_kind["spatial"] += rel_spatial_bytes
+    _log(f"relation spatial: {len(rel_touched_cells)} touched cell(s) rewritten in {timer.lap('relation_spatial'):.2f}s")
+
+    relation_byid_manifest, rel_byid_bytes = _compact_byid_table(
+        con, root, old_man.get("byid", {}).get("relation", []) or [], "relation", new_generation,
+        _relation_byid_cols(promoted_sql), "relation_byid_winners", has_rel_byid, {"row_group_size": RELATION_ROW_GROUP},
+    )
+    bytes_by_kind["byid"] += rel_byid_bytes
+    _log(f"relation byid: {len(relation_byid_manifest)} part(s) in {timer.lap('relation_byid'):.2f}s")
+
+    # ---- node_way index ---------------------------------------------------------------
+    node_way_manifest, node_way_bytes = _compact_node_way_index(
+        con, root, old_man.get("index", {}).get("node_way", []) or [], old_way_byid_parts,
+        way_byid_manifest, new_generation, has_way_byid, "way_byid_winners", has_node_byid, "node_byid_winners",
+    )
+    bytes_by_kind["index"] += node_way_bytes
+    _log(f"node_way index: {len(node_way_manifest)} part(s) in {timer.lap('node_way_index'):.2f}s")
+
+    # ---- member index (full rebuild) ---------------------------------------------------
+    member_manifest, member_bytes = _compact_member_index(con, root, relation_byid_manifest, new_generation)
+    bytes_by_kind["index"] += member_bytes
+    _log(f"member index: {sum(p['rows'] for p in member_manifest)} row(s) in {timer.lap('member_index'):.2f}s")
+
+    # ---- row-group index ----------------------------------------------------------------
+    node_rg_path, node_rg_rows = rowgroups_mod.write_rowgroup_index(con, str(root), new_generation, "node", _node_rg_files(node_table_manifest))
+    way_rg_path, way_rg_rows = rowgroups_mod.write_rowgroup_index(con, str(root), new_generation, "way", _flat_rg_files(way_table_manifest))
+    relation_rg_path, relation_rg_rows = rowgroups_mod.write_rowgroup_index(con, str(root), new_generation, "relation", _flat_rg_files(relation_table_manifest))
+    for p in (node_rg_path, way_rg_path, relation_rg_path):
+        bytes_by_kind["index"] += (root / p).stat().st_size
+    _log(
+        f"rowgroup index ({node_rg_rows} node, {way_rg_rows} way, {relation_rg_rows} relation rows) "
+        f"in {timer.lap('rowgroup_index'):.2f}s"
+    )
+
+    # ---- manifest -------------------------------------------------------------------------
+    new_man = copy.deepcopy(old_man)
+    new_man["generation"] = new_generation
+    new_man["manifest_version"] = 3
+    new_man["deltas"] = {}
+    new_man["tables"] = {"node": node_table_manifest, "way": way_table_manifest, "relation": relation_table_manifest}
+    new_man["byid"] = {"node": node_byid_manifest, "way": way_byid_manifest, "relation": relation_byid_manifest}
+    new_man["index"] = {"node_way": node_way_manifest, "member": member_manifest}
+    new_man["rowgroup_index"] = {"node": node_rg_path, "way": way_rg_path, "relation": relation_rg_path}
+
+    n_nodes = sum(p["rows"] for p in node_byid_manifest)
+    n_tagged_nodes = sum(e.get("tagged", {}).get("rows", 0) for e in node_table_manifest["cells"].values())
+    n_ways = sum(p["rows"] for p in way_byid_manifest)
+    n_relations = sum(p["rows"] for p in relation_byid_manifest)
+    old_stats = old_man.get("stats", {})
+    new_man["stats"] = {
+        "nodes": n_nodes,
+        "tagged_nodes": n_tagged_nodes,
+        "ways": n_ways,
+        "relations": n_relations,
+        "leaf_cells": old_stats.get("leaf_cells", len(old_man.get("leaf_cells", []))),
+        "bytes": bytes_by_kind,
+    }
+
+    gen_number = latest_num + 1
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    (manifest_dir / f"{gen_number}.json").write_text(json.dumps(new_man, indent=2, sort_keys=False))
+    (manifest_dir / "LATEST").write_text(str(gen_number))
+    _log(f"wrote manifest/{gen_number}.json and manifest/LATEST")
+    _log(f"done in {time.time() - t_start:.2f}s total")
+
+    con.close()
+    if db_path.exists():
+        db_path.unlink()
+    return new_man
+
+
+# --------------------------------------------------------------------------
+# CLI entry point (coordinator wires this into osmpq.cli)
+# --------------------------------------------------------------------------
+
+
+def compact_main(argv: Optional[list[str]] = None) -> int:
+    p = argparse.ArgumentParser(prog="osmpq compact", description=__doc__)
+    p.add_argument("root")
+    p.add_argument("--generation", default=None)
+    p.add_argument("--threads", type=int, default=None)
+    p.add_argument("--memory-limit", default=None)
+    p.add_argument("--tmpdir", default=None)
+    args = p.parse_args(argv if argv is not None else sys.argv[1:])
+    compact(CompactOptions(
+        root=args.root, generation=args.generation, threads=args.threads,
+        memory_limit=args.memory_limit, tmpdir=args.tmpdir,
+    ))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(compact_main())
