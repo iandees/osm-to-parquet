@@ -120,7 +120,10 @@ def fetch(
     sleep_between: float,
     label: str = "",
 ) -> FetchResult:
-    """POST a query to an Overpass-compatible endpoint, retrying on 429/504."""
+    """POST a query to an Overpass-compatible endpoint, retrying on 429/504
+    and on a transient-looking 200-with-remark runtime error (a shared
+    reference mirror occasionally reports "out of memory" or "timed out"
+    on a query that succeeds moments later under lighter load)."""
     last_exc: Optional[str] = None
     for attempt in range(retries + 1):
         t0 = time.monotonic()
@@ -142,6 +145,16 @@ def fetch(
         content_type = resp.headers.get("content-type", "")
         body = resp.text
         remark = extract_remark(body, content_type)
+        if (
+            resp.status_code == 200
+            and remark is not None
+            and _looks_transient(remark)
+            and attempt < retries
+        ):
+            wait = sleep_between * (2**attempt)
+            last_exc = f"transient runtime error: {remark}"
+            time.sleep(wait)
+            continue
         return FetchResult(
             ok=resp.status_code == 200 and remark is None,
             status_code=resp.status_code,
@@ -159,6 +172,26 @@ def fetch(
         elapsed_ms=elapsed_ms,
         error=last_exc or "exhausted retries",
     )
+
+
+_TRANSIENT_REMARK_MARKERS = (
+    "out of memory",
+    "cannot allocate memory",
+    "timed out",
+    "timeout",
+    "too busy",
+    "try again",
+)
+
+
+def _looks_transient(remark: str) -> bool:
+    """Runtime errors that plausibly reflect momentary load on a shared
+    reference mirror rather than a real problem with the query, so a retry
+    is worth trying. A `[timeout:n]` genuinely exceeded by the query itself
+    is a subset of this (the message is indistinguishable from a busy
+    server), so a couple of retries with backoff is the pragmatic call."""
+    lowered = remark.lower()
+    return any(marker in lowered for marker in _TRANSIENT_REMARK_MARKERS)
 
 
 def extract_remark(body: str, content_type: str) -> Optional[str]:
