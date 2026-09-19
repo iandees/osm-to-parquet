@@ -1,0 +1,30 @@
+{
+  // Config for the Worker-level test only (`vitest.workers.config.ts`).
+  // Deliberately narrower than `wrangler.jsonc`: it omits the
+  // `containers` block entirely, since `@cloudflare/vitest-pool-workers`
+  // runs on local Miniflare/workerd with no Docker daemon behind it, so
+  // there is nothing to route the `ENGINE`/`UPDATER` container bindings
+  // to. The routes this test exercises (404 and unauthenticated admin)
+  // never reach `getRandom(env.ENGINE, ...)`, so the container classes
+  // only need to be *defined* (for the module to import) and never
+  // *bound*. See the README for what this does and does not cover.
+  "name": "osmpq-worker-test",
+  "main": "src/index.ts",
+  // Pinned to what the vendored workerd binary in
+  // `@cloudflare/vitest-pool-workers` supports locally, independent of
+  // the real `wrangler.jsonc`'s date; bump this alongside a
+  // `vitest-pool-workers` upgrade if it starts rejecting this date too.
+  "compatibility_date": "2026-08-22",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "OSMPQ_ROOT": "file:///nonexistent",
+    "OSMPQ_ANNOUNCED_ENDPOINT": "https://osmpq.example.org/api/interpreter",
+    "OSMPQ_REPLICATION_SOURCE": "https://example.org/replication/minute",
+    "ENGINE_INSTANCES": 1,
+    "ADMIN_TOKEN": "test-admin-token"
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "SCHEDULER", "class_name": "UpdaterScheduler" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["UpdaterScheduler"] }]
+}
