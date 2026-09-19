@@ -15,7 +15,7 @@ requests were measured). Nothing has touched a real R2 bucket yet.
 | Range-request profiler | `tools/range_server.py`, `tools/remote_profile.py` | Counts requests, files and bytes per query over HTTP range reads. |
 | Extract cutter | `tools/bbox_extract.py` | Cuts a reference-complete bbox extract from a larger PBF (Geofabrik is unreachable from the sandbox). |
 
-Test suite: 222 tests (`python -m pytest -q`). One test (`test_timeout_produces_remark`) is timing-flaky and should use a slower query.
+Test suite: 225 tests (`python -m pytest -q`). One test (`test_timeout_produces_remark`) is timing-flaky and should use a slower query.
 
 ## Dataset
 
@@ -92,23 +92,24 @@ essentially zero here; the request counts are what matter for object storage.
 
 | query | elements | seconds | range requests | files | MB read |
 | --- | --- | --- | --- | --- | --- |
-| wizard `amenity=cafe` (nwr + `>` + skel) | 72 | 0.35 | 43 | 20 | 8.8 |
-| wizard `building` | 6,893 | 0.80 | 107 | 22 | 57 |
-| wizard `highway=residential` | 159 | 0.36 | 59 | 20 | 9.5 |
-| wizard `natural=water` | 2,645 | 1.7 | 302 | 32 | 258 |
-| wizard `leisure=park` | 1,320 | 0.76 | 129 | 25 | 75 |
-| `nwr[amenity] out center` | 1,311 | 0.40 | 84 | 21 | 9.5 |
-| `way[highway] out geom` | 3,452 | 0.40 | 40 | 9 | 6.8 |
-| `way[building]` with `out tags/ids/skel/meta/count/5/qt` | 614 | 0.25-0.29 | 39 | 9 | 6.6 |
+| wizard `amenity=cafe` (nwr + `>` + skel) | 72 | 0.34 | 43 | 20 | 8.8 |
+| wizard `building` | 6,893 | 0.57 | 95 | 22 | 15.9 |
+| wizard `highway=residential` | 159 | 0.34 | 59 | 20 | 9.5 |
+| wizard `natural=water` | 2,645 | 0.84 | 247 | 37 | 60 |
+| wizard `leisure=park` | 1,320 | 0.55 | 116 | 25 | 24 |
+| `nwr[amenity] out center` | 1,311 | 0.39 | 84 | 21 | 9.5 |
+| `way[highway] out geom` | 3,452 | 0.39 | 40 | 9 | 6.8 |
+| `way[building]` with `out tags/ids/skel/meta/count/5/qt` | 614 | 0.24-0.28 | 39 | 9 | 6.6 |
 | `[bbox:]` global + `nwr[shop]` | 103 | 0.28 | 55 | 19 | 7.3 |
 | regex `["name"~"^Lake",i]` | 12 | 0.29 | 65 | 19 | 10 |
-| `node(w)` after a way query | 5,878 | 0.33 | 49 | 11 | 9.4 |
-| `way(bn)` / `<` / `<<` from nodes | 422-654 | 3.0-3.4 | ~1,070 | 15-16 | 322-328 |
-| `>>` from relations | 1,244 | 4.5 | 1,678 | 29 | 496 |
-| `rel(bw)` after a way query | 251 | 0.52 | 73 | 11 | 12.6 |
+| `node(w)` after a way query | 5,878 | 0.38 | 49 | 11 | 9.4 |
+| `way(bn)` from nodes | 422 | 0.41 | 44 | 11 | 11.7 |
+| `<` / `<<` from nodes | 653 / 654 | 0.53 / 0.63 | 87 / 82 | 17 | 14 |
+| `>>` from relations | 1,244 | 0.69 | 107 | 26 | 28 |
+| `rel(bw)` after a way query | 251 | 0.45 | 87 | 16 | 9.5 |
 | difference / intersection of sets | 2,831 / 966 | 0.43 / 0.38 | 40 / 42 | 9 | 6.8 / 9.3 |
-| `node(id)` / `way(id:...)` by id | 1 / 2 | 0.18 / 0.30 | 5 / 7 | 1 | 1.0 / 12.7 |
-| relation `out geom` | 6 | 0.33 | 50 | 14 | 10 |
+| `node(id)` / `way(id:...)` by id | 1 / 2 | 0.18 / 0.32 | 5 / 7 | 1 | 1.0 / 12.7 |
+| relation `out geom` | 6 | 0.40 | 84 | 21 | 18.7 |
 
 Reading the table:
 
@@ -120,18 +121,21 @@ Reading the table:
   is 20-80 ms of latency. With DuckDB issuing them concurrently, a cold
   simple query should land around 0.5-1.5 s on R2; the numbers must be
   confirmed on a real bucket in M1.
-- **Data volumes are small** for the common queries (6-10 MB), and the byte
+- **Data volumes are small** for the common queries (6-16 MB), and the byte
   reads are almost entirely row groups that survive bbox pruning. The
-  `building` wizard query reads 57 MB because the untagged node partition of
-  the downtown cell is read to resolve 5.9k way nodes; that is one file.
-- **Reverse lookups were the outlier** (`<`, `way(bn)`, `>>`): 1,000+ requests
-  and 300-500 MB, because parent ways were resolved through the id-sorted
-  `node_way` index and byid way parts, and scattered ids defeat row-group
-  pruning. The same mechanism was fixed for `>` during M0 by resolving nodes
-  from the spatial cells covering the source ways (5.6 s → 0.65 s); the
-  reverse direction is being changed to scan the way files of the nodes'
-  cells with a `refs` semi-join, and relation member ways to the spatial
-  files covering the relation bbox. Numbers will be updated below.
+  `natural=water` wizard query is the heaviest at 60 MB because lake
+  multipolygons pull in member ways and their nodes from several cells.
+- **Reverse lookups were the outlier and are now in line.** Before the last
+  round of changes, `<`, `way(bn)` and `>>` cost 1,000-1,700 requests and
+  320-500 MB (3-4.5 s), because parent ways were resolved through the
+  id-sorted `node_way` index and byid way parts, and scattered ids defeat
+  row-group pruning. Resolving nodes from the spatial cells covering the
+  source ways (for `>`: 5.6 s → 0.6 s), scanning the way files of the nodes'
+  cells with a `refs` semi-join (for `<`), and reading relation member ways
+  from the spatial files covering the relation bbox (for `>>` and `out geom`)
+  brought all of them to 44-107 requests, 12-28 MB and under 0.7 s. The
+  `node_way` index and the byid copies are now only fallbacks on the query
+  path (explicit id queries, and bboxes covering more than half the leaves).
 - **By-id lookups are cheap** when the row is in one byid part (5-7 requests);
   the way lookup read 12.7 MB because a whole row group of the byid way
   parts (refs and tags of ~100k ways) is fetched for two ids. Smaller row
@@ -171,8 +175,8 @@ match a real Overpass instance, and the common queries cost tens of range
 requests and under 10 MB, which is compatible with an object-store-backed,
 serverless engine. The remaining risk is per-request latency on R2, which
 scales with the file count per query (fixable in M1 by the findings above),
-and the reverse-lookup paths, which are being moved onto the same cell-scoped
-mechanism that fixed `>`.
+and planet-scale tuning of the cell-fraction guard that decides when a lookup
+falls back to the id-sorted copies.
 
 Go for M1, with these changes to the plan: implement finding 1-3 in the
 layout before the planet build; port the builder to Rust with pyosmium-free

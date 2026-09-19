@@ -150,6 +150,47 @@ def test_backward_recurse_finds_relation_via_found_way(engine, fixture):
     assert ("relation", fixture.way_only_relation_id) in got
 
 
+def test_backward_recurse_from_node_finds_way_in_ancestor_cell(engine, fixture):
+    # design.md 3.1 item 1: `<` resolves a node's parent ways via the
+    # bbox-scoped way lookup (a way containing a node has a bbox
+    # containing that node, so it lives in the node's own leaf cell or one
+    # of its ancestors), not the node_way index. `spanning_way_id` (110)
+    # is stored at ancestor cell "00" because its refs span leaf "000"
+    # (node 1, covered by test_backward_recurse_from_node_gets_parent_ways)
+    # and leaf "002" -- exercised here from that *other* endpoint, whose
+    # leaf ("002") is neither "00" nor "000".
+    b = bbox_args(fixture.leaf_bbox["002"])
+    r = engine.run(f"[out:json];node[amenity=cafe]({b});<;out ids;")
+    got = {(e["type"], e["id"]) for e in r.elements}
+    assert ("way", fixture.spanning_way_id) in got
+
+
+def test_inline_recurse_filter_bn_restricted_to_way(engine, fixture):
+    # design.md 3.1 item 1: `way(bn)` restricts the backward hop's result
+    # to ways, resolved the same bbox-scoped way as `<` (not the
+    # node_way index directly followed by a byid hydrate). Node 1 is
+    # referenced by way 102 and (via the ancestor cell) way 110; it is
+    # also a member of relation 201, which `way(bn)` must exclude.
+    r = engine.run(f"[out:json];node({fixture.cafe_node_id});way(bn);out ids;")
+    ids = sorted(e["id"] for e in r.elements)
+    assert ids == [102, fixture.spanning_way_id]
+    assert all(e["type"] == "way" for e in r.elements)
+
+
+def test_transitive_forward_recurse_resolves_relation_member_way_geometry(engine, fixture):
+    # design.md 3.1 item 3: `>>` (like `>`) resolves a relation's member
+    # way from the spatial way files of the cells covering the relation's
+    # own bbox, not byid -- so the way's geometry comes back directly,
+    # with no second hydration pass. `spanning_relation_id` (202) is
+    # stored at ancestor cell "00" (its members span leaf "000" and leaf
+    # "002"); its way member (101) is stored at leaf "000", a cell the
+    # relation itself is not stored at.
+    r = engine.run(f"[out:json];relation({fixture.spanning_relation_id});>>;out geom;")
+    way_el = next(e for e in r.elements if e["type"] == "way" and e["id"] == fixture.closed_way_id)
+    assert len(way_el["geometry"]) == 5
+    assert way_el["geometry"][0] == way_el["geometry"][-1]  # closed ring, refs order preserved
+
+
 def test_way_bbox_exact_geometry_test(engine, fixture):
     # The diagonal way's flat bbox covers the whole leaf, but its actual
     # line only ever visits the SW->NE diagonal.

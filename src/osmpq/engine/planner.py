@@ -38,7 +38,7 @@ from osmpq.ql.ast import (
     UserFilter,
 )
 
-from . import catalog, recurse, render, setops, sources
+from . import catalog, idset, recurse, render, setops, sources
 from .schema import empty_set_sql
 
 BBox = tuple[float, float, float, float]
@@ -100,17 +100,20 @@ def _check_unsupported_filters(q: Query) -> None:
             raise UnsupportedError(f"filter {type(f).__name__} is not supported in M0")
 
 
-def _recurse_filter_ids_table(ctx: Context, rf: RecurseFilter) -> Optional[str]:
+def _recurse_filter_ids_table(ctx: Context, rf: RecurseFilter) -> tuple[Optional[str], int]:
     """One hop for an inline recurse filter ((w)/(r)/(bn)/(bw)/(br)):
-    returns a fresh TEMP TABLE(type, id) name, or None if it produced
-    nothing. See recurse.py: this never inlines ids as a SQL literal list
-    or fetches them into Python."""
+    returns (a fresh TEMP TABLE(type, id, cell) name, files read), or
+    (None, 0) if it produced nothing. See recurse.py: this never inlines
+    ids as a SQL literal list or fetches them into Python. The backward
+    kinds (bn/bw/br) may read way spatial files (design.md 3.1); the
+    forward kinds never read files here (any reads happen when the
+    caller hydrates the ids)."""
     source_table = f"set_{rf.set_name}"
     _require_set(ctx, rf.set_name)
     if rf.kind == "w":
-        return recurse.forward_new_ids_table(ctx.con, source_table, restrict_source_types={"way"})
+        return recurse.forward_new_ids_table(ctx.con, source_table, restrict_source_types={"way"}), 0
     elif rf.kind == "r":
-        return recurse.forward_new_ids_table(ctx.con, source_table, restrict_source_types={"relation"}, role=rf.role)
+        return recurse.forward_new_ids_table(ctx.con, source_table, restrict_source_types={"relation"}, role=rf.role), 0
     elif rf.kind == "bn":
         return recurse.backward_new_ids_table(ctx.con, ctx.manifest, source_table, restrict_source_types={"node"}, role=rf.role)
     elif rf.kind == "bw":
@@ -142,7 +145,8 @@ def execute_query(ctx: Context, q: Query) -> None:
 
     if recurse_filters:
         rf = recurse_filters[0]
-        id_table = _recurse_filter_ids_table(ctx, rf)
+        id_table, nfiles_hop = _recurse_filter_ids_table(ctx, rf)
+        ctx.files_read += nfiles_hop
         if id_table is None:
             base_select = empty_set_sql()
         elif rf.kind == "w" and "node" in types:
@@ -159,6 +163,34 @@ def execute_query(ctx: Context, q: Query) -> None:
             ctx.files_read += nfiles
             if base_select is None:
                 base_select = empty_set_sql()
+        elif rf.kind == "r" and "way" in types:
+            # design.md 3.1 item 3: `(r)`'s way ids are a relation's member
+            # ways, so they lie inside that relation's own bbox -- resolve
+            # them from the spatial way files of the cells covering it
+            # (same helper `>`'s forward hop uses for member ways) instead
+            # of a byid scan. Other requested types (node/relation members)
+            # still go through the generic byid/cell hydration below.
+            way_ids_tbl = idset.fresh_table_name("rfilterwayids")
+            ctx.con.execute(
+                f"CREATE TEMP TABLE {way_ids_tbl} AS SELECT DISTINCT id FROM {id_table} WHERE type = 'way'"
+            )
+            bbox_selects = [
+                f"SELECT xmin_e7, ymin_e7, xmax_e7, ymax_e7 FROM set_{rf.set_name} WHERE type = 'relation'"
+            ]
+            way_sql, nfiles_w = sources.build_way_hydrate_via_bbox_select(
+                ctx.con, ctx.manifest, way_ids_tbl, bbox_selects, ctx.promoted_keys, tag_filters=tag_filters
+            )
+            ctx.files_read += nfiles_w
+            parts = [way_sql] if way_sql else []
+            other_types = set(types) - {"way"}
+            if other_types:
+                other_sql, nfiles_o = recurse.hydrate_ids_table(
+                    ctx.con, ctx.manifest, id_table, tag_filters, ctx.promoted_keys, only_types=other_types
+                )
+                ctx.files_read += nfiles_o
+                if other_sql:
+                    parts.append(other_sql)
+            base_select = "\nUNION ALL\n".join(parts) if parts else empty_set_sql()
         else:
             base_select, nfiles = recurse.hydrate_ids_table(
                 ctx.con, ctx.manifest, id_table, tag_filters, ctx.promoted_keys, only_types=set(types)

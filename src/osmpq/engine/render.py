@@ -175,38 +175,66 @@ def resolve_node_coords(
     return {i: (lat, lon) for i, lat, lon in rows}
 
 
-def resolve_way_geometries(con, manifest: catalog.Manifest, ids: list[int]) -> dict[int, list[tuple[float, float]]]:
-    """(way id) -> geometry points, for relation members: look up each way's
-    cell via byid, then group by cell *in SQL* (one join across the needed
-    spatial files) instead of issuing one `id IN (...)` query per cell."""
+def resolve_way_geometries(
+    con,
+    manifest: catalog.Manifest,
+    ids: list[int],
+    bbox_hints: Optional[list[tuple[int, int, int, int]]] = None,
+) -> dict[int, list[tuple[float, float]]]:
+    """(way id) -> geometry points, for relation members: a relation's
+    member ways lie inside the relation's own bbox (design.md 3.1 item 3),
+    so when the caller passes the bboxes of the relations these way ids
+    came from (`bbox_hints`), resolve from the spatial way files of the
+    leaf cells those bboxes touch -- the spatial rows already carry
+    `geometry`, so the common case is a single pass with no second
+    hydration. `bbox_hints` omitted or empty skips straight to byid, same
+    as before this existed.
+
+    `build_way_hydrate_via_bbox_select`'s own fallback (the bbox guard
+    tripping, or a way just not found in the bbox-scoped read) lands on
+    byid, whose way rows carry no geometry column at all (contract section
+    4) -- only `cell`. For any id that comes back that way, fall back once
+    more to the (cell, id) spatial join `hydrate_way_geometry` uses for
+    top-level way rows, so member-way geometry is still resolved; this
+    second pass only runs for the ids the first one didn't already settle."""
     ids = sorted(set(ids))
     if not ids:
         return {}
-    lo, hi = idset.id_range(ids)
-    parts = catalog.byid_parts_for_range(manifest, "way", lo, hi)
-    files = [manifest.path(p["path"]) for p in parts]
-    if not files:
+    ids_table = idset.register_ids_table(con, ids)
+    bbox_selects: list[str] = []
+    if bbox_hints:
+        xmin = min(b[0] for b in bbox_hints)
+        ymin = min(b[1] for b in bbox_hints)
+        xmax = max(b[2] for b in bbox_hints)
+        ymax = max(b[3] for b in bbox_hints)
+        bbox_selects = [
+            f"SELECT {xmin} AS xmin_e7, {ymin} AS ymin_e7, {xmax} AS xmax_e7, {ymax} AS ymax_e7"
+        ]
+    sql, _nfiles = sources.build_way_hydrate_via_bbox_select(con, manifest, ids_table, bbox_selects, set())
+    if not sql:
         return {}
-    pred = idset.id_predicate(con, "id", ids)
-    id_cell = con.execute(
-        f"SELECT id, cell FROM read_parquet({_quote_list(files)}) WHERE {pred} AND cell IS NOT NULL"
-    ).fetchall()
-    if not id_cell:
-        return {}
-    tc = manifest.table_cells("way")
-    needed_cells = sorted({cell for _, cell in id_cell if cell in tc})
-    if not needed_cells:
-        return {}
-    spatial_files = [manifest.path(tc[c]["path"]) for c in needed_cells]
-    pairs_table = idset.register_pairs_table(con, [(cell, wid) for wid, cell in id_cell])
     out: dict[int, list[tuple[float, float]]] = {}
-    for wid, wkt in con.execute(
-        f"SELECT t.id, ST_AsText(t.geometry) FROM read_parquet({_quote_list(spatial_files)}) t "
-        f"JOIN {pairs_table} p ON t.cell = p.cell AND t.id = p.id"
-    ).fetchall():
+    missing_cell_pairs: list[tuple[str, int]] = []
+    for wid, cell, wkt in con.execute(f"SELECT id, cell, ST_AsText(geometry) FROM ({sql}) __r").fetchall():
         pts = parse_linestring_wkt(wkt)
         if pts is not None:
             out[wid] = pts
+        elif cell:
+            missing_cell_pairs.append((cell, wid))
+
+    if missing_cell_pairs:
+        tc = manifest.table_cells("way")
+        needed_cells = sorted({c for c, _ in missing_cell_pairs if c in tc})
+        if needed_cells:
+            files = [manifest.path(tc[c]["path"]) for c in needed_cells]
+            pairs_table = idset.register_pairs_table(con, missing_cell_pairs)
+            for wid, wkt in con.execute(
+                f"SELECT t.id, ST_AsText(t.geometry) FROM read_parquet({_quote_list(files)}) t "
+                f"JOIN {pairs_table} p ON t.cell = p.cell AND t.id = p.id"
+            ).fetchall():
+                pts = parse_linestring_wkt(wkt)
+                if pts is not None:
+                    out[wid] = pts
     return out
 
 
@@ -253,7 +281,11 @@ def build_elements(con, manifest: catalog.Manifest, target_set: str, out: Out) -
             if node_ids_needed
             else {}
         )
-        way_geoms = resolve_way_geometries(con, manifest, list(way_ids_needed)) if way_ids_needed else {}
+        way_geoms = (
+            resolve_way_geometries(con, manifest, list(way_ids_needed), relation_bboxes)
+            if way_ids_needed
+            else {}
+        )
     else:
         node_coords = {}
         way_geoms = {}

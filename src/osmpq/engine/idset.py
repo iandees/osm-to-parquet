@@ -91,6 +91,18 @@ def register_pairs_table(con, pairs: Iterable[tuple[str, int]], columns: tuple[s
     return name
 
 
+def table_has_column(con, table: str, column: str) -> bool:
+    """True if TEMP TABLE `table` has a column named `column`. Used to
+    detect whether an id-hop table (recurse.py) carries a spatial `cell`
+    hint (design.md 3.1 items 1-2) before deciding whether to hydrate via
+    (cell, id) or fall back to a plain byid scan."""
+    row = con.execute(
+        "SELECT count(*) FROM duckdb_columns() WHERE table_name = ? AND column_name = ?",
+        [table, column],
+    ).fetchone()
+    return bool(row[0])
+
+
 def sql_type_range(con, table: str, type_value: str) -> tuple[Optional[int], Optional[int], int]:
     """(min id, max id, row count) for `type = type_value` rows of a
     (type, id, ...) table/set, computed in SQL (a single aggregate, not an

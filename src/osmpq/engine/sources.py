@@ -414,6 +414,307 @@ def _union_bbox_e7(con, selects: list[str]) -> Optional[BBox]:
     return (ymin / 1e7, xmin / 1e7, ymax / 1e7, xmax / 1e7)
 
 
+def bbox_from_points_e7(con, points_sql: str) -> Optional[BBox]:
+    """Union bbox (south, west, north, east) in degrees over the
+    lat_e7/lon_e7 columns of a SQL fragment (``SELECT lat_e7, lon_e7 FROM
+    ...``), or None if there are no rows / every coordinate is NULL. Used
+    to bound a set of *source nodes themselves* (design.md 3.1: a way
+    containing a node has a bbox containing that node), as opposed to
+    `_union_bbox_e7` which bounds a set of already-bboxed rows."""
+    row = con.execute(
+        f"SELECT min(lat_e7), max(lat_e7), min(lon_e7), max(lon_e7) FROM ({points_sql}) __pts"
+    ).fetchone()
+    lat_min, lat_max, lon_min, lon_max = row
+    if None in (lat_min, lat_max, lon_min, lon_max):
+        return None
+    return (lat_min / 1e7, lon_min / 1e7, lat_max / 1e7, lon_max / 1e7)
+
+
+def build_way_bbox_semijoin_select(
+    con,
+    manifest: catalog.Manifest,
+    node_ids_table: str,
+    bbox: BBox,
+    tag_filters: list[TagFilter],
+    promoted_keys: set[str],
+    max_cell_fraction: float = 0.5,
+) -> tuple[Optional[str], int]:
+    """design.md 3.1: "a way containing a node has a bbox containing that
+    node, so it is stored in the node's leaf cell or one of its
+    ancestors" (contract section 2). Reads the way spatial files of
+    `cells_for_bbox(manifest, "way", bbox)` with the flat-bbox prune,
+    keeping rows whose `refs` contains any id in `node_ids_table` (a TEMP
+    TABLE with an ``id`` column) via a semi-join over `UNNEST(refs)`.
+
+    Exhaustive by construction as long as `bbox` truly bounds every id in
+    `node_ids_table` (e.g. it is these nodes' own union bbox): no
+    remainder/fallback merge is needed for *these* rows, unlike node
+    hydration's bbox hint (which comes from a bounding *parent* element's
+    bbox column, not the ids' own coordinates). The caller is still
+    expected to fall back entirely to the node_way index when this
+    returns (None, 0) because the guard below tripped.
+
+    Returns (None, 0) when `cells_for_bbox` would touch more than
+    `max_cell_fraction` of all leaves -- the planet-scale guard, the same
+    one `build_node_hydrate_via_bbox_select` uses."""
+    cells = catalog.cells_for_bbox(manifest, "way", bbox)
+    total_leaves = len(manifest.leaf_cells) or 1
+    if not cells or len(cells) > max_cell_fraction * total_leaves:
+        return None, 0
+    files = _way_files(manifest, cells)
+    if not files:
+        return empty_set_sql(), 0
+
+    s, w, n, e = bbox
+    se, we, ne, ee = to_e7(s), to_e7(w), to_e7(n), to_e7(e)
+    bbox_where = f"xmax_e7 >= {we} AND xmin_e7 <= {ee} AND ymax_e7 >= {se} AND ymin_e7 <= {ne}"
+    tag_where = tagsql.tag_filters_sql(tag_filters, promoted_keys)
+
+    cols = {
+        "type": "'way'",
+        "id": "id",
+        "cell": "cell",
+        "refs": "refs",
+        "tags": "tags",
+        "version": "version",
+        "changeset": "changeset",
+        "timestamp": "timestamp",
+        "uid": "uid",
+        "user": '"user"',
+        "xmin_e7": "xmin_e7",
+        "ymin_e7": "ymin_e7",
+        "xmax_e7": "xmax_e7",
+        "ymax_e7": "ymax_e7",
+        "geometry": "geometry",
+        "hilbert": "hilbert",
+    }
+    sql = (
+        f"WITH __waycand AS (\n"
+        f"  SELECT * FROM read_parquet({_quote_list(files)}, hive_partitioning=true, union_by_name=true)\n"
+        f"  WHERE ({bbox_where}) AND ({tag_where})\n"
+        f"),\n"
+        f"__waymatch AS (\n"
+        f"  SELECT DISTINCT c.id FROM __waycand c, UNNEST(c.refs) AS t(ref)\n"
+        f"  JOIN {node_ids_table} n ON n.id = t.ref\n"
+        f")\n"
+        f"SELECT {project(cols)} FROM __waycand WHERE id IN (SELECT id FROM __waymatch)"
+    )
+    return sql, len(files)
+
+
+def build_way_hydrate_via_bbox_select(
+    con,
+    manifest: catalog.Manifest,
+    way_ids_table: str,
+    bbox_source_selects: list[str],
+    promoted_keys: set[str],
+    tag_filters: Optional[list[TagFilter]] = None,
+    max_cell_fraction: float = 0.5,
+) -> tuple[Optional[str], int]:
+    """design.md 3.1 item 3: resolve way ids in `way_ids_table` (a TEMP
+    TABLE with at least an ``id`` column -- typically a relation's member
+    way ids) from the spatial way files of the leaf cells intersecting the
+    union bbox of `bbox_source_selects` (SQL fragments over rows carrying
+    xmin_e7/ymin_e7/xmax_e7/ymax_e7 known to bound these ways -- a
+    relation's member ways lie inside the relation's own bbox, contract
+    section 4) instead of scanning the id-sorted byid way parts end to
+    end. The spatial rows already carry `geometry`, so a caller resolving
+    member-way geometry for `out geom` gets it in this one pass with no
+    second hydration.
+
+    Falls back to byid for whatever the spatial pass does not find
+    (defensive; should be empty for consistent data), and skips the
+    spatial pass entirely -- straight to byid -- when
+    `bbox_source_selects` is empty, every candidate bbox is NULL, or the
+    union bbox would make `cells_for_bbox` touch more than
+    `max_cell_fraction` of all leaves (same guard as
+    `build_node_hydrate_via_bbox_select`)."""
+    total_ids = con.execute(f"SELECT count(*) FROM {way_ids_table}").fetchone()[0]
+    if not total_ids:
+        return None, 0
+
+    files_total = 0
+    selects: list[str] = []
+    found_table: Optional[str] = None
+
+    bbox = _union_bbox_e7(con, bbox_source_selects)
+    if bbox is not None:
+        cells = catalog.cells_for_bbox(manifest, "way", bbox)
+        total_leaves = len(manifest.leaf_cells) or 1
+        if cells and len(cells) <= max_cell_fraction * total_leaves:
+            way_files = _way_files(manifest, cells)
+            if way_files:
+                s, w, n, e = bbox
+                se, we, ne, ee = to_e7(s), to_e7(w), to_e7(n), to_e7(e)
+                bbox_where = (
+                    f"w.xmax_e7 >= {we} AND w.xmin_e7 <= {ee} "
+                    f"AND w.ymax_e7 >= {se} AND w.ymin_e7 <= {ne}"
+                )
+                files_total += len(way_files)
+                found_table = idset.fresh_table_name("bboxwayhits")
+                cols = {
+                    "type": "'way'",
+                    "id": "w.id",
+                    "cell": "w.cell",
+                    "refs": "w.refs",
+                    "tags": "w.tags",
+                    "version": "w.version",
+                    "changeset": "w.changeset",
+                    "timestamp": 'w."timestamp"',
+                    "uid": "w.uid",
+                    "user": 'w."user"',
+                    "xmin_e7": "w.xmin_e7",
+                    "ymin_e7": "w.ymin_e7",
+                    "xmax_e7": "w.xmax_e7",
+                    "ymax_e7": "w.ymax_e7",
+                    "geometry": "w.geometry",
+                    "hilbert": "w.hilbert",
+                }
+                tag_where = tagsql.tag_filters_sql(tag_filters or [], promoted_keys, prefix="w.")
+                con.execute(
+                    f"CREATE TEMP TABLE {found_table} AS\n"
+                    f"SELECT {project(cols)}\n"
+                    f"FROM read_parquet({_quote_list(way_files)}, hive_partitioning=true, union_by_name=true) w\n"
+                    f"JOIN (SELECT DISTINCT id FROM {way_ids_table}) ids ON w.id = ids.id\n"
+                    f"WHERE ({bbox_where}) AND ({tag_where})"
+                )
+                selects.append(f"SELECT * FROM {found_table}")
+
+    if found_table is not None:
+        remainder_sql = (
+            f"SELECT DISTINCT id FROM {way_ids_table} "
+            f"WHERE id NOT IN (SELECT id FROM {found_table})"
+        )
+    else:
+        remainder_sql = f"SELECT DISTINCT id FROM {way_ids_table}"
+    remainder_table = idset.fresh_table_name("bboxwayrem")
+    con.execute(f"CREATE TEMP TABLE {remainder_table} AS {remainder_sql}")
+    n_remaining = con.execute(f"SELECT count(*) FROM {remainder_table}").fetchone()[0]
+    if n_remaining:
+        lo, hi = con.execute(f"SELECT min(id), max(id) FROM {remainder_table}").fetchone()
+        byid_sql, nfiles = build_byid_select_from_ids_query(
+            manifest, "way", f"SELECT id FROM {remainder_table}", lo, hi, tag_filters or [], promoted_keys
+        )
+        files_total += nfiles
+        if byid_sql:
+            selects.append(byid_sql)
+
+    if not selects:
+        return None, files_total
+    return "\nUNION ALL\n".join(selects), files_total
+
+
+def _spatial_files_for_type(manifest: catalog.Manifest, element_type: str, cells: list[str]) -> list[str]:
+    if element_type == "way":
+        return _way_files(manifest, cells)
+    if element_type == "relation":
+        return _relation_files(manifest, cells)
+    raise ValueError(f"unsupported element_type {element_type!r} for cell hydration")
+
+
+def _spatial_cols_for_type(element_type: str, prefix: str) -> dict[str, str]:
+    common = {
+        "type": f"'{element_type}'",
+        "id": f"{prefix}id",
+        "cell": f"{prefix}cell",
+        "tags": f"{prefix}tags",
+        "version": f"{prefix}version",
+        "changeset": f"{prefix}changeset",
+        "timestamp": f'{prefix}"timestamp"',
+        "uid": f"{prefix}uid",
+        "user": f'{prefix}"user"',
+        "xmin_e7": f"{prefix}xmin_e7",
+        "ymin_e7": f"{prefix}ymin_e7",
+        "xmax_e7": f"{prefix}xmax_e7",
+        "ymax_e7": f"{prefix}ymax_e7",
+        "hilbert": f"{prefix}hilbert",
+    }
+    if element_type == "way":
+        common["refs"] = f"{prefix}refs"
+        common["geometry"] = f"{prefix}geometry"
+    else:
+        # Relation geometry is always NULL in M0 (contract section 4).
+        common["members"] = f"{prefix}members"
+        common["geometry"] = "NULL::GEOMETRY"
+    return common
+
+
+def build_spatial_hydrate_via_cell_select(
+    con,
+    manifest: catalog.Manifest,
+    element_type: str,
+    id_cell_table: str,
+    tag_filters: list[TagFilter],
+    promoted_keys: set[str],
+) -> tuple[Optional[str], int]:
+    """design.md 3.1 item 2: hydrate `element_type` ('way' or 'relation')
+    ids in `id_cell_table` (columns ``id``, ``cell`` -- `cell` may be NULL
+    for some/all rows) by joining the spatial files of exactly the cells
+    that appear on (cell, id), instead of scanning the id-sorted byid
+    copy end to end. `cell` for relations is the member index's
+    `parent_cell` column (contract section 4); for ways it is the way's
+    own `cell` as found by `build_way_bbox_semijoin_select`.
+
+    Falls back to byid for every id whose `cell` is NULL or that the
+    spatial join does not find (defensive: should be empty for
+    consistent data)."""
+    total = con.execute(f"SELECT count(*) FROM {id_cell_table}").fetchone()[0]
+    if not total:
+        return None, 0
+
+    files_total = 0
+    selects: list[str] = []
+    found_table: Optional[str] = None
+
+    known_cells = [
+        r[0]
+        for r in con.execute(
+            f"SELECT DISTINCT cell FROM {id_cell_table} WHERE cell IS NOT NULL"
+        ).fetchall()
+    ]
+    tc = manifest.table_cells(element_type)
+    needed_cells = [c for c in known_cells if c in tc]
+    if needed_cells:
+        files = _spatial_files_for_type(manifest, element_type, needed_cells)
+        if files:
+            files_total += len(files)
+            found_table = idset.fresh_table_name(f"{element_type}cellhits")
+            tag_where = tagsql.tag_filters_sql(tag_filters, promoted_keys, prefix="t.")
+            cols = _spatial_cols_for_type(element_type, prefix="t.")
+            con.execute(
+                f"CREATE TEMP TABLE {found_table} AS\n"
+                f"SELECT {project(cols)}\n"
+                f"FROM read_parquet({_quote_list(files)}, hive_partitioning=true, union_by_name=true) t\n"
+                f"JOIN (SELECT DISTINCT id, cell FROM {id_cell_table} WHERE cell IS NOT NULL) ids\n"
+                f"  ON t.cell = ids.cell AND t.id = ids.id\n"
+                f"WHERE {tag_where}"
+            )
+            selects.append(f"SELECT * FROM {found_table}")
+
+    if found_table is not None:
+        remainder_sql = (
+            f"SELECT DISTINCT id FROM {id_cell_table} "
+            f"WHERE cell IS NULL OR id NOT IN (SELECT id FROM {found_table})"
+        )
+    else:
+        remainder_sql = f"SELECT DISTINCT id FROM {id_cell_table}"
+    remainder_table = idset.fresh_table_name(f"{element_type}cellrem")
+    con.execute(f"CREATE TEMP TABLE {remainder_table} AS {remainder_sql}")
+    n_remaining = con.execute(f"SELECT count(*) FROM {remainder_table}").fetchone()[0]
+    if n_remaining:
+        lo, hi = con.execute(f"SELECT min(id), max(id) FROM {remainder_table}").fetchone()
+        byid_sql, nfiles = build_byid_select_from_ids_query(
+            manifest, element_type, f"SELECT id FROM {remainder_table}", lo, hi, tag_filters, promoted_keys
+        )
+        files_total += nfiles
+        if byid_sql:
+            selects.append(byid_sql)
+
+    if not selects:
+        return None, files_total
+    return "\nUNION ALL\n".join(selects), files_total
+
+
 def build_node_hydrate_via_bbox_select(
     con,
     manifest: catalog.Manifest,
