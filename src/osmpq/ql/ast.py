@@ -17,7 +17,8 @@ Conventions
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Optional, Sequence, Union
+from typing import Literal, Optional, Sequence
+from typing import Union as TypingUnion
 
 ElementType = Literal["node", "way", "relation"]
 ALL_TYPES: tuple[ElementType, ...] = ("node", "way", "relation")
@@ -135,7 +136,7 @@ class IfFilter:
     expression: str
 
 
-Filter = Union[
+Filter = TypingUnion[
     TagFilter,
     BboxFilter,
     IdFilter,
@@ -250,7 +251,7 @@ class Unsupported:
     source: str
 
 
-Statement = Union[
+Statement = TypingUnion[
     Query,
     Union,
     Difference,

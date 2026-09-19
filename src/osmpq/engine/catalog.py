@@ -176,3 +176,17 @@ def byid_parts_for_ids(manifest: Manifest, table: str, ids: Iterable[int]) -> li
 
 def all_byid_parts(manifest: Manifest, table: str) -> list[dict]:
     return manifest.byid_parts(table)
+
+
+def index_parts_for_ids(manifest: Manifest, name: str, ids: Iterable[int]) -> list[dict]:
+    """Like byid_parts_for_ids but for index/<name> parts. Falls back to all
+    parts when a part lacks min_id/max_id (e.g. the member index, which is
+    not sorted by a single id)."""
+    ids = list(ids)
+    parts = manifest.index_parts(name)
+    if not ids or not parts:
+        return parts if ids else []
+    if not all("min_id" in p and "max_id" in p for p in parts):
+        return parts
+    lo, hi = min(ids), max(ids)
+    return [p for p in parts if p["max_id"] >= lo and p["min_id"] <= hi]
