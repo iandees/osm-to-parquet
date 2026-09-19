@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "osmpq"
+version = "0.0.1"
+description = "Overpass QL over Parquet on object storage (M0 prototype)"
+requires-python = ">=3.11"
+dependencies = [
+  "duckdb>=1.5",
+  "pyarrow>=17",
+  "numpy",
+  "fastapi",
+  "uvicorn",
+  "httpx",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+osmpq = "osmpq.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
