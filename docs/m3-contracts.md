@@ -434,7 +434,7 @@ vitest tests.
   `/api/timestamp`, `/healthz` pass through. `/admin/scheduler/{start,
   stop,status,run}` guarded by the `ADMIN_TOKEN` secret control the
   updater scheduler. Everything else 404. Add the ODbL attribution header
-  `X-Attribution: © OpenStreetMap contributors, ODbL`.
+  `X-Attribution: (c) OpenStreetMap contributors, ODbL` (ASCII: non-ASCII header values are rejected by strict Fetch implementations).
 * **`EngineContainer`** (`src/engine.ts`): `extends Container`,
   `defaultPort = 8080`, `sleepAfter = "2m"`, `envVars` from the Worker's
   vars/secrets (`OSMPQ_ROOT`, `OSMPQ_S3_*`, `OSMPQ_TRUST_PROXY=1`,

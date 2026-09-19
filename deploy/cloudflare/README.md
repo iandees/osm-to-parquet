@@ -91,13 +91,10 @@ docstring for what the engine does with each `OSMPQ_S3_*` variable.
 - **Re-arming uses the run's start time, not its finish time**
   (`logic.nextAlarmAfterRun`): a slow run delays the next one instead of
   the fixed interval compounding on top of an already-late one.
-- **Attribution header.** `X-Attribution: © OpenStreetMap contributors,
-  ODbL` is added to every response the Worker returns, matching contract
-  section 7. Miniflare warns that the `©` byte is technically outside
-  plain ASCII for a header value (a Fetch-spec quirk some strict browser
-  clients could choke on reading it back via `fetch()`); it is sent
-  as-is because the contract specifies this exact text and no client in
-  the corpus reads this header programmatically.
+- **Attribution header.** `X-Attribution: (c) OpenStreetMap contributors,
+  ODbL` is added to every response the Worker returns (contract section
+  7). The value is plain ASCII on purpose: strict Fetch implementations
+  reject non-ASCII header bytes.
 
 ## Testing strategy
 

@@ -165,7 +165,7 @@ export function routeFor(method: string, pathname: string): Route {
 // ---------------------------------------------------------------------
 
 export const ATTRIBUTION_HEADER = "X-Attribution";
-export const ATTRIBUTION_VALUE = "© OpenStreetMap contributors, ODbL";
+export const ATTRIBUTION_VALUE = "(c) OpenStreetMap contributors, ODbL";
 
 // ---------------------------------------------------------------------
 // Scheduler: next-alarm computation
