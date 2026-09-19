@@ -38,12 +38,31 @@ from osmpq.ql.ast import (
     UserFilter,
 )
 
-from . import catalog, idset, recurse, render, setops, sources
+from . import catalog, hooks, idset, recurse, render, setops, sources
 from .schema import empty_set_sql
 
 BBox = tuple[float, float, float, float]
 
-_REJECTED_FILTERS = (AroundFilter, PolyFilter, AreaFilter, PivotFilter, NewerFilter, ChangedFilter, UserFilter, UidFilter, IfFilter)
+_CORE_FILTERS = (TagFilter, BboxFilter, IdFilter, RecurseFilter)
+_hooks_loaded = False
+
+
+def _load_hooks() -> None:
+    """Import the tier-2 modules that register filter/statement hooks
+    (hooks.HOOK_MODULES). A module that does not exist yet is skipped: its
+    filters/statements then raise UnsupportedError as before."""
+    global _hooks_loaded
+    if _hooks_loaded:
+        return
+    import importlib
+
+    for name in hooks.HOOK_MODULES:
+        try:
+            importlib.import_module(name)
+        except ModuleNotFoundError as e:
+            if e.name != name:
+                raise
+    _hooks_loaded = True
 
 
 @dataclass
@@ -79,6 +98,28 @@ def _bbox_for(q: Query, global_bbox: Optional[BBox]) -> Optional[BBox]:
     return global_bbox
 
 
+def _effective_bbox(ctx: "Context", q: Query) -> Optional[BBox]:
+    """Explicit/global bbox intersected with every hooked filter's implied
+    bbox (hooks.FilterHook.implied_bbox). Used for cell and row-group
+    selection only; the hooks' predicates do the exact tests."""
+    bbox = _bbox_for(q, ctx.global_bbox)
+    for f in q.filters:
+        hook = hooks.FILTER_HOOKS.get(type(f))
+        if hook is None:
+            continue
+        bbox = hooks.intersect_bbox(bbox, hook.implied_bbox(ctx, q, f))
+    return bbox
+
+
+def _hook_predicates(ctx: "Context", q: Query, alias: str) -> list[str]:
+    preds = []
+    for f in q.filters:
+        hook = hooks.FILTER_HOOKS.get(type(f))
+        if hook is not None:
+            preds.append(hook.predicate(ctx, q, f, alias))
+    return preds
+
+
 def _ids_for(q: Query) -> Optional[list[int]]:
     for f in q.filters:
         if isinstance(f, IdFilter):
@@ -96,8 +137,8 @@ def _recurse_filters_for(q: Query) -> list[RecurseFilter]:
 
 def _check_unsupported_filters(q: Query) -> None:
     for f in q.filters:
-        if isinstance(f, _REJECTED_FILTERS):
-            raise UnsupportedError(f"filter {type(f).__name__} is not supported in M0")
+        if not isinstance(f, _CORE_FILTERS) and type(f) not in hooks.FILTER_HOOKS:
+            raise UnsupportedError(f"filter {type(f).__name__} is not supported")
 
 
 def _recurse_filter_ids_table(ctx: Context, rf: RecurseFilter) -> tuple[Optional[str], int]:
@@ -134,11 +175,17 @@ def _require_set(ctx: Context, name: str) -> None:
 
 def execute_query(ctx: Context, q: Query) -> None:
     if q.types == ["area"] or "area" in q.types:
-        raise UnsupportedError("area queries are not supported in M0")
+        if hooks.AREA_QUERY_HOOK:
+            hooks.AREA_QUERY_HOOK[0](ctx, q)
+            return
+        raise UnsupportedError("area queries are not supported")
     _check_unsupported_filters(q)
 
     types = q.types
-    bbox = _bbox_for(q, ctx.global_bbox)
+    bbox = _effective_bbox(ctx, q)
+    if hooks.is_empty_bbox(bbox):
+        setops.materialize(ctx.con, q.output_set, empty_set_sql())
+        return
     ids = _ids_for(q)
     tag_filters = _tag_filters_for(q)
     recurse_filters = _recurse_filters_for(q)
@@ -218,6 +265,9 @@ def execute_query(ctx: Context, q: Query) -> None:
             selects.append(sql)
         base_select = "\nUNION ALL\n".join(selects)
 
+    preds = _hook_predicates(ctx, q, "__q")
+    if preds:
+        base_select = f"SELECT * FROM ({base_select}) __q WHERE " + " AND ".join(f"({p})" for p in preds)
     setops.materialize(ctx.con, q.output_set, base_select)
 
 
@@ -295,13 +345,16 @@ def execute_statement(ctx: Context, stmt: Statement) -> None:
         execute_out(ctx, stmt)
     elif isinstance(stmt, Unsupported):
         raise UnsupportedError(f"{stmt.keyword} is not supported in M0")
+    elif type(stmt) in hooks.STATEMENT_HOOKS:
+        hooks.STATEMENT_HOOKS[type(stmt)](ctx, stmt)
     elif isinstance(stmt, (IsIn, MapToArea, Foreach, If)):
-        raise UnsupportedError(f"{type(stmt).__name__} is not supported in M0")
+        raise UnsupportedError(f"{type(stmt).__name__} is not supported")
     else:
         raise UnsupportedError(f"unrecognized statement {type(stmt).__name__}")
 
 
 def run_program(con, manifest: catalog.Manifest, program) -> Context:
+    _load_hooks()
     check_settings(program.settings)
     promoted_keys = set(manifest.promoted_keys)
     ctx = Context(con=con, manifest=manifest, promoted_keys=promoted_keys, global_bbox=program.settings.bbox)
