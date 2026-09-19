@@ -701,8 +701,13 @@ def compact(opts: CompactOptions) -> dict:
 
     gen_number = latest_num + 1
     manifest_dir.mkdir(parents=True, exist_ok=True)
-    (manifest_dir / f"{gen_number}.json").write_text(json.dumps(new_man, indent=2, sort_keys=False))
-    (manifest_dir / "LATEST").write_text(str(gen_number))
+    # Write via temp file + rename: manifest files may be hardlinked across
+    # snapshot copies (cp -al), and an in-place write would change every copy.
+    for name, text in ((f"{gen_number}.json", json.dumps(new_man, indent=2, sort_keys=False)),
+                       ("LATEST", str(gen_number))):
+        tmp = manifest_dir / f".{name}.tmp"
+        tmp.write_text(text)
+        os.replace(tmp, manifest_dir / name)
     _log(f"wrote manifest/{gen_number}.json and manifest/LATEST")
     _log(f"done in {time.time() - t_start:.2f}s total")
 
