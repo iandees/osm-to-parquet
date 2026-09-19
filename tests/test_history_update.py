@@ -474,3 +474,63 @@ def test_run_once_through_s3_root_writes_history_tiers(tmp_path, monkeypatch):
     man = manifest_mod.load_latest(root2.root)
     hour = man.history["tiers"]["hour"]
     assert (Path(root2.root) / hour["files"]["node"]["byid"]).exists()
+
+
+# --------------------------------------------------------------------------
+# integration: the engine's attic reads over the tiers the updater wrote
+# (docs/m4-contracts.md sections 3.1-3.2 on section 5.1's output)
+# --------------------------------------------------------------------------
+
+
+def _engine(hinfo):
+    from osmpq.engine.executor import Engine
+
+    return Engine(hinfo.root)
+
+
+def _names_at(engine, node_id: int, date: str) -> list[str]:
+    r = engine.run(f'[out:json][date:"{date}"];node({node_id});out meta;')
+    assert r.remark is None or r.remark.startswith("history starts at ")
+    return [e.get("tags", {}).get("name") for e in r.elements]
+
+
+def test_engine_date_reads_updater_tiers(hinfo, run3):
+    eng = _engine(hinfo)
+    before = _names_at(eng, 1, "2026-09-19T01:00:00Z")
+    at_run2 = _names_at(eng, 1, "2026-09-19T01:50:00Z")
+    at_run3 = _names_at(eng, 1, "2026-09-19T02:10:00Z")
+    assert len(before) == 1 and "renamed" not in (before[0] or "")
+    assert at_run2 == ["Aroma Cafe (renamed run2)"]
+    assert at_run3 == ["Aroma Cafe (renamed run3)"]
+    # exactly at valid_from the new state is already visible
+    assert _names_at(eng, 1, "2026-09-19T01:45:00Z") == ["Aroma Cafe (renamed run2)"]
+
+
+def test_engine_date_sees_move_and_deletion(hinfo, run3):
+    eng = _engine(hinfo)
+    lat_b, lon_b = history_v5.HistoryFixtureInfo.leaf001_point_b
+    r_old = eng.run(f'[out:json][date:"2026-09-19T01:00:00Z"];node({hinfo.move_node_id});out;')
+    r_new = eng.run(f'[out:json][date:"2026-09-19T01:20:00Z"];node({hinfo.move_node_id});out;')
+    assert len(r_old.elements) == 1 and len(r_new.elements) == 1
+    assert abs(r_new.elements[0]["lat"] - lat_b) < 1e-6 and abs(r_new.elements[0]["lon"] - lon_b) < 1e-6
+    assert (r_old.elements[0]["lat"], r_old.elements[0]["lon"]) != (r_new.elements[0]["lat"], r_new.elements[0]["lon"])
+    # the moved node is found by a bbox scan of its NEW position at t, and not at its old one
+    r_bbox = eng.run(
+        f'[out:json][date:"2026-09-19T01:20:00Z"];'
+        f"node({lat_b - 0.0005},{lon_b - 0.0005},{lat_b + 0.0005},{lon_b + 0.0005});out ids;"
+    )
+    assert hinfo.move_node_id in [e["id"] for e in r_bbox.elements]
+    gone = eng.run(f'[out:json][date:"2026-09-19T01:20:00Z"];node({hinfo.delete_node_id});out ids;')
+    still = eng.run(f'[out:json][date:"2026-09-19T01:00:00Z"];node({hinfo.delete_node_id});out ids;')
+    assert gone.elements == [] and len(still.elements) == 1
+
+
+def test_engine_timeline_and_adiff_over_tiers(hinfo, run3):
+    eng = _engine(hinfo)
+    tl = eng.run("[out:json];timeline(node,1);out;")
+    versions = [e["tags"]["refversion"] for e in tl.elements]
+    assert len(versions) == 3 and versions == sorted(versions, key=int)
+    assert "expired" not in tl.elements[-1]["tags"] and all("expired" in e["tags"] for e in tl.elements[:-1])
+    d = eng.run('[out:xml][adiff:"2026-09-19T01:00:00Z","2026-09-19T02:10:00Z"];node(1);out meta;')
+    body, _ctype = d.render()
+    assert '<action type="modify">' in body and "renamed run3" in body and "<old>" in body
