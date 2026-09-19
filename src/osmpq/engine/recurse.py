@@ -38,7 +38,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from . import catalog, idset, sources
+from . import attic, catalog, idset, sources
 from .schema import empty_set_sql
 
 
@@ -121,6 +121,7 @@ def backward_new_ids_table(con, manifest: catalog.Manifest, source_table: str,
     parts: list[str] = []
     params: list = []
     files_total = 0
+    snap = catalog.SNAPSHOT.get()
 
     want_node = restrict_source_types is None or "node" in restrict_source_types
     if want_node:
@@ -143,9 +144,11 @@ def backward_new_ids_table(con, manifest: catalog.Manifest, source_table: str,
                 # design.md 3.1 / m2-contracts.md section 4: this path
                 # already reads way rows through `sources.current_rows`
                 # (base ⊕ deltas for the cells covering these nodes' own
-                # bbox), so it needs nothing extra here.
+                # bbox, or -- under a snapshot -- history for those cells,
+                # since `current_rows` itself branches on
+                # `catalog.SNAPSHOT`), so it needs nothing extra here.
                 parts.append(f"SELECT type, id, cell FROM ({way_rows_sql}) __wr")
-            else:
+            elif snap is None:
                 files = [manifest.path(p["path"]) for p in catalog.index_parts_for_range(manifest, "node_way", lo, hi)]
                 if files:
                     parts.append(
@@ -160,6 +163,30 @@ def backward_new_ids_table(con, manifest: catalog.Manifest, source_table: str,
                 if delta_way_tbl is not None:
                     files_total += 1
                     parts.append(f"SELECT type, id, cell FROM {delta_way_tbl}")
+            # docs/m4-contracts.md section 3.1: under a snapshot, the
+            # node_way index (current-only) is never consulted -- when the
+            # bbox-semijoin path above found nothing (no bbox / the
+            # planet-scale guard tripped), the node -> parent-way hop
+            # simply yields nothing rather than risk a wrong (current-day)
+            # answer.
+
+    if snap is not None:
+        # docs/m4-contracts.md section 3.1: relation lookups scan relation
+        # history rows instead of the (current-only) member index; the
+        # delta member/way-ref augmentations below are skipped entirely
+        # (deltas are current-only and history already has everything).
+        rel_tbl, nfiles_r = attic.backward_relation_ids_snapshot(
+            con, manifest, source_table, snap, restrict_source_types=restrict_source_types, role=role
+        )
+        files_total += nfiles_r
+        if rel_tbl is not None:
+            parts.append(f"SELECT type, id, cell FROM {rel_tbl}")
+        if not parts:
+            return None, files_total
+        name = idset.fresh_table_name("bwd")
+        hop_sql = "\nUNION ALL\n".join(parts)
+        con.execute(f"CREATE TEMP TABLE {name} AS SELECT DISTINCT type, id, cell FROM ({hop_sql}) __hop")
+        return name, files_total
 
     member_files = [manifest.path(p["path"]) for p in manifest.index_parts("member")]
     if member_files:

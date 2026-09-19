@@ -78,6 +78,12 @@ class Result:
     remark: Optional[str] = None
     timestamp_osm_base: Optional[str] = None
     stats: dict = field(default_factory=dict)
+    # docs/m4-contracts.md section 3.2: `[diff:]`/`[adiff:]` -- `elements`
+    # then holds action dicts (`{"action", "type", "id", "old"?, "new"?}`)
+    # instead of plain Overpass elements. JSON renders them as-is (our
+    # documented extension over the reference, which errors instead); XML
+    # gets its own `<action type="...">` wrapper via `_action_xml`.
+    is_diff: bool = False
 
     def render(self) -> tuple[str, str]:
         fmt = self.settings.out_format if self.settings is not None else "json"
@@ -134,7 +140,7 @@ class Result:
         if self.timestamp_osm_base:
             parts.append(f'<meta osm_base="{xml_escape(self.timestamp_osm_base)}"/>')
         for el in self.elements:
-            parts.append(_element_xml(el))
+            parts.append(_action_xml(el) if self.is_diff else _element_xml(el))
         if self.remark:
             parts.append(f"<remark>{xml_escape(self.remark)}</remark>")
         parts.append("</osm>")
@@ -154,6 +160,12 @@ def _meta_attrs(el: dict) -> str:
     out += _attr("changeset", el.get("changeset"))
     out += _attr("uid", el.get("uid"))
     out += _attr("user", el.get("user"))
+    # docs/m4-contracts.md section 3.2: an `adiff` raw old/new stub carries
+    # an explicit `visible` flag (probe `adiff_xml`: `visible="true"` for
+    # an element that still exists but fell out of the query, `"false"`
+    # for a real OSM deletion); absent on every ordinary element.
+    if "visible" in el:
+        out += _attr("visible", "true" if el["visible"] else "false")
     return out
 
 
@@ -195,7 +207,39 @@ def _element_xml(el: dict) -> str:
         return _relation_xml(el)
     if t == "area":
         return _area_xml(el)
+    if t == "timeline":
+        return _timeline_xml(el)
     return ""
+
+
+def _timeline_xml(el: dict) -> str:
+    # docs/m4-contracts.md section 3.2: `<timeline id=".."><tag .../></timeline>`
+    # (probe `timeline_xml.xml`), same `<tag>` shape as any other element.
+    return f'<timeline id="{el["id"]}">' + _tags_xml(el) + "</timeline>"
+
+
+def _action_xml(action: dict) -> str:
+    """`[diff:]`/`[adiff:]` XML (docs/m4-contracts.md section 3.2, probes
+    `diff_xml`/`adiff_xml`): `<action type="create">` wraps the element
+    directly, `"modify"` wraps `<old>`/`<new>`, `"delete"` wraps `<old>`
+    and -- for `adiff`, when the object's raw state is still known at `b`
+    -- a `<new>` stub (`_meta_attrs`' `visible` attribute distinguishes a
+    real OSM deletion from one that merely fell out of the query)."""
+    kind = action["action"]
+    body = ""
+    if kind == "create":
+        body = _element_xml(action["new"])
+    elif kind == "delete":
+        body = "<old>\n  " + _element_xml(action["old"]) + "\n</old>"
+        new = action.get("new")
+        if new is not None:
+            body += "\n<new>\n  " + _element_xml(new) + "\n</new>"
+    else:  # modify
+        body = (
+            "<old>\n  " + _element_xml(action["old"]) + "\n</old>\n"
+            "<new>\n  " + _element_xml(action["new"]) + "\n</new>"
+        )
+    return f'<action type="{kind}">\n{body}\n</action>\n'
 
 
 def _node_xml(el: dict) -> str:

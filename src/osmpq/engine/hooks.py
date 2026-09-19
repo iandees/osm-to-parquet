@@ -57,6 +57,7 @@ HOOK_MODULES = (
     "osmpq.engine.metafilters",  # W3: newer, changed, user, uid
     "osmpq.engine.evalfilter",   # W3: (if:) filter, foreach, if
     "osmpq.engine.areas",        # W2: area queries, (area), (pivot), is_in, map_to_area
+    "osmpq.engine.attic",        # M4 W2: snapshot reads, changed/newer with history, diff/adiff
 )
 
 

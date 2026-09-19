@@ -29,16 +29,18 @@ from osmpq.ql.ast import (
     Query,
     Recurse,
     RecurseFilter,
+    Retro,
     Settings,
     Statement,
     TagFilter,
+    Timeline,
     UidFilter,
     Union,
     Unsupported,
     UserFilter,
 )
 
-from . import catalog, hooks, idset, recurse, render, setops, sources
+from . import attic, catalog, hooks, idset, recurse, render, setops, sources
 from .schema import empty_set_sql
 
 BBox = tuple[float, float, float, float]
@@ -81,19 +83,49 @@ class Context:
     # Set while hook predicates run for a query: the TEMP TABLE holding
     # that query's candidate rows (see execute_query). None otherwise.
     current_base_table: Optional[str] = None
+    # True for either pass of a `[diff:]`/`[adiff:]` run (docs/m4-
+    # contracts.md section 3.2): the reference has no real `out count`
+    # under diff mode (probe `adiff_count_xml` is byte-identical to
+    # `adiff_ids_xml`), so `execute_out` renders an `out count;` as if it
+    # had said `out ids;` instead of producing a `{"type": "count", ...}`
+    # summary element, which the (type, id)-keyed diff algorithm couldn't
+    # use anyway.
+    diff_mode: bool = False
+    # (type, id) -> version, accumulated from every `out` while
+    # `diff_mode` (section 3.2's "different (version, minor)" test);
+    # unused/empty otherwise.
+    diff_versions: dict = field(default_factory=dict)
     _counter: "count" = field(default_factory=lambda: count(1))
 
     def fresh_name(self, prefix: str) -> str:
-        return f"__{prefix}_{next(self._counter)}"
+        # docs/m4-contracts.md section 3.2: `[diff:]`/`[adiff:]` runs the
+        # whole program twice on the *same* DuckDB cursor, each pass
+        # building its own fresh `Context` -- a per-Context counter
+        # restarting at 1 would hand out the same TEMP TABLE name to both
+        # passes whenever they take the same code path in the same order,
+        # colliding on the second pass's plain `CREATE TEMP TABLE` (no
+        # `OR REPLACE`). `idset.fresh_table_name` keeps one counter for
+        # the whole process instead, so names stay unique across passes
+        # (and across concurrent `Engine.run()` calls, same reasoning as
+        # `executor.py`'s per-run cursor) with the same `__prefix_N`
+        # shape this always returned.
+        return idset.fresh_table_name(prefix)
 
 
-def check_settings(settings: Settings) -> None:
-    if settings.date is not None:
-        raise UnsupportedError("[date:] (attic) is not supported in M0")
-    if settings.diff is not None:
-        raise UnsupportedError("[diff:] is not supported in M0")
-    if settings.adiff is not None:
-        raise UnsupportedError("[adiff:] is not supported in M0")
+def check_settings(manifest: catalog.Manifest, settings: Settings) -> None:
+    """docs/m4-contracts.md section 3.2: `[date:]`/`[diff:]`/`[adiff:]`
+    need a history dataset (manifest v5 `history`, absent = "attic
+    unsupported" for every manifest version); a manifest without one keeps
+    raising exactly as M0-M3 did, just with a message naming the reason.
+    `[diff:]`/`[adiff:]` are otherwise supported for every `[out:]` format
+    here (JSON is a documented extension over the reference, section 3.2)."""
+    has_history = manifest.has_history()
+    if settings.date is not None and not has_history:
+        raise UnsupportedError("[date:] (attic) is not supported: this dataset has no history")
+    if settings.diff is not None and not has_history:
+        raise UnsupportedError("[diff:] is not supported: this dataset has no history")
+    if settings.adiff is not None and not has_history:
+        raise UnsupportedError("[adiff:] is not supported: this dataset has no history")
 
 
 def _bbox_for(q: Query, global_bbox: Optional[BBox]) -> Optional[BBox]:
@@ -344,10 +376,53 @@ def execute_out(ctx: Context, o: Out) -> None:
     # implemented entirely in render.build_elements/_row_to_element; the
     # M0-era rejection here (this statement's only remaining line) is lifted
     # as part of that delivery, same as check_settings' csv rejection above.
-    elements, _extra = render.build_elements(
-        ctx.con, ctx.manifest, o.input_set, o, include_areas_count=ctx.areas_used
+    effective_out = o
+    if ctx.diff_mode and o.count:
+        from dataclasses import replace
+
+        effective_out = replace(o, count=False, verbosity="ids")
+    elements, extra = render.build_elements(
+        ctx.con, ctx.manifest, o.input_set, effective_out, include_areas_count=ctx.areas_used
     )
     ctx.elements.extend(elements)
+    if ctx.diff_mode:
+        for key, version in (extra.get("versions") or {}).items():
+            ctx.diff_versions[key] = version
+
+
+def execute_retro(ctx: Context, stmt: Retro) -> None:
+    """docs/m4-contracts.md section 3.2: `retro("t") { ... }` runs its
+    body with `catalog.SNAPSHOT = t`, restored afterwards (even on
+    error). Block-local set scope, confirmed against a live reference
+    probe (a set assigned inside a `retro` block, including the default
+    set `_`, is not visible after it: `retro("t"){ node(...)->.then; }
+    .then; out count;` gives 0 on the reference) -- every `set_<name>`
+    table is snapshotted before the body runs and restored (or dropped,
+    if the body created it fresh) once it ends; only the body's own
+    `out` statements produce anything the caller sees."""
+    if not ctx.manifest.has_history():
+        raise UnsupportedError("retro(...) is not supported: this dataset has no history")
+    t = attic.evaluate_retro_time(ctx, stmt.time_expr)
+    remark = attic.history_remark(ctx.manifest, t)
+    if remark and remark not in ctx.warnings:
+        ctx.warnings.append(remark)
+    saved = attic.snapshot_sets(ctx.con)
+    token = catalog.SNAPSHOT.set(t)
+    try:
+        for body_stmt in stmt.body:
+            execute_statement(ctx, body_stmt)
+    finally:
+        catalog.SNAPSHOT.reset(token)
+        attic.restore_sets(ctx.con, saved)
+
+
+def execute_timeline(ctx: Context, stmt: Timeline) -> None:
+    """docs/m4-contracts.md section 3.2: `timeline(type, id[, version])`."""
+    if not ctx.manifest.has_history():
+        raise UnsupportedError("timeline(...) is not supported: this dataset has no history")
+    elements = attic.timeline_elements(ctx.con, ctx.manifest, stmt.element_type, stmt.element_id, stmt.version)
+    sql = attic.timeline_select_sql(elements)
+    setops.materialize(ctx.con, stmt.output_set, sql)
 
 
 def execute_statement(ctx: Context, stmt: Statement) -> None:
@@ -363,6 +438,10 @@ def execute_statement(ctx: Context, stmt: Statement) -> None:
         execute_item(ctx, stmt)
     elif isinstance(stmt, Out):
         execute_out(ctx, stmt)
+    elif isinstance(stmt, Retro):
+        execute_retro(ctx, stmt)
+    elif isinstance(stmt, Timeline):
+        execute_timeline(ctx, stmt)
     elif isinstance(stmt, Unsupported):
         raise UnsupportedError(f"{stmt.keyword} is not supported in M0")
     elif type(stmt) in hooks.STATEMENT_HOOKS:
@@ -391,13 +470,43 @@ def _program_uses_areas(statements) -> bool:
     return False
 
 
-def run_program(con, manifest: catalog.Manifest, program) -> Context:
+def run_program_body(con, manifest: catalog.Manifest, program, diff_mode: bool = False) -> Context:
+    """Everything `run_program` does after `check_settings` -- factored out
+    so `attic.run_diff_pass` can run the same program twice (once per
+    `[diff:]`/`[adiff:]` snapshot) without re-running `check_settings`
+    (already checked once by the executor before either pass) or
+    re-raising on the very setting that got it there. `[date:"t"]` sets
+    `catalog.SNAPSHOT` for the whole program (docs/m4-contracts.md section
+    3.2); a `[diff:]`/`[adiff:]` program's `settings.date` is never set
+    (the parser rejects both together via the grammar's own
+    one-setting-per-name rule), so this never conflicts with the
+    per-pass SNAPSHOT `attic.run_diff_pass` sets around this same call."""
     _load_hooks()
-    check_settings(program.settings)
     promoted_keys = set(manifest.promoted_keys)
     ctx = Context(con=con, manifest=manifest, promoted_keys=promoted_keys, global_bbox=program.settings.bbox,
-                  areas_used=_program_uses_areas(program.statements))
+                  areas_used=_program_uses_areas(program.statements), diff_mode=diff_mode)
     setops.ensure_empty_set(con, "_")
-    for stmt in program.statements:
-        execute_statement(ctx, stmt)
+    date_token = None
+    # A `[diff:]`/`[adiff:]` pass (`attic.run_diff_pass`) already sets
+    # `catalog.SNAPSHOT` around this very call; a program that somehow
+    # combines `[date:]` with `[diff:]`/`[adiff:]` must not have this
+    # override that pass's own snapshot.
+    if program.settings.date is not None and catalog.SNAPSHOT.get() is None:
+        t = attic.parse_date(program.settings.date)
+        remark = attic.history_remark(manifest, t)
+        if remark:
+            ctx.warnings.append(remark)
+        date_token = catalog.SNAPSHOT.set(t)
+    try:
+        for stmt in program.statements:
+            execute_statement(ctx, stmt)
+    finally:
+        if date_token is not None:
+            catalog.SNAPSHOT.reset(date_token)
     return ctx
+
+
+def run_program(con, manifest: catalog.Manifest, program) -> Context:
+    _load_hooks()
+    check_settings(manifest, program.settings)
+    return run_program_body(con, manifest, program)

@@ -264,7 +264,18 @@ def current_rows(
     -- byte-identical to the pre-M2 SQL, 0 extra files, 0 extra queries.
     When `base_files` is empty but delta tiers exist, only the delta side
     is emitted (a bbox/cell whose base file(s) got pruned to nothing can
-    still hold newly-created elements in the delta)."""
+    still hold newly-created elements in the delta).
+
+    docs/m4-contracts.md section 3.1: when `catalog.SNAPSHOT` is set,
+    `base_files`/the delta tiers are ignored entirely and the history
+    dataset is read instead (`attic.snapshot_current_rows`) -- callers
+    still pass `cells`/`cols`/`where_sql` the same way, so this stays the
+    single seam every spatial/cell-scoped read path goes through."""
+    snap = catalog.SNAPSHOT.get()
+    if snap is not None:
+        from . import attic
+
+        return attic.snapshot_current_rows(con, manifest, table, cells, cols, where_sql, snap)
     layer = spatial_delta_layer(con, manifest, table, cells)
     if layer is None:
         if not base_files:
@@ -321,7 +332,16 @@ def byid_current_rows(
     same as `current_rows`'s `where_sql`.
 
     Returns ``(select_sql, extra_files_read)``; degrades to the pre-M2
-    byid SQL (0 extra files/queries) when there are no delta tiers."""
+    byid SQL (0 extra files/queries) when there are no delta tiers.
+
+    docs/m4-contracts.md section 3.1: under `catalog.SNAPSHOT`, `base_files`
+    and the delta tiers are ignored and the history byid files are read
+    instead (`attic.snapshot_byid_current_rows`)."""
+    snap = catalog.SNAPSHOT.get()
+    if snap is not None:
+        from . import attic
+
+        return attic.snapshot_byid_current_rows(con, manifest, element_type, cols, id_pred_sql, tag_where_sql, snap)
     tiers = manifest.delta_tiers()
     if not tiers:
         if not base_files:
@@ -413,19 +433,31 @@ def build_node_spatial_select(
     ids: Optional[list[int]],
     promoted_keys: set[str],
 ) -> tuple[str, int]:
-    cells = catalog.cells_for_bbox(manifest, "node", bbox)
-    need_untagged = tagsql.is_negative_only(tag_filters)
-    files = _node_files(manifest, cells, "tagged")
-    if need_untagged:
-        files = files + _node_files(manifest, cells, "untagged")
-    if bbox is not None:
-        se, we, ne, ee = to_e7(bbox[0]), to_e7(bbox[1]), to_e7(bbox[2]), to_e7(bbox[3])
-        # Row-group pruning (m1-contracts.md section 6): node row groups
-        # carry the min/max of lon_e7/lat_e7, so the bbox tuple order here
-        # is (xmin=lon_min, ymin=lat_min, xmax=lon_max, ymax=lat_max).
-        files = catalog.prune_files_by_bbox(manifest, "node", files, (we, se, ee, ne))
-    if not files and not manifest.delta_tiers():
-        return empty_set_sql(), 0
+    snap = catalog.SNAPSHOT.get()
+    if snap is not None:
+        # docs/m4-contracts.md section 3.1: a snapshot read ignores the
+        # current tagged/untagged spatial files and row-group index
+        # entirely (no history equivalent), reading history instead --
+        # `current_rows` below does the actual branching, so `files` here
+        # is unused (never passed on this path); only `cells` matters, and
+        # it comes from the history dataset's own cell presence, not the
+        # current table's.
+        cells = catalog.history_cells_for_bbox(manifest, "node", bbox)
+        files: list[str] = []
+    else:
+        cells = catalog.cells_for_bbox(manifest, "node", bbox)
+        need_untagged = tagsql.is_negative_only(tag_filters)
+        files = _node_files(manifest, cells, "tagged")
+        if need_untagged:
+            files = files + _node_files(manifest, cells, "untagged")
+        if bbox is not None:
+            se, we, ne, ee = to_e7(bbox[0]), to_e7(bbox[1]), to_e7(bbox[2]), to_e7(bbox[3])
+            # Row-group pruning (m1-contracts.md section 6): node row groups
+            # carry the min/max of lon_e7/lat_e7, so the bbox tuple order here
+            # is (xmin=lon_min, ymin=lat_min, xmax=lon_max, ymax=lat_max).
+            files = catalog.prune_files_by_bbox(manifest, "node", files, (we, se, ee, ne))
+        if not files and not manifest.delta_tiers():
+            return empty_set_sql(), 0
 
     where = []
     if bbox is not None:
@@ -464,13 +496,18 @@ def build_way_spatial_select(
     ids: Optional[list[int]],
     promoted_keys: set[str],
 ) -> tuple[str, int]:
-    cells = catalog.cells_for_bbox(manifest, "way", bbox)
-    files = _way_files(manifest, cells)
-    if bbox is not None:
-        se, we, ne, ee = to_e7(bbox[0]), to_e7(bbox[1]), to_e7(bbox[2]), to_e7(bbox[3])
-        files = catalog.prune_files_by_bbox(manifest, "way", files, (we, se, ee, ne))
-    if not files and not manifest.delta_tiers():
-        return empty_set_sql(), 0
+    snap = catalog.SNAPSHOT.get()
+    if snap is not None:
+        cells = catalog.history_cells_for_bbox(manifest, "way", bbox)
+        files: list[str] = []
+    else:
+        cells = catalog.cells_for_bbox(manifest, "way", bbox)
+        files = _way_files(manifest, cells)
+        if bbox is not None:
+            se, we, ne, ee = to_e7(bbox[0]), to_e7(bbox[1]), to_e7(bbox[2]), to_e7(bbox[3])
+            files = catalog.prune_files_by_bbox(manifest, "way", files, (we, se, ee, ne))
+        if not files and not manifest.delta_tiers():
+            return empty_set_sql(), 0
 
     where = []
     if bbox is not None:
@@ -604,13 +641,18 @@ def build_relation_spatial_select(
     ids: Optional[list[int]],
     promoted_keys: set[str],
 ) -> tuple[str, int]:
-    cells = catalog.cells_for_bbox(manifest, "relation", bbox)
-    files = _relation_files(manifest, cells)
-    if bbox is not None:
-        se, we, ne, ee = to_e7(bbox[0]), to_e7(bbox[1]), to_e7(bbox[2]), to_e7(bbox[3])
-        files = catalog.prune_files_by_bbox(manifest, "relation", files, (we, se, ee, ne))
-    if not files and not manifest.delta_tiers():
-        return empty_set_sql(), 0
+    snap = catalog.SNAPSHOT.get()
+    if snap is not None:
+        cells = catalog.history_cells_for_bbox(manifest, "relation", bbox)
+        files: list[str] = []
+    else:
+        cells = catalog.cells_for_bbox(manifest, "relation", bbox)
+        files = _relation_files(manifest, cells)
+        if bbox is not None:
+            se, we, ne, ee = to_e7(bbox[0]), to_e7(bbox[1]), to_e7(bbox[2]), to_e7(bbox[3])
+            files = catalog.prune_files_by_bbox(manifest, "relation", files, (we, se, ee, ne))
+        if not files and not manifest.delta_tiers():
+            return empty_set_sql(), 0
 
     where = []
     if bbox is not None:
@@ -647,12 +689,17 @@ def build_relation_spatial_select(
     }
     sql, extra_files = current_rows(con, manifest, "relation", cells, files, cols, where_sql)
     nfiles = len(files) + extra_files
-    if bbox is not None:
+    if bbox is not None and snap is None:
         # The coarse test above is the union-of-members AABB (contract
         # section 4); it can pass while no individual member actually
         # falls in the bbox (e.g. an L-shaped union of two far-apart member
         # ways). Re-check exactly, only resolving the members of whatever
-        # survived the coarse prune.
+        # survived the coarse prune. Skipped under a snapshot (docs/m4-
+        # contracts.md section 3.1): the member-node/way lookups this uses
+        # are current-only, so re-checking exactly against them at an
+        # attic date could wrongly drop a relation whose members have
+        # since moved -- the coarse AABB test above is kept as the
+        # (slightly looser) selection instead.
         sql, extra_files = _relation_bbox_exact_filter(con, manifest, sql, bbox)
         nfiles += extra_files
     return sql, nfiles
@@ -735,6 +782,17 @@ def build_byid_select(
     ids = list(ids)
     if not ids:
         return empty_set_sql(), 0
+    # docs/m4-contracts.md section 3.1: under a snapshot, `byid_current_rows`
+    # ignores `files`/delta tiers entirely and reads history instead, so
+    # the "nothing to read" guard below (current byid parts + delta tiers)
+    # must not short-circuit before ever reaching it -- a history-only id
+    # (never present in the current byid copy) would otherwise always
+    # come back empty.
+    if catalog.SNAPSHOT.get() is not None:
+        id_pred = idset.id_predicate(con, "id", ids)
+        tag_where = tagsql.tag_filters_sql(tag_filters, promoted_keys)
+        cols = _byid_cols(element_type)
+        return byid_current_rows(con, manifest, element_type, [], cols, id_pred, tag_where)
     lo, hi = idset.id_range(ids)
     parts = catalog.byid_parts_for_range(manifest, element_type, lo, hi)
     files = [manifest.path(p["path"]) for p in parts]
@@ -809,18 +867,33 @@ def build_way_bbox_semijoin_select(
 
     Returns (None, 0) when `cells_for_bbox` would touch more than
     `max_cell_fraction` of all leaves -- the planet-scale guard, the same
-    one `build_node_hydrate_via_bbox_select` uses."""
-    cells = catalog.cells_for_bbox(manifest, "way", bbox)
-    total_leaves = len(manifest.leaf_cells) or 1
-    if not cells or len(cells) > max_cell_fraction * total_leaves:
-        return None, 0
-    files = _way_files(manifest, cells)
+    one `build_node_hydrate_via_bbox_select` uses.
+
+    docs/m4-contracts.md section 3.1: under a snapshot, cells come from
+    `history_cells_for_bbox` and the current way spatial files/row-group
+    prune are skipped -- `current_rows` reads history for `cells`
+    regardless of what (empty) `files` this passes it."""
+    snap = catalog.SNAPSHOT.get()
+    if snap is not None:
+        cells = catalog.history_cells_for_bbox(manifest, "way", bbox)
+        total_leaves = len(manifest.leaf_cells) or 1
+        if not cells or len(cells) > max_cell_fraction * total_leaves:
+            return None, 0
+        files: list[str] = []
+    else:
+        cells = catalog.cells_for_bbox(manifest, "way", bbox)
+        total_leaves = len(manifest.leaf_cells) or 1
+        if not cells or len(cells) > max_cell_fraction * total_leaves:
+            return None, 0
+        files = _way_files(manifest, cells)
+        s, w, n, e = bbox
+        se, we, ne, ee = to_e7(s), to_e7(w), to_e7(n), to_e7(e)
+        files = catalog.prune_files_by_bbox(manifest, "way", files, (we, se, ee, ne))
+        if not files and not manifest.delta_tiers():
+            return empty_set_sql(), 0
+
     s, w, n, e = bbox
     se, we, ne, ee = to_e7(s), to_e7(w), to_e7(n), to_e7(e)
-    files = catalog.prune_files_by_bbox(manifest, "way", files, (we, se, ee, ne))
-    if not files and not manifest.delta_tiers():
-        return empty_set_sql(), 0
-
     bbox_where = f"xmax_e7 >= {we} AND xmin_e7 <= {ee} AND ymax_e7 >= {se} AND ymin_e7 <= {ne}"
     tag_where = tagsql.tag_filters_sql(tag_filters, promoted_keys)
 
@@ -1190,7 +1263,17 @@ def build_byid_select_from_ids_query(
     all. `lo`/`hi` (from a SQL aggregate on that same relation, not a Python
     id scan) pick which byid parts can contain them. `con` is needed (added
     for M2) to materialize the delta candidate/shadow TEMP TABLEs when the
-    manifest has delta tiers -- see `byid_current_rows`."""
+    manifest has delta tiers -- see `byid_current_rows`.
+
+    docs/m4-contracts.md section 3.1: under a snapshot, skips the current
+    byid-parts/delta-tiers guard entirely (same reasoning as
+    `build_byid_select`) so a history-only id is never dropped before
+    `byid_current_rows` gets a chance to read history for it."""
+    if catalog.SNAPSHOT.get() is not None:
+        id_pred = f"id IN ({id_subquery_sql})"
+        tag_where = tagsql.tag_filters_sql(tag_filters, promoted_keys)
+        cols = _byid_cols(element_type)
+        return byid_current_rows(con, manifest, element_type, [], cols, id_pred, tag_where)
     parts = catalog.byid_parts_for_range(manifest, element_type, lo, hi)
     files = [manifest.path(p["path"]) for p in parts]
     tiers = manifest.delta_tiers()

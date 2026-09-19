@@ -245,10 +245,40 @@ class If:
 @dataclass
 class Unsupported:
     """Syntactically consumed statement the planner cannot run (for, complete,
-    retro, compare, make, convert, timeline, local ...)."""
+    compare, make, convert, local ...)."""
 
     keyword: str
     source: str
+
+
+@dataclass
+class Retro:
+    """``retro(<time-expr>) { <body> }`` (docs/m4-contracts.md section 3.2).
+    ``time_expr`` is the raw source text between the parens: either a
+    quoted string literal or an evaluator expression the M3 evaluator
+    (``osmpq.ql.evaluator``) supports, evaluated against the ambient
+    default set at run time. The body runs with ``catalog.SNAPSHOT`` set
+    to the evaluated timestamp, restored to whatever it was before on
+    exit (including on error). Block-local set scope (confirmed against
+    a live reference probe): every set the body assigns -- including the
+    default set ``_`` -- is restored to whatever it held before the block
+    once it ends; only the body's own ``out`` statements are visible
+    outside it."""
+
+    time_expr: str
+    body: list["Statement"] = field(default_factory=list)
+
+
+@dataclass
+class Timeline:
+    """``timeline(<type>, <id>[, <version>])`` (docs/m4-contracts.md
+    section 3.2). Produces a set of synthetic ``timeline`` elements, one
+    per state (own version or minor version) of the named element."""
+
+    element_type: ElementType
+    element_id: int
+    version: Optional[int] = None
+    output_set: str = "_"
 
 
 Statement = TypingUnion[
@@ -262,6 +292,8 @@ Statement = TypingUnion[
     Out,
     Foreach,
     If,
+    Retro,
+    Timeline,
     Unsupported,
 ]
 

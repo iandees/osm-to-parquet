@@ -241,6 +241,96 @@ class Manifest:
     def has_areas(self) -> bool:
         return bool(self.area_index or self.way_area_index)
 
+    # -- history (docs/m4-contracts.md section 2) ------------------------
+
+    @property
+    def history(self) -> Optional[dict]:
+        """The manifest v5 ``history`` section, or None when absent (any
+        manifest version without it -- "attic unsupported")."""
+        return self.data.get("history")
+
+    def has_history(self) -> bool:
+        return bool(self.history)
+
+    @property
+    def history_generation(self) -> Optional[str]:
+        h = self.history
+        return h.get("generation") if h else None
+
+    @property
+    def history_since(self) -> Optional[str]:
+        """The ISO timestamp ``history.since`` (section 2.3), or None when
+        there is no history."""
+        h = self.history
+        return h.get("since") if h else None
+
+    def history_spatial_parts(self, table: str, cells: list[str]) -> list[dict]:
+        """Manifest entries (``{"path", "rows", "bytes"}``) for `table`'s
+        base history spatial files of `cells`, or `[]` when there is no
+        history / no entry for those cells."""
+        h = self.history
+        if not h:
+            return []
+        by_cell = (h.get("spatial") or {}).get(table, {})
+        out: list[dict] = []
+        for c in cells:
+            out.extend(by_cell.get(c, []))
+        return out
+
+    def history_spatial_files(self, table: str, cells: list[str]) -> list[str]:
+        return [self.path(p["path"]) for p in self.history_spatial_parts(table, cells)]
+
+    def history_byid_parts(self, table: str) -> list[dict]:
+        """Every manifest entry for `table`'s base history byid files
+        (``{"path", "min_id", "max_id", "rows", "bytes"}``), or `[]`."""
+        h = self.history
+        if not h:
+            return []
+        return list((h.get("byid") or {}).get(table, []))
+
+    def history_byid_parts_for_range(self, table: str, lo: Optional[int], hi: Optional[int]) -> list[dict]:
+        return parts_for_range(self.history_byid_parts(table), lo, hi)
+
+    def history_tiers(self) -> list[dict]:
+        """The present history tiers (``history.tiers``, section 2.3), as a
+        list of their raw manifest dicts (hour, day, week -- whichever are
+        present), each carrying a resolved ``files`` mapping
+        (``{"node": {"spatial": <abspath>, "byid": <abspath>}, ...}``).
+        Empty when there is no history or no tiers are present (a fresh
+        history with nothing appended yet)."""
+        h = self.history
+        if not h:
+            return []
+        tiers = h.get("tiers") or {}
+        out: list[dict] = []
+        for name in ("hour", "day", "week"):
+            tier = tiers.get(name)
+            if not tier:
+                continue
+            files = tier.get("files", {}) or {}
+            resolved_files: dict[str, dict[str, str]] = {}
+            for t in ("node", "way", "relation"):
+                tf = files.get(t) or {}
+                resolved_files[t] = {k: self.path(v) for k, v in tf.items() if v}
+            out.append({**tier, "name": name, "files": resolved_files})
+        return out
+
+    def history_tier_spatial_files(self, table: str) -> list[str]:
+        return [
+            f
+            for tier in self.history_tiers()
+            for f in [tier["files"].get(table, {}).get("spatial")]
+            if f
+        ]
+
+    def history_tier_byid_files(self, table: str) -> list[str]:
+        return [
+            f
+            for tier in self.history_tiers()
+            for f in [tier["files"].get(table, {}).get("byid")]
+            if f
+        ]
+
     def byid_parts(self, table: str) -> list[dict]:
         return list(self.data.get("byid", {}).get(table, []))
 
@@ -376,6 +466,21 @@ def cells_for_bbox(manifest: Manifest, table: str, bbox: Optional[BBox]) -> list
     base_present = manifest.table_cells(table)
     present = set(base_present.keys())
     present |= delta_present_cells(manifest, table)
+    return _cells_for_present(manifest, table, bbox, present, base_keys=set(base_present.keys()))
+
+
+def _cells_for_present(
+    manifest: Manifest, table: str, bbox: Optional[BBox], present: set[str], base_keys: set[str]
+) -> list[str]:
+    """Shared leaf/ancestor walk behind `cells_for_bbox` and
+    `history_cells_for_bbox`: `present` is whichever cell-key set counts as
+    "has a file for this bbox selection" for the caller (the base's own
+    cells plus delta-declared ones for `cells_for_bbox`; the history
+    dataset's own spatial cell keys for `history_cells_for_bbox`).
+    `base_keys` is the subset that came from an actual base/leaf-derived
+    listing (as opposed to a delta/history-only declaration), used the
+    same way `cells_for_bbox` used `base_present.keys()` to find cells
+    reachable only by direct bbox test."""
     if bbox is None:
         return sorted(present)
     leaves = leaves_intersecting(manifest, bbox)
@@ -391,11 +496,26 @@ def cells_for_bbox(manifest: Manifest, table: str, bbox: Optional[BBox]) -> list
     else:
         for leaf in leaves:
             wanted.update(ancestors_and_self(leaf))
-    delta_only = present - set(base_present.keys())
-    for c in delta_only:
+    extra_only = present - base_keys
+    for c in extra_only:
         if c not in wanted and bbox_intersects(bbox, cell_bbox(c)):
             wanted.add(c)
     return sorted(c for c in wanted if c in present)
+
+
+def history_cells_for_bbox(manifest: Manifest, table: str, bbox: Optional[BBox]) -> list[str]:
+    """Like `cells_for_bbox`, but "present" is the history dataset's own
+    base spatial cell keys (`history.spatial.<table>`, docs/m4-contracts.md
+    section 2.3) instead of the *current* table's cells -- a cell that has
+    long since emptied out (every element in it deleted or moved away) can
+    still hold history rows for dates when it wasn't empty, and would
+    otherwise never be reached by `cells_for_bbox`'s current-presence
+    filter. Empty when there is no history."""
+    h = manifest.history
+    if not h:
+        return []
+    present = set((h.get("spatial") or {}).get(table, {}).keys())
+    return _cells_for_present(manifest, table, bbox, present, base_keys=present)
 
 
 def parts_for_range(parts: list[dict], lo: Optional[int], hi: Optional[int]) -> list[dict]:
@@ -509,6 +629,20 @@ class DeltaStats:
 
 DELTA_STATS: "contextvars.ContextVar[Optional[DeltaStats]]" = contextvars.ContextVar(
     "osmpq_delta_stats", default=None
+)
+
+
+#: docs/m4-contracts.md section 3.1: when set, `sources.current_rows` and
+#: `sources.byid_current_rows` ignore their `base_files`/delta arguments
+#: entirely and read the history dataset's "state at this instant"
+#: instead (see `osmpq.engine.attic`). None (the default) means "no
+#: attic": every read path is byte-identical to a manifest with no
+#: history, which is the M4 no-regression requirement. Set for the
+#: duration of `[date:]`/`retro(...)`/one pass of `[diff:]`/`[adiff:]`
+#: (`executor`/`attic`), a per-thread ContextVar for the same
+#: concurrency reasons as `FILE_STATS`/`DELTA_STATS` above.
+SNAPSHOT: "contextvars.ContextVar[Optional[object]]" = contextvars.ContextVar(
+    "osmpq_snapshot", default=None
 )
 
 

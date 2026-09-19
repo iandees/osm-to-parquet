@@ -32,7 +32,9 @@ from osmpq.ql.ast import (
     Query,
     Recurse,
     RecurseFilter,
+    Retro,
     TagFilter,
+    Timeline,
     UidFilter,
     Union,
     Unsupported,
@@ -753,7 +755,7 @@ def test_if_statement_with_else():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("keyword", ["for", "complete", "retro", "compare"])
+@pytest.mark.parametrize("keyword", ["for", "complete", "compare"])
 def test_block_keywords_captured_as_unsupported(keyword):
     stmt = parse_one(f"{keyword}(t) {{ out; }}")
     assert isinstance(stmt, Unsupported)
@@ -762,13 +764,34 @@ def test_block_keywords_captured_as_unsupported(keyword):
     assert "out;" in stmt.source
 
 
-@pytest.mark.parametrize("keyword", ["make", "convert", "timeline", "local"])
+def test_retro_is_a_real_parsed_statement_not_unsupported():
+    # docs/m4-contracts.md section 3.2: M4 gives `retro` real AST support
+    # (tests/test_ql_parser.py's own retro/timeline tests -- see
+    # `test_engine_control`/`test_attic_*` for behavior); it's no longer
+    # a placeholder `Unsupported` node like `for`/`complete`/`compare`.
+    stmt = parse_one('retro("2020-01-01T00:00:00Z") { out; }')
+    assert isinstance(stmt, Retro)
+    assert stmt.time_expr == '"2020-01-01T00:00:00Z"'
+    assert len(stmt.body) == 1
+
+
+@pytest.mark.parametrize("keyword", ["make", "convert", "local"])
 def test_simple_keywords_captured_as_unsupported(keyword):
     stmt = parse_one(f"{keyword} point = geom;")
     assert isinstance(stmt, Unsupported)
     assert stmt.keyword == keyword
     assert stmt.source.startswith(keyword)
     assert stmt.source.endswith(";")
+
+
+def test_timeline_is_a_real_parsed_statement_not_unsupported():
+    # docs/m4-contracts.md section 3.2: same story as `retro` above.
+    stmt = parse_one("timeline(way,23125943,4)->.t;")
+    assert isinstance(stmt, Timeline)
+    assert stmt.element_type == "way"
+    assert stmt.element_id == 23125943
+    assert stmt.version == 4
+    assert stmt.output_set == "t"
 
 
 def test_unsupported_simple_does_not_split_on_semicolon_inside_parens():

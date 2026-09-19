@@ -71,7 +71,7 @@ from osmpq import store as store_mod
 from osmpq.errors import RuntimeQueryError
 from osmpq.ql.ast import Program
 
-from . import catalog, hilbert, planner
+from . import attic, catalog, hilbert, planner
 from .result import Result
 
 
@@ -280,8 +280,23 @@ class Engine:
                 timer.start()
 
             start = time.monotonic()
+            is_diff = settings.diff is not None or settings.adiff is not None
             try:
-                ctx = planner.run_program(con, manifest, program)
+                if is_diff:
+                    # docs/m4-contracts.md section 3.2: two passes of the
+                    # whole program (`SNAPSHOT = a` then `= b`), turned
+                    # into an action list -- `ctx` below stands in for the
+                    # normal single-pass `Context` so the stats/error
+                    # handling beneath is unchanged either way.
+                    planner.check_settings(manifest, settings)
+                    diff_result = attic.run_diff_program(con, manifest, program)
+                    ctx = diff_result
+                else:
+                    # Unchanged from before M4: `planner.run_program` is
+                    # still the one call site for a normal (non-diff) run
+                    # -- it calls `check_settings` itself and then
+                    # `run_program_body`, exactly as pre-M4.
+                    ctx = planner.run_program(con, manifest, program)
             except duckdb.InterruptException:
                 elapsed = time.monotonic() - start
                 if timed_out_flag[0]:
@@ -353,6 +368,7 @@ class Engine:
                 remark=None,
                 timestamp_osm_base=manifest.timestamp_osm_base,
                 stats=stats,
+                is_diff=is_diff,
             )
         finally:
             con.close()

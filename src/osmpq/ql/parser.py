@@ -305,9 +305,13 @@ class Parser:
             if word == "map_to_area":
                 self.advance()
                 return self.parse_map_to_area("_")
-            if word in ("for", "complete", "retro", "compare"):
+            if word == "retro":
+                return self.parse_retro()
+            if word == "timeline":
+                return self.parse_timeline()
+            if word in ("for", "complete", "compare"):
                 return self.parse_unsupported_block(word)
-            if word in ("make", "convert", "timeline", "local"):
+            if word in ("make", "convert", "local"):
                 return self.parse_unsupported_simple(word)
             self.error(f"unknown statement '{word}'")
         label = "end of input" if tok.type == EOF else f"'{tok.text}'"
@@ -645,6 +649,48 @@ class Parser:
                     otherwise.append(stmt)
             self.expect(RBRACE)
         return ast.If(condition=condition, then=then_stmts, otherwise=otherwise)
+
+    def parse_retro(self) -> ast.Retro:
+        """``retro(<time-expr>) { <body> }`` (docs/m4-contracts.md section
+        3.2). The time expression is captured as raw source text, same
+        trick as ``(if: ...)`` -- evaluated later by the engine, which
+        knows how to run the M3 evaluator subset."""
+        self.advance()  # consume 'retro'
+        self.expect(LPAREN)
+        time_expr = self.capture_until_matching_rparen()
+        self.expect(RPAREN)
+        self.expect(LBRACE)
+        body: list[ast.Statement] = []
+        while not self.check(RBRACE):
+            if self.at_end():
+                self.error("unbalanced '{' '}' in 'retro' block")
+            stmt = self.parse_statement()
+            if stmt is not None:
+                body.append(stmt)
+        self.expect(RBRACE)
+        return ast.Retro(time_expr=time_expr, body=body)
+
+    _TIMELINE_TYPES = {"node": "node", "way": "way", "relation": "relation", "rel": "relation"}
+
+    def parse_timeline(self) -> ast.Timeline:
+        """``timeline(<type>, <id>[, <version>])`` (docs/m4-contracts.md
+        section 3.2)."""
+        self.advance()  # consume 'timeline'
+        self.expect(LPAREN)
+        type_word = self.expect_ident_text()
+        if type_word not in self._TIMELINE_TYPES:
+            self.error(f"unknown element type '{type_word}' in timeline(...)")
+        element_type = self._TIMELINE_TYPES[type_word]
+        self.expect(COMMA)
+        element_id = int(self.parse_signed_number())
+        version = None
+        if self.check(COMMA):
+            self.advance()
+            version = int(self.parse_signed_number())
+        self.expect(RPAREN)
+        output_set = self.parse_output_set()
+        self.expect(SEMI)
+        return ast.Timeline(element_type=element_type, element_id=element_id, version=version, output_set=output_set)  # type: ignore[arg-type]
 
     def parse_unsupported_block(self, keyword: str) -> ast.Unsupported:
         """for/complete/retro/compare: consume up to and including the

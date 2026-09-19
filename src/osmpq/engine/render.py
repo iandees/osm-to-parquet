@@ -145,10 +145,16 @@ def fetch_counts(con, target_set: str) -> dict:
     # alongside nodes/ways/relations when the set holds area rows.
     counts = {"nodes": 0, "ways": 0, "relations": 0, "areas": 0}
     label = {"node": "nodes", "way": "ways", "relation": "relations", "area": "areas"}
+    # docs/m4-contracts.md section 3.2: a `timeline` set (or any other
+    # synthetic element type) has no bucket of its own -- it counts under
+    # `total` only.
+    other_total = 0
     for t, c in rows:
         if t in label:
             counts[label[t]] = c
-    counts["total"] = counts["nodes"] + counts["ways"] + counts["relations"] + counts["areas"]
+        else:
+            other_total += c
+    counts["total"] = counts["nodes"] + counts["ways"] + counts["relations"] + counts["areas"] + other_total
     return counts
 
 
@@ -163,9 +169,24 @@ def hydrate_way_geometry(con, manifest: catalog.Manifest, rows: list[dict]) -> N
     own cell, so this is one registered (cell, id) TEMP TABLE plus one
     join across the handful of spatial way files those cells need --
     instead of a Python loop doing one `id IN (<n literals>)` query per
-    cell."""
+    cell.
+
+    docs/m4-contracts.md section 3.1: under a snapshot, a byid-sourced
+    way row's `cell` is still whatever `attic.snapshot_byid_current_rows`
+    projected (the history byid row's own `cell` column), but the base/
+    delta spatial-file lookup below is current-only -- resolve from
+    history instead."""
     missing = [r for r in rows if r["type"] == "way" and not r.get("geometry_wkt") and r.get("cell")]
     if not missing:
+        return
+    snap = catalog.SNAPSHOT.get()
+    if snap is not None:
+        from . import attic
+
+        resolved = attic.history_way_geometry_by_id(con, manifest, [r["id"] for r in missing], snap)
+        for r in missing:
+            if r["id"] in resolved:
+                r["geometry_wkt"] = resolved[r["id"]]
         return
     tc = manifest.table_cells("way")
     needed_cells = sorted({r["cell"] for r in missing if r["cell"] in tc})
@@ -434,7 +455,17 @@ def build_elements(
         way_geoms = {}
 
     elements = [_row_to_element(r, out, node_coords, way_geoms) for r in rows]
-    return elements, {}
+    # docs/m4-contracts.md section 3.2: `[diff:]`/`[adiff:]` needs to know
+    # whether two passes' elements are the *same state* even when the
+    # requested verbosity (`out ids`/`out count`, most starkly) strips
+    # every field that would otherwise show it -- `rows` always carries
+    # `version` regardless of verbosity, so hand it back keyed by
+    # (type, id) for `attic.build_diff_actions` to use as its primary
+    # "did this change" signal (the rendered dicts remain the tiebreaker
+    # for a same-version minor/geometry-only difference `out geom`/`out
+    # meta` would actually show).
+    versions = {(r["type"], r["id"]): r.get("version") for r in rows}
+    return elements, {"versions": versions}
 
 
 def _row_to_element(row: dict, out: Out, node_coords: dict, way_geoms: dict) -> dict:
