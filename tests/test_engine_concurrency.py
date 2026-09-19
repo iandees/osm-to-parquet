@@ -157,20 +157,19 @@ def test_engine_opens_one_database_reused_by_every_run(engine, fixture_v2):
     assert engine._db is db_before
 
 
-def test_engine_run_uses_a_cursor_not_the_shared_db_directly(monkeypatch, engine, fixture_v2):
+def test_engine_run_uses_a_cursor_not_the_shared_db_directly(engine, fixture_v2):
+    # `run()` materializes `set_<name>` temp tables while it runs. If those
+    # lived on `self._db` itself (rather than on a per-run cursor that
+    # gets closed in `run_program`'s `finally`), they'd still be visible
+    # on `self._db` afterwards; a cursor's temp tables die with the
+    # cursor, so querying `self._db` straight after `run()` returns should
+    # show none left over.
     b = bbox_args(fixture_v2.leaf_bbox["000"])
-    seen = []
-    real_cursor = engine._db.cursor
-
-    def spying_cursor():
-        cur = real_cursor()
-        seen.append(cur)
-        return cur
-
-    monkeypatch.setattr(engine._db, "cursor", spying_cursor)
     engine.run(f"[out:json];node[amenity=cafe]({b});out;")
-    assert len(seen) == 1
-    assert seen[0] is not engine._db
+    leftover = engine._db.execute(
+        "SELECT table_name FROM duckdb_tables() WHERE temporary AND table_name LIKE 'set\\_%' ESCAPE '\\'"
+    ).fetchall()
+    assert leftover == []
 
 
 # --------------------------------------------------------------------
@@ -261,7 +260,6 @@ def test_engine_creates_s3_secret_for_s3_root(monkeypatch, tmp_path):
     def fake_connect(*a, **kw):
         return _RecordingConnection(real_connect(*a, **kw))
 
-    monkeypatch.setattr(executor_mod, "duckdb", executor_mod.duckdb)
     monkeypatch.setattr(executor_mod.duckdb, "connect", fake_connect)
 
     # Engine.__init__ treats `root` purely as a string prefix check for the
@@ -272,13 +270,12 @@ def test_engine_creates_s3_secret_for_s3_root(monkeypatch, tmp_path):
     # separately confirm Engine._setup_database issues it when root is
     # s3://-prefixed, using a monkeypatched loader.
     called_with = {}
+    real_load_manifest = executor_mod.catalog.load_manifest
 
     def fake_load_manifest(root, con=None):
         called_with["root"] = root
         called_with["con"] = con
-        from osmpq.engine import catalog
-
-        return catalog.load_manifest(info.root)
+        return real_load_manifest(info.root)
 
     monkeypatch.setattr(executor_mod.catalog, "load_manifest", fake_load_manifest)
 
