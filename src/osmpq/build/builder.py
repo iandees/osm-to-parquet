@@ -213,41 +213,48 @@ def build(opts: BuildOptions) -> manifest_mod.Manifest:
 
     # ---- relation bbox (member nodes/ways, then one nested pass) -------------
     t0 = time.time()
+    # Flatten members first so every lookup is a plain equi-join; a lateral
+    # UNNEST joined straight against the node table planned as a near
+    # cross product at state scale.
+    con.execute("""
+        CREATE TABLE rel_members AS
+        SELECT r.id AS rel_id, m.type AS mtype, m.ref AS mref
+        FROM relation0 r, UNNEST(r.members) AS t(m)
+    """)
+    con.execute("""
+        CREATE TABLE rel_member_bbox AS
+        SELECT rm.rel_id, nn.lat_e7 AS ymin_e7, nn.lat_e7 AS ymax_e7,
+               nn.lon_e7 AS xmin_e7, nn.lon_e7 AS xmax_e7
+        FROM rel_members rm JOIN node0 nn ON nn.id = rm.mref
+        WHERE rm.mtype = 'n'
+        UNION ALL
+        SELECT rm.rel_id, ww.ymin_e7, ww.ymax_e7, ww.xmin_e7, ww.xmax_e7
+        FROM rel_members rm JOIN way1 ww ON ww.id = rm.mref
+        WHERE rm.mtype = 'w' AND ww.xmin_e7 IS NOT NULL
+    """)
     con.execute("""
         CREATE TABLE relation_bbox0 AS
         SELECT r.id,
-               min(CASE m.type
-                     WHEN 'n' THEN nn.lat_e7
-                     WHEN 'w' THEN ww.ymin_e7 END) AS ymin_e7,
-               max(CASE m.type
-                     WHEN 'n' THEN nn.lat_e7
-                     WHEN 'w' THEN ww.ymax_e7 END) AS ymax_e7,
-               min(CASE m.type
-                     WHEN 'n' THEN nn.lon_e7
-                     WHEN 'w' THEN ww.xmin_e7 END) AS xmin_e7,
-               max(CASE m.type
-                     WHEN 'n' THEN nn.lon_e7
-                     WHEN 'w' THEN ww.xmax_e7 END) AS xmax_e7
-        FROM relation0 r
-        LEFT JOIN UNNEST(r.members) AS t(m) ON true
-        LEFT JOIN node0 nn ON m.type = 'n' AND nn.id = m.ref
-        LEFT JOIN way1 ww ON m.type = 'w' AND ww.id = m.ref
+               min(b.ymin_e7) AS ymin_e7, max(b.ymax_e7) AS ymax_e7,
+               min(b.xmin_e7) AS xmin_e7, max(b.xmax_e7) AS xmax_e7
+        FROM relation0 r LEFT JOIN rel_member_bbox b ON b.rel_id = r.id
         GROUP BY r.id
     """)
     # second pass: fold in bboxes of member relations resolved in pass 0
     con.execute("""
         CREATE TABLE relation_bbox1 AS
-        SELECT r.id,
-               LEAST(r0.ymin_e7, min(CASE WHEN m.type = 'r' THEN rb.ymin_e7 END)) AS ymin_e7,
-               GREATEST(r0.ymax_e7, max(CASE WHEN m.type = 'r' THEN rb.ymax_e7 END)) AS ymax_e7,
-               LEAST(r0.xmin_e7, min(CASE WHEN m.type = 'r' THEN rb.xmin_e7 END)) AS xmin_e7,
-               GREATEST(r0.xmax_e7, max(CASE WHEN m.type = 'r' THEN rb.xmax_e7 END)) AS xmax_e7
-        FROM relation0 r
-        JOIN relation_bbox0 r0 ON r0.id = r.id
-        LEFT JOIN UNNEST(r.members) AS t(m) ON true
-        LEFT JOIN relation_bbox0 rb ON m.type = 'r' AND rb.id = m.ref
-        GROUP BY r.id, r0.ymin_e7, r0.ymax_e7, r0.xmin_e7, r0.xmax_e7
+        SELECT r0.id,
+               LEAST(r0.ymin_e7, min(rb.ymin_e7)) AS ymin_e7,
+               GREATEST(r0.ymax_e7, max(rb.ymax_e7)) AS ymax_e7,
+               LEAST(r0.xmin_e7, min(rb.xmin_e7)) AS xmin_e7,
+               GREATEST(r0.xmax_e7, max(rb.xmax_e7)) AS xmax_e7
+        FROM relation_bbox0 r0
+        LEFT JOIN rel_members rm ON rm.rel_id = r0.id AND rm.mtype = 'r'
+        LEFT JOIN relation_bbox0 rb ON rb.id = rm.mref
+        GROUP BY r0.id, r0.ymin_e7, r0.ymax_e7, r0.xmin_e7, r0.xmax_e7
     """)
+    con.execute("DROP TABLE rel_member_bbox")
+    con.execute("DROP TABLE rel_members")
     con.execute("""
         CREATE TABLE relation1 AS
         SELECT r.id, r.tags, r.members, r.version, r.changeset, r.timestamp, r.uid, r."user",
