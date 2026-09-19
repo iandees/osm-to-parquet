@@ -30,8 +30,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from osmpq.build import areas as areas_mod
 from osmpq.build import common
 from osmpq.build import rowgroups as rowgroups_mod
+from osmpq.engine import catalog as engine_catalog
 
 TIER_ORDER = ["hour", "day", "week"]  # precedence high (0) to low
 
@@ -554,6 +556,119 @@ def _flat_rg_files(table_manifest: dict) -> list[dict]:
 
 
 # --------------------------------------------------------------------------
+# areas (docs/m3-contracts.md section 4.3): re-derive touched pivots, merge
+# into the previous generation's area cell files, rewrite the index in full.
+# --------------------------------------------------------------------------
+
+
+def _compact_areas(
+    con, root: Path, old_man: dict, new_man: dict, new_generation: str,
+    promoted_keys: list[str],
+    has_way_byid: bool, way_byid_winners_view: str,
+    has_rel_byid: bool, relation_byid_winners_view: str,
+) -> tuple[Optional[dict], int]:
+    """Re-derives area rows for touched pivots -- winners of type way/
+    relation, which already include every relation that lists a touched
+    way as a member, since the updater puts those into the touched set too
+    (docs/m2-contracts.md's touched-set fixed point) -- merges them into
+    the previous generation's area cell files (only cells that actually
+    gained/lost a row are rewritten; the rest are hardlinked forward), and
+    rewrites the (small) index file in full. Returns (new `areas` manifest
+    field, bytes written), or (None, 0) when the dataset has no `areas`
+    table yet -- areas then simply stay absent until the first `osmpq
+    areas` run, same as a brand-new v4 manifest (4.2)."""
+    old_areas = old_man.get("areas") or {}
+    if not old_areas.get("index"):
+        return None, 0
+
+    touched_way_ids = (
+        [r[0] for r in con.execute(f"SELECT id FROM {way_byid_winners_view}").fetchall()]
+        if has_way_byid else []
+    )
+    touched_relation_ids = (
+        [r[0] for r in con.execute(f"SELECT id FROM {relation_byid_winners_view}").fetchall()]
+        if has_rel_byid else []
+    )
+    stale_ids = (
+        [w + areas_mod.WAY_ID_OFFSET for w in touched_way_ids]
+        + [r + areas_mod.RELATION_ID_OFFSET for r in touched_relation_ids]
+    )
+
+    new_cat_manifest = engine_catalog.Manifest(root=str(root), data=new_man)
+    placed_table, _files_read = areas_mod.derive_areas_for_pivots(
+        con, new_cat_manifest, promoted_keys, touched_way_ids, touched_relation_ids,
+    )
+
+    old_index_path = root / old_areas["index"]["path"]
+    old_cells = old_areas.get("cells", {})
+    promoted_cols = ", ".join(f'"{k}"' for k in promoted_keys)
+    idx_cols = (
+        f'id, pivot_type, pivot_id, tags, {promoted_cols}, '
+        f'version, changeset, timestamp, uid, "user", xmin_e7, ymin_e7, xmax_e7, ymax_e7, cell, hilbert'
+    )
+    spatial_cols = idx_cols.replace("cell, hilbert", "geometry, cell, hilbert")
+    id_excl = f"id NOT IN ({','.join(str(i) for i in stale_ids)})" if stale_ids else "TRUE"
+
+    if stale_ids:
+        stale_cells = {
+            r[0] for r in con.execute(
+                f"SELECT DISTINCT cell FROM read_parquet('{_esc(old_index_path)}') "
+                f"WHERE id IN ({','.join(str(i) for i in stale_ids)})"
+            ).fetchall()
+        }
+    else:
+        stale_cells = set()
+    new_cells = {r[0] for r in con.execute(f"SELECT DISTINCT cell FROM {placed_table}").fetchall()}
+    touched_cells = stale_cells | new_cells
+    all_cells = set(old_cells) | touched_cells
+
+    total_bytes = 0
+    cells_manifest: dict = {}
+    for cell in sorted(all_cells):
+        old_entry = old_cells.get(cell)
+        rel_path = f"spatial/{new_generation}/area/cell={cell}/part-0.parquet"
+        if cell not in touched_cells:
+            if old_entry:
+                _place_file(root / old_entry["path"], root / rel_path)
+                cells_manifest[cell] = {**old_entry, "path": rel_path}
+                total_bytes += old_entry["bytes"]
+            continue
+        parts = []
+        if old_entry:
+            old_path = root / old_entry["path"]
+            parts.append(f"SELECT {spatial_cols} FROM read_parquet('{_esc(old_path)}') WHERE {id_excl}")
+        parts.append(f"SELECT {spatial_cols} FROM {placed_table} WHERE cell = '{_esc(cell)}'")
+        sel = " UNION ALL ".join(parts) + " ORDER BY hilbert, id"
+        path = root / rel_path
+        rows, size = common.copy_to_parquet(con, sel, path, row_group_size_bytes=areas_mod.AREA_SPATIAL_ROW_GROUP_BYTES)
+        if rows == 0:
+            if path.exists():
+                path.unlink()
+            continue
+        bbox = con.execute(
+            f"SELECT min(ymin_e7)/1e7, min(xmin_e7)/1e7, max(ymax_e7)/1e7, max(xmax_e7)/1e7 "
+            f"FROM read_parquet('{_esc(path)}')"
+        ).fetchone()
+        cells_manifest[cell] = {
+            "path": rel_path, "rows": rows, "bytes": size,
+            "bbox": [float(x) if x is not None else None for x in bbox],
+        }
+        total_bytes += size
+
+    index_rel = f"index/{new_generation}/areas.parquet"
+    index_path = root / index_rel
+    index_sel = (
+        f"SELECT {idx_cols} FROM read_parquet('{_esc(old_index_path)}') WHERE {id_excl} "
+        f"UNION ALL SELECT {idx_cols} FROM {placed_table} "
+        f"ORDER BY id"
+    )
+    index_rows, index_size = common.copy_to_parquet(con, index_sel, index_path, row_group_size_bytes=areas_mod.AREA_INDEX_ROW_GROUP_BYTES)
+    total_bytes += index_size
+
+    return {"index": {"path": index_rel, "rows": index_rows, "bytes": index_size}, "cells": cells_manifest}, total_bytes
+
+
+# --------------------------------------------------------------------------
 # top-level orchestration
 # --------------------------------------------------------------------------
 
@@ -590,6 +705,13 @@ def compact(opts: CompactOptions) -> dict:
     con.execute("SET preserve_insertion_order=false")
     con.execute("INSTALL spatial")
     con.execute("LOAD spatial")
+    # `_compact_areas` (below) calls into `osmpq.build.areas`, whose
+    # relation-area member-way hydration can fall back to `sources.py`'s
+    # byid path, which references the `opq_node_hilbert`/`opq_bbox_hilbert`
+    # UDFs the engine normally registers on its own connection.
+    from osmpq.engine import hilbert as engine_hilbert_mod
+
+    engine_hilbert_mod.register_duckdb_udfs(con)
 
     promoted_sql = common.promoted_select(promoted_keys)
     bytes_by_kind = {"spatial": 0, "byid": 0, "index": 0}
@@ -685,6 +807,20 @@ def compact(opts: CompactOptions) -> dict:
     new_man["index"] = {"node_way": node_way_manifest, "member": member_manifest}
     new_man["rowgroup_index"] = {"node": node_rg_path, "way": way_rg_path, "relation": relation_rg_path}
 
+    # ---- areas (docs/m3-contracts.md section 4.3) --------------------------------------
+    areas_field, areas_bytes = _compact_areas(
+        con, root, old_man, new_man, new_generation, promoted_keys,
+        has_way_byid, "way_byid_winners", has_rel_byid, "relation_byid_winners",
+    )
+    if areas_field is not None:
+        new_man["areas"] = areas_field
+        new_man["manifest_version"] = 4
+        bytes_by_kind["index"] += areas_bytes
+        _log(
+            f"areas: {areas_field['index']['rows']} row(s) across {len(areas_field['cells'])} cell(s) "
+            f"in {timer.lap('areas'):.2f}s"
+        )
+
     n_nodes = sum(p["rows"] for p in node_byid_manifest)
     n_tagged_nodes = sum(e.get("tagged", {}).get("rows", 0) for e in node_table_manifest["cells"].values())
     n_ways = sum(p["rows"] for p in way_byid_manifest)
@@ -698,6 +834,8 @@ def compact(opts: CompactOptions) -> dict:
         "leaf_cells": old_stats.get("leaf_cells", len(old_man.get("leaf_cells", []))),
         "bytes": bytes_by_kind,
     }
+    if areas_field is not None:
+        new_man["stats"]["areas"] = areas_field["index"]["rows"]
 
     gen_number = latest_num + 1
     manifest_dir.mkdir(parents=True, exist_ok=True)

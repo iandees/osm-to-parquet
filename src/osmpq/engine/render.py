@@ -97,12 +97,14 @@ def fetch_out_rows(con, target_set: str, order: str, limit: Optional[int]) -> li
 
 def fetch_counts(con, target_set: str) -> dict:
     rows = con.execute(f"SELECT type, count(*) FROM set_{target_set} GROUP BY type").fetchall()
-    counts = {"nodes": 0, "ways": 0, "relations": 0}
-    label = {"node": "nodes", "way": "ways", "relation": "relations"}
+    # docs/m3-contracts.md section 4.4: `out count` reports an `areas` count
+    # alongside nodes/ways/relations when the set holds area rows.
+    counts = {"nodes": 0, "ways": 0, "relations": 0, "areas": 0}
+    label = {"node": "nodes", "way": "ways", "relation": "relations", "area": "areas"}
     for t, c in rows:
         if t in label:
             counts[label[t]] = c
-    counts["total"] = sum(counts.values())
+    counts["total"] = counts["nodes"] + counts["ways"] + counts["relations"] + counts["areas"]
     return counts
 
 
@@ -295,6 +297,7 @@ def build_elements(con, manifest: catalog.Manifest, target_set: str, out: Out) -
                 "nodes": str(counts["nodes"]),
                 "ways": str(counts["ways"]),
                 "relations": str(counts["relations"]),
+                "areas": str(counts["areas"]),
                 "total": str(counts["total"]),
             },
         }
@@ -384,6 +387,11 @@ def _row_to_element(row: dict, out: Out, node_coords: dict, way_geoms: dict) -> 
             c = center_dict(row)
             if c:
                 el["center"] = c
+    elif t == "area":
+        # docs/m3-contracts.md section 4.4: an area element carries no
+        # geometry/bounds/members of its own -- just id/tags/meta, handled
+        # by the generic blocks below.
+        pass
 
     if v == "meta":
         ts = format_timestamp(row.get("timestamp"))

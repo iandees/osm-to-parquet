@@ -120,6 +120,8 @@ def _element_xml(el: dict) -> str:
         return _way_xml(el)
     if t == "relation":
         return _relation_xml(el)
+    if t == "area":
+        return _area_xml(el)
     return ""
 
 
@@ -152,6 +154,16 @@ def _way_xml(el: dict) -> str:
     if not body:
         return head + "/>"
     return head + ">" + body + "</way>"
+
+
+def _area_xml(el: dict) -> str:
+    # docs/m3-contracts.md section 4.4: an `<area>` element has no geometry
+    # of its own -- just its id, optional meta attributes and tags.
+    head = f'<area id="{el["id"]}"' + _meta_attrs(el)
+    tags = _tags_xml(el)
+    if not tags:
+        return head + "/>"
+    return head + ">" + tags + "</area>"
 
 
 def _relation_xml(el: dict) -> str:

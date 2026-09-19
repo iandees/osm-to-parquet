@@ -82,7 +82,11 @@ def test_interpreter_parse_error_400(client):
 
 
 def test_interpreter_unsupported_400(client):
-    resp = client.get("/api/interpreter", params={"data": "[out:json];area[name=Foo];out;"})
+    # `[out:csv(...)]` is still rejected by `planner.check_settings`
+    # (docs/m3-contracts.md section 3.6 lifts this only once W1 is merged);
+    # picked as an arbitrary still-unsupported construct to exercise the
+    # generic 400 path (area queries became supported in M3, section 4).
+    resp = client.get("/api/interpreter", params={"data": '[out:csv(::id)];node[amenity=cafe];out;'})
     assert resp.status_code == 400
     assert "text/html" in resp.headers["content-type"]
 

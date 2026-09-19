@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 MANIFEST_VERSION = 1
-CURRENT_MANIFEST_VERSION = 3
+CURRENT_MANIFEST_VERSION = 4
 SCHEMA_VERSION = 1
 COORDINATE_SCALE = 10_000_000
 
@@ -81,6 +81,13 @@ class Manifest:
     # version metadata; a tier absent from ``deltas`` is empty (base only).
     replication_source: Optional[str] = None
     deltas: dict[str, Any] = field(default_factory=dict)
+    # -- v4 fields (docs/m3-contracts.md section 4.2): the `area` table,
+    # additive over v1-v3 (nothing above changes for node/way/relation).
+    # ``areas`` is None/empty for a v1-v3 manifest, or a v4 manifest that
+    # hasn't had `osmpq areas` run against it yet -- readers of either
+    # treat area statements as producing an empty set with a warning
+    # (docs/m3-contracts.md section 4.2).
+    areas: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -107,6 +114,8 @@ class Manifest:
         if self.manifest_version >= 3:
             d["replication_source"] = self.replication_source
             d["deltas"] = self.deltas
+        if self.manifest_version >= 4:
+            d["areas"] = self.areas
         return d
 
     @classmethod
@@ -132,6 +141,7 @@ class Manifest:
             stats=d.get("stats", {}),
             replication_source=d.get("replication_source"),
             deltas=d.get("deltas", {}),
+            areas=d.get("areas", {}),
         )
 
     # -- convenience accessors -------------------------------------------------
@@ -164,6 +174,13 @@ class Manifest:
                 paths.append(part["path"])
         for path in self.rowgroup_index.values():
             paths.append(path)
+        if self.areas:
+            index_entry = self.areas.get("index")
+            if index_entry and index_entry.get("path"):
+                paths.append(index_entry["path"])
+            for entry in self.areas.get("cells", {}).values():
+                if entry.get("path"):
+                    paths.append(entry["path"])
         for _tier, entry in self.deltas.items():
             files = entry.get("files", {})
             for _table, table_files in files.items():

@@ -59,6 +59,7 @@ class BuildOptions:
     memory_limit: Optional[str] = None
     tmpdir: Optional[str] = None
     mode: str = "link"  # link|copy|move, for placing the intermediate raw/ files
+    run_areas: bool = True  # docs/m3-contracts.md section 4.3: run `osmpq areas` at the end
 
 
 def build(opts: BuildOptions) -> manifest_mod.Manifest:
@@ -88,6 +89,7 @@ def build(opts: BuildOptions) -> manifest_mod.Manifest:
         memory_limit=opts.memory_limit,
         tmpdir=str(tmpdir / "build-from-raw-tmp"),
         mode=opts.mode,
+        run_areas=opts.run_areas,
     )
     return build_from_raw(from_raw_opts)
 
@@ -108,6 +110,7 @@ class BuildFromRawOptions:
     memory_limit: Optional[str] = None
     tmpdir: Optional[str] = None
     mode: str = "link"  # link|copy|move
+    run_areas: bool = True  # docs/m3-contracts.md section 4.3: run `osmpq areas` at the end
     extent: Optional[tuple[float, float, float, float]] = None  # (S, W, N, E): the intended
     # coverage of a regional dataset; the updater keeps new elements inside it. Defaults to the
     # data bbox from raw/summary.json, which is wider than the cut bbox for extracts because a
@@ -249,6 +252,20 @@ def build_from_raw(opts: BuildFromRawOptions) -> manifest_mod.Manifest:
     con.close()
     if db_path.exists():
         db_path.unlink()
+
+    if opts.run_areas:
+        # docs/m3-contracts.md section 4.3: `osmpq build` runs `osmpq
+        # areas` at the end unless `--no-areas`. This writes a further
+        # manifest (v4, additive) on top of the one just written above, so
+        # `man` itself (returned to M0-compatible callers) stays the
+        # node/way/relation-only manifest that was just built; callers that
+        # want the areas-aware manifest re-read `manifest/LATEST`.
+        from osmpq.build.areas import BuildAreasOptions, build_areas
+
+        areas_tmpdir = tmpdir / "areas-tmp"
+        build_areas(BuildAreasOptions(
+            root=opts.root, threads=opts.threads, memory_limit=opts.memory_limit, tmpdir=str(areas_tmpdir),
+        ))
     return man
 
 

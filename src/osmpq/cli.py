@@ -63,6 +63,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
             memory_limit=args.memory_limit,
             tmpdir=args.tmpdir,
             mode=_copy_mode(args),
+            run_areas=not args.no_areas,
             extent=args.extent,
         )
         build_from_raw(opts)
@@ -85,8 +86,18 @@ def _cmd_build(args: argparse.Namespace) -> int:
         memory_limit=args.memory_limit,
         tmpdir=args.tmpdir,
         mode=_copy_mode(args),
+        run_areas=not args.no_areas,
     )
     build(opts)
+    return 0
+
+
+def _cmd_areas(args: argparse.Namespace) -> int:
+    from osmpq.build.areas import BuildAreasOptions, build_areas
+
+    build_areas(BuildAreasOptions(
+        root=args.root, threads=args.threads, memory_limit=args.memory_limit, tmpdir=args.tmpdir,
+    ))
     return 0
 
 
@@ -129,6 +140,11 @@ def _cmd_manifest(args: argparse.Namespace) -> int:
     if man.manifest_version >= 2 and man.rowgroup_index:
         for table_name, path in man.rowgroup_index.items():
             print(f"rowgroup_index {table_name}: {path}")
+    areas = man.areas
+    if areas and areas.get("index"):
+        idx = areas["index"]
+        n_cells = len(areas.get("cells", {}))
+        print(f"areas: {idx.get('rows', 0)} rows, {n_cells} cells, {idx.get('bytes', 0)} index bytes")
     return 0
 
 
@@ -200,7 +216,16 @@ def main(argv: list[str] | None = None) -> int:
     mode_group.add_argument("--link", action="store_true", help="hardlink raw files into root (default)")
     mode_group.add_argument("--copy", action="store_true", help="copy raw files into root")
     mode_group.add_argument("--move", action="store_true", help="move raw files into root")
+    p_build.add_argument("--no-areas", action="store_true",
+                          help="skip running `osmpq areas` at the end (docs/m3-contracts.md section 4.3)")
     p_build.set_defaults(func=_cmd_build)
+
+    p_areas = sub.add_parser("areas", help="derive the area table for the current generation (docs/m3-contracts.md section 4)")
+    p_areas.add_argument("root")
+    p_areas.add_argument("--threads", type=int, default=None)
+    p_areas.add_argument("--memory-limit", default=None)
+    p_areas.add_argument("--tmpdir", default=None)
+    p_areas.set_defaults(func=_cmd_areas)
 
     p_manifest = sub.add_parser("manifest", help="print a summary of a dataset root's manifest")
     p_manifest.add_argument("root")
