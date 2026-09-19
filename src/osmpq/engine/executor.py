@@ -362,10 +362,14 @@ class Engine:
             except Exception:
                 pass
 
+            # docs/m4-contracts.md 3.1: a date before `history.since` is
+            # answered from the earliest known state and says so in the
+            # OSM `remark`, not only in the stats warnings.
+            attic_remark = next((w for w in ctx.warnings if w.startswith("history starts at ")), None)
             return Result(
                 elements=ctx.elements,
                 settings=settings,
-                remark=None,
+                remark=attic_remark,
                 timestamp_osm_base=manifest.timestamp_osm_base,
                 stats=stats,
                 is_diff=is_diff,

@@ -53,7 +53,7 @@ def test_retro_named_set_assigned_inside_is_not_visible_outside(engine, fixture)
         f'node({fixture.hist_node_id})->.then; }} '
         f".then; out count;"
     )
-    assert r.remark is None
+    assert r.remark is None or r.remark.startswith("history starts at ")
     assert r.elements == [{"type": "count", "id": 0,
                             "tags": {"nodes": "0", "ways": "0", "relations": "0", "total": "0"}}]
 

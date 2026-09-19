@@ -30,7 +30,7 @@ def engine(fixture):
 
 def _node(engine, node_id, date):
     r = engine.run(f'[out:json][date:"{date}"];node({node_id});out meta;')
-    assert r.remark is None
+    assert r.remark is None or r.remark.startswith("history starts at ")
     return r.elements
 
 
