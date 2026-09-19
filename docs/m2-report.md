@@ -51,7 +51,26 @@ extent filter doing its job.
 
 ## Delta overhead per query
 
-_pending: profile table with and without tiers_
+Cold Engine per query, HTTP range reads, downtown Minneapolis bbox, same
+machine state for both columns. "With deltas" = base plus `hour` v3 (187
+nodes, 140 ways, 29 relations) and `day` v2 (649 / 94 / 1).
+
+| query | no deltas: s / requests / files | with two tiers: s / requests / files |
+| --- | --- | --- |
+| `way[building]` any `out` | 0.10 / 27 / 5 | 0.15 / 36 / 9 |
+| wizard `amenity=cafe` | 0.18 / 38 / 14 | 0.30 / 50 / 22 |
+| wizard `building` | 0.39 / 85 / 19 | 0.52 / 108 / 27 |
+| wizard `natural=water` | 0.67 / 392 / 31 | 0.82 / 415 / 39 |
+| `<` / `<<` from nodes | 0.35 / 82 / 12, 0.45 / 77 / 12 | 0.51 / 99 / 22, 0.65 / 94 / 22 |
+| `>>` from relations | 0.46 / 114 / 23 | 0.65 / 136 / 33 |
+| `node(id)` | 0.04 / 5 / 1 | 0.06 / 7 / 3 |
+
+Each present tier costs one spatial file plus the tombstone file per table
+touched (4 extra files for a way query with two tiers) and about 10 extra
+range requests; 50-150 ms per query cold, nothing once an Engine has loaded
+the tiers (they are cached per run and by DuckDB's object cache across runs).
+This is the fixed price of freshness the design accepted; compaction resets
+it.
 
 ## Bugs the real run found (all fixed, with tests)
 
