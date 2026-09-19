@@ -249,22 +249,31 @@ class FixtureInfo:
     delta_new_way_no_base_cell: str = ""
     delta_new_way_no_base_cell_bbox: tuple = None
     delta_new_way_no_base_cell_refs: list = field(default_factory=list)
-    # -- manifest_version=4 only (areas, docs/m3-contracts.md section 4) ---
-    # A named park, fully inside leaf "000": way area -> id = way_id +
-    # 2400000000.
+    # -- manifest_version=4 only (areas, docs/m3-contracts.md section 9) ---
+    # A named park, fully inside leaf "000": a *way* area (9.1) -- it is
+    # its own canonical row wherever it appears, no 2400000000 offset.
     area_park_way_id: int = 0
-    area_park_area_id: int = 0
     area_park_inside_node_id: int = 0
     area_park_outside_node_id: int = 0
     area_park_crossing_way_id: int = 0
+    # A way that crosses the park ring with *neither* endpoint inside it
+    # (like the amendment's bridge example) -- `way(area.a)` must NOT
+    # select it, since neither vertex is strictly within the polygon (9
+    # fact 4: any-vertex-within, never ST_Intersects).
+    area_park_bridge_way_id: int = 0
     area_park_relation_id: int = 0
-    # A `landuse` way (no name) spanning leaves "000"/"002", like
-    # `spanning_way_id` -- exercises v2 loose placement for an area.
+    # A `landuse` way (also named, so it stays in the way index -- 9.2's
+    # index only keys on name/ref/admin_level/boundary/place) spanning
+    # leaves "000"/"002", like `spanning_way_id` -- exercises v2 loose
+    # placement for a way-area index entry.
     area_landuse_way_id: int = 0
-    area_landuse_area_id: int = 0
     # `closed_way_id` (101, tags={"building": "yes"} only) is the
-    # bare-building-exclusion fixture: is_area=true, no qualifying key ->
-    # no area is derived for it.
+    # bare-building fixture: closed, so `is_in`/`(area)`/`(pivot)`/
+    # `map_to_area` still treat it as an area (9 fact 1), but it carries no
+    # way-index qualifying key, so `area[...]` never finds it (9.2).
+    # rel 201 (type=multipolygon, building=yes, no `name`, ring = way 101)
+    # is the unnamed-multipolygon fixture: it resolves a valid ring but
+    # does not match the `areas.osm3s` rule (9 fact 3), so it gets no area.
     # A multipolygon relation with an inner ring (hole): outer/inner member
     # ways, a point strictly inside the hole (must NOT match the area) and
     # one inside the outer ring but outside the hole (must match).
@@ -514,9 +523,29 @@ def build(
         })
         info.area_park_crossing_way_id = park_way_cross_id
 
-        # landuse way (no `name`, still qualifies via `landuse`) spanning
-        # leaves "000"/"002", like `spanning_way_id` -- exercises v2 loose
-        # placement for an area.
+        # A way that crosses the park ring with *neither* endpoint inside
+        # it (9 fact 4's "bridge" case): a straight segment at frac_lat
+        # 0.15 (inside the ring's [0.05, 0.30] latitude band) from
+        # frac_lon 0.02 to 0.33 (both outside the ring's [0.05, 0.30]
+        # longitude range) passes straight through the square without
+        # either vertex landing inside it.
+        bridge_w_id, bridge_e_id = alloc(), alloc()
+        bw_lon, bw_lat = _inset_point(park_bbox, frac_lat=0.15, frac_lon=0.02)
+        be_lon, be_lat = _inset_point(park_bbox, frac_lat=0.15, frac_lon=0.33)
+        nodes.append({"id": bridge_w_id, "lon": bw_lon, "lat": bw_lat, "cell": "000", "tags": None})
+        nodes.append({"id": bridge_e_id, "lon": be_lon, "lat": be_lat, "cell": "000", "tags": None})
+        park_bridge_way_id = alloc()
+        ways.append({
+            "id": park_bridge_way_id, "refs": [bridge_w_id, bridge_e_id],
+            "tags": {"highway": "path"}, "cell": "000",
+        })
+        info.area_park_bridge_way_id = park_bridge_way_id
+
+        # landuse way spanning leaves "000"/"002", like `spanning_way_id`
+        # -- exercises v2 loose placement for a way-area index entry. Also
+        # named, since 9.2's way index only keys on name/ref/admin_level/
+        # boundary/place (not `landuse`); the `landuse` tag itself is only
+        # there to exercise the promoted-key path.
         lu_a, lu_b, lu_c, lu_d = alloc(), alloc(), alloc(), alloc()
         a_lon, a_lat = _inset_point(leaf_bbox["000"], 0.80, 0.80)
         b_lon, b_lat = _inset_point(leaf_bbox["000"], 0.80, 0.90)
@@ -530,7 +559,7 @@ def build(
         ways.append({
             "id": landuse_way_id,
             "refs": [lu_a, lu_b, lu_c, lu_d, lu_a],
-            "tags": {"landuse": "forest"},
+            "tags": {"landuse": "forest", "name": "Fixture Landuse Area"},
             "cell": "00",  # promoted to "root" by the v2 cell-placement block below, like way 110
         })
         info.area_landuse_way_id = landuse_way_id
@@ -1633,20 +1662,19 @@ def build(
             },
         }
 
-    # ----------------------------------------------------- areas (v4, 4.5)
+    # ----------------------------------------------------- areas (v4, 9.4)
     # Derived by the real `osmpq.build.areas` code against the on-disk
     # layout just written above -- not fabricated by hand -- so these
     # tests exercise derivation itself (ring assembly incl. the hole, the
-    # way-area rule, and the bare-building exclusion).
+    # `areas.osm3s` relation rule, and the way index's narrower key set).
     if manifest_version == 4:
-        from osmpq.build.areas import RELATION_ID_OFFSET, WAY_ID_OFFSET
+        from osmpq.build.areas import RELATION_ID_OFFSET
 
         cat_manifest = EngineManifest(root=str(root), data=manifest)
         areas_field = build_areas_for_manifest(con, root, cat_manifest, PROMOTED_KEYS)
         manifest["areas"] = areas_field
         manifest["stats"]["areas"] = areas_field["index"]["rows"]
-        info.area_park_area_id = info.area_park_way_id + WAY_ID_OFFSET
-        info.area_landuse_area_id = info.area_landuse_way_id + WAY_ID_OFFSET
+        manifest["stats"]["way_areas"] = areas_field["way_index"]["rows"]
         info.area_multipolygon_area_id = info.area_multipolygon_relation_id + RELATION_ID_OFFSET
         info.area_boundary_area_id = info.area_boundary_relation_id + RELATION_ID_OFFSET
 
