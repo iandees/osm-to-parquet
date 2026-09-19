@@ -72,6 +72,7 @@ def build(opts: BuildOptions) -> manifest_mod.Manifest:
     if opts.memory_limit:
         con.execute(f"SET memory_limit='{opts.memory_limit}'")
     con.execute(f"SET temp_directory='{tmpdir.as_posix()}'")
+    con.execute("SET preserve_insertion_order=false")
     con.execute("INSTALL spatial")
     con.execute("LOAD spatial")
     con.execute("INSTALL osmium FROM community")
@@ -145,20 +146,44 @@ def build(opts: BuildOptions) -> manifest_mod.Manifest:
 
     # ---- way geometry / bbox --------------------------------------------------
     t0 = time.time()
+    # Materialize the way->node join first (hash join, spills to disk), then
+    # aggregate in id-range batches: an ordered list() over tens of millions
+    # of rows in one go cannot spill and runs out of memory at state scale.
     con.execute("""
-        CREATE TABLE way_geom AS
-        SELECT w.id,
-               CASE WHEN count(n.lat_e7) > 0 THEN min(n.lat_e7) END AS ymin_e7,
-               CASE WHEN count(n.lat_e7) > 0 THEN max(n.lat_e7) END AS ymax_e7,
-               CASE WHEN count(n.lat_e7) > 0 THEN min(n.lon_e7) END AS xmin_e7,
-               CASE WHEN count(n.lat_e7) > 0 THEN max(n.lon_e7) END AS xmax_e7,
-               CASE WHEN count(n.lat_e7) >= 2 THEN
-                   ST_MakeLine(list(ST_Point(n.lon_e7 / 1e7, n.lat_e7 / 1e7) ORDER BY t.ordinal))
-               END AS geometry
+        CREATE TABLE way_pts AS
+        SELECT w.id AS way_id, t.ordinal, n.lat_e7, n.lon_e7
         FROM way0 w, UNNEST(w.refs) WITH ORDINALITY AS t(ref, ordinal)
         LEFT JOIN node0 n ON n.id = t.ref
-        GROUP BY w.id
     """)
+    con.execute("""
+        CREATE TABLE way_geom (
+            id BIGINT, ymin_e7 INTEGER, ymax_e7 INTEGER, xmin_e7 INTEGER, xmax_e7 INTEGER,
+            geometry GEOMETRY
+        )
+    """)
+    batch_rows = 250_000
+    bounds = [r[0] for r in con.execute(f"""
+        SELECT id FROM (SELECT id, row_number() OVER (ORDER BY id) AS rn FROM way0)
+        WHERE rn % {batch_rows} = 1 ORDER BY id
+    """).fetchall()]
+    bounds.append(None)
+    for lo, hi in zip(bounds[:-1], bounds[1:]):
+        cond = f"way_id >= {lo}" + (f" AND way_id < {hi}" if hi is not None else "")
+        con.execute(f"""
+            INSERT INTO way_geom
+            SELECT way_id AS id,
+                   CASE WHEN count(lat_e7) > 0 THEN min(lat_e7) END AS ymin_e7,
+                   CASE WHEN count(lat_e7) > 0 THEN max(lat_e7) END AS ymax_e7,
+                   CASE WHEN count(lat_e7) > 0 THEN min(lon_e7) END AS xmin_e7,
+                   CASE WHEN count(lat_e7) > 0 THEN max(lon_e7) END AS xmax_e7,
+                   CASE WHEN count(lat_e7) >= 2 THEN
+                       ST_MakeLine(list(ST_Point(lon_e7 / 1e7, lat_e7 / 1e7) ORDER BY ordinal)
+                                   FILTER (WHERE lat_e7 IS NOT NULL))
+                   END AS geometry
+            FROM way_pts WHERE {cond}
+            GROUP BY way_id
+        """)
+    con.execute("DROP TABLE way_pts")
     con.execute("""
         CREATE TABLE way1 AS
         SELECT w.id, w.refs, w.tags, w.version, w.changeset, w.timestamp, w.uid, w."user",
