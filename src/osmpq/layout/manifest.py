@@ -91,6 +91,16 @@ class Manifest:
     # `osmpq areas` run against it yet -- readers of either treat area
     # statements as producing an empty set with a warning (section 4.2).
     areas: dict[str, Any] = field(default_factory=dict)
+    # -- v5 field (docs/m4-contracts.md section 2.3): the history dataset
+    # (base spatial/byid history parts + rolling history tiers), additive
+    # over v1-v4. None for any manifest that doesn't carry history -- every
+    # reader treats absence as "attic unsupported". This is the minimal
+    # stub the M4 contract asks W3 (updater/compaction) to add when W1's
+    # own history-builder work hasn't landed `history` here yet; it is
+    # written/read as a single opaque dict (no dataclass tree) so W1 can
+    # extend its shape freely without touching this file's round-trip
+    # logic.
+    history: Optional[dict] = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -119,6 +129,8 @@ class Manifest:
             d["deltas"] = self.deltas
         if self.manifest_version >= 4:
             d["areas"] = self.areas
+        if self.manifest_version >= 5:
+            d["history"] = self.history
         return d
 
     @classmethod
@@ -145,6 +157,7 @@ class Manifest:
             replication_source=d.get("replication_source"),
             deltas=d.get("deltas", {}),
             areas=d.get("areas", {}),
+            history=d.get("history"),
         )
 
     # -- convenience accessors -------------------------------------------------
@@ -196,6 +209,19 @@ class Manifest:
                             paths.append(p)
                 elif table_files:
                     paths.append(table_files)
+        if self.history:
+            for typ_cells in (self.history.get("spatial") or {}).values():
+                for parts in typ_cells.values():
+                    for p in parts:
+                        paths.append(p["path"])
+            for parts in (self.history.get("byid") or {}).values():
+                for p in parts:
+                    paths.append(p["path"])
+            for tier_entry in (self.history.get("tiers") or {}).values():
+                for typ_files in (tier_entry.get("files") or {}).values():
+                    for _kind, p in (typ_files or {}).items():
+                        if p:
+                            paths.append(p)
         return paths
 
 

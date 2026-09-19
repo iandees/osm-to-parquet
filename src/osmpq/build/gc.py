@@ -50,6 +50,22 @@ def _referenced_paths(man: dict) -> set[str]:
                 paths.update(val.values())
             elif isinstance(val, str):
                 paths.add(val)
+    # docs/m4-contracts.md section 2.3: manifest v5 `history` (base
+    # spatial/byid history parts + rolling history tiers) is referenced
+    # like any other table/delta.
+    history = man.get("history") or {}
+    for typ_cells in (history.get("spatial") or {}).values():
+        for parts in typ_cells.values():
+            for p in parts:
+                paths.add(p["path"])
+    for parts in (history.get("byid") or {}).values():
+        for p in parts:
+            paths.add(p["path"])
+    for tier_entry in (history.get("tiers") or {}).values():
+        for typ_files in (tier_entry.get("files") or {}).values():
+            for _kind, p in (typ_files or {}).items():
+                if p:
+                    paths.add(p)
     return paths
 
 

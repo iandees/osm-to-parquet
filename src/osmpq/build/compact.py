@@ -34,6 +34,8 @@ from osmpq.build import areas as areas_mod
 from osmpq.build import common
 from osmpq.build import rowgroups as rowgroups_mod
 from osmpq.engine import catalog as engine_catalog
+from osmpq.history import schema as history_schema
+from osmpq.update.updater import BYID_COLUMNS, SPATIAL_COLUMNS
 
 TIER_ORDER = ["hour", "day", "week"]  # precedence high (0) to low
 
@@ -675,6 +677,299 @@ def _compact_areas(
 
 
 # --------------------------------------------------------------------------
+# history (docs/m4-contracts.md section 5.2): fold every history tier into
+# the base history -- rewrite the touched spatial cells and byid parts,
+# fill `valid_to` for rows that now have a successor, hardlink the rest,
+# clear `history.tiers`, bump `history.generation`.
+#
+# `_history_write_spatial`/`_history_write_byid` below are a *local stub*
+# standing in for W1's `history/writer.py` (docs/m4-contracts.md section
+# 4.2: "write_spatial(con, root, gen, type, table, cells: Optional[set])" /
+# "write_byid(con, root, gen, type, table)", returning the section 2.3
+# manifest fragments) -- at merge time the coordinator can replace these
+# two functions' bodies with calls into the real module without touching
+# any of their callers, since the call signature already matches.
+# --------------------------------------------------------------------------
+
+
+def _history_write_spatial(
+    con, root: Path, gen: str, typ: str, table: str, cells: Optional[set] = None,
+) -> dict:
+    """Writes ``history/<gen>/spatial/<typ>/cell=<cell>/part-0.parquet`` for
+    each cell in ``cells`` (or every distinct cell present in ``table`` when
+    ``cells`` is None), sorted by ``(hilbert, id, valid_from)`` --
+    docs/m4-contracts.md section 2.2. `table` must already carry exactly the
+    rows to write (`SELECT *` is used verbatim). Returns the manifest
+    fragment ``{cell: [{"path","rows","bytes"}]}`` (section 2.3's
+    ``history.spatial.<type>`` shape). One part per cell, like this
+    module's existing way/relation spatial compaction (`_compact_flat_
+    spatial`) -- the ``<= 64MB, several parts`` split the contract allows
+    for a very large cell is not implemented here (never exercised at the
+    Bermuda/fixture scale this workstream tests at)."""
+    if cells is None:
+        cells = {r[0] for r in con.execute(f"SELECT DISTINCT cell FROM {table} WHERE cell IS NOT NULL").fetchall()}
+    out: dict = {}
+    for cell in sorted(cells):
+        rel = f"history/{gen}/spatial/{typ}/cell={cell}/part-0.parquet"
+        path = root / rel
+        cell_esc = cell.replace("'", "''")
+        sel = f"SELECT * FROM {table} WHERE cell = '{cell_esc}' ORDER BY hilbert, id, valid_from"
+        rows, size = common.copy_to_parquet(con, sel, path, row_group_size_bytes=1_000_000)
+        if rows == 0:
+            if path.exists():
+                path.unlink()
+            continue
+        out[cell] = [{"path": rel, "rows": rows, "bytes": size}]
+    return out
+
+
+def _history_write_byid(con, root: Path, gen: str, typ: str, table: str) -> list[dict]:
+    """Writes ``history/<gen>/byid/<typ>/part-<n>.parquet`` from ``table``,
+    sorted by ``(id, valid_from)``, split at ~4M rows -- section 2.2.
+    Returns the manifest fragment (list of part dicts) -- section 2.3's
+    ``history.byid.<type>`` shape."""
+    total = con.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+    out: list[dict] = []
+    if total == 0:
+        return out
+    for k, (lo, hi) in enumerate(common.range_bounds(con, table, "id", total)):
+        cond = common.range_cond("id", lo, hi)
+        rel = f"history/{gen}/byid/{typ}/part-{k:05d}.parquet"
+        path = root / rel
+        sel = f"SELECT * FROM {table} WHERE {cond} ORDER BY id, valid_from"
+        rows, size = common.copy_to_parquet(con, sel, path, row_group_size_bytes=1_000_000)
+        if rows == 0:
+            if path.exists():
+                path.unlink()
+            continue
+        min_id, max_id = _parquet_id_range(path)
+        out.append({"path": rel, "min_id": min_id, "max_id": max_id, "rows": rows, "bytes": size})
+    return out
+
+
+def _hardlink_history_spatial(root: Path, old_spatial: dict, new_generation: str, typ: str) -> tuple[dict, int]:
+    out: dict = {}
+    total_bytes = 0
+    for cell, parts in (old_spatial or {}).items():
+        new_parts = []
+        for j, part in enumerate(parts):
+            rel = f"history/{new_generation}/spatial/{typ}/cell={cell}/part-{j}.parquet"
+            _place_file(root / part["path"], root / rel)
+            new_parts.append({"path": rel, "rows": part["rows"], "bytes": part["bytes"]})
+            total_bytes += part["bytes"]
+        out[cell] = new_parts
+    return out, total_bytes
+
+
+def _hardlink_history_byid(root: Path, old_byid: list[dict], new_generation: str, typ: str) -> tuple[list[dict], int]:
+    out: list[dict] = []
+    total_bytes = 0
+    for i, p in enumerate(old_byid or []):
+        rel = f"history/{new_generation}/byid/{typ}/part-{i:05d}.parquet"
+        _place_file(root / p["path"], root / rel)
+        out.append({"path": rel, "min_id": p["min_id"], "max_id": p["max_id"], "rows": p["rows"], "bytes": p["bytes"]})
+        total_bytes += p["bytes"]
+    return out, total_bytes
+
+
+def _compact_history_byid_parts(
+    con, root: Path, old_byid: list[dict], touched_idx: set, typ: str, new_generation: str,
+    pool_table: str, byid_cols: list[str],
+) -> tuple[list[dict], int]:
+    out: list[dict] = []
+    total_bytes = 0
+    next_idx = 0
+    for i, p in enumerate(old_byid):
+        if i in touched_idx:
+            continue
+        rel = f"history/{new_generation}/byid/{typ}/part-{next_idx:05d}.parquet"
+        _place_file(root / p["path"], root / rel)
+        out.append({"path": rel, "min_id": p["min_id"], "max_id": p["max_id"], "rows": p["rows"], "bytes": p["bytes"]})
+        total_bytes += p["bytes"]
+        next_idx += 1
+    total = con.execute(f"SELECT count(*) FROM {pool_table}").fetchone()[0]
+    for lo, hi in common.range_bounds(con, pool_table, "id", total):
+        cond = common.range_cond("id", lo, hi)
+        rel = f"history/{new_generation}/byid/{typ}/part-{next_idx:05d}.parquet"
+        path = root / rel
+        sel = f"SELECT {', '.join(byid_cols)} FROM {pool_table} WHERE {cond} ORDER BY id, valid_from"
+        rows, size = common.copy_to_parquet(con, sel, path, row_group_size_bytes=1_000_000)
+        next_idx += 1
+        if rows == 0:
+            if path.exists():
+                path.unlink()
+            continue
+        min_id, max_id = _parquet_id_range(path)
+        out.append({"path": rel, "min_id": min_id, "max_id": max_id, "rows": rows, "bytes": size})
+        total_bytes += size
+    return out, total_bytes
+
+
+def _compact_history_type(
+    con, root: Path, old_history: dict, typ: str, new_generation: str, promoted_keys: list[str],
+) -> tuple[dict, list, int]:
+    """Folds this type's history tiers into the base history (section 5.2):
+    rewrites the touched spatial cells (old rows + tier rows, `valid_to`
+    filled where a successor now exists) and the touched byid parts,
+    hardlinks the rest. `valid_to` is computed *once*, globally per id, from
+    the byid rows (one row per state -- no duplicate move-tombstone rows to
+    confuse a LEAD-by-valid_from window function), then joined back onto
+    both the byid and spatial outputs by ``(id, version, minor, valid_from,
+    cell)`` -- the last, `cell`, is what keeps a move-tombstone row (same
+    id/version/minor/valid_from as its state row, but at the *old* cell)
+    from being mistaken for that state row and getting a spurious
+    `valid_to`. Returns (spatial_fragment, byid_fragment, bytes_written)."""
+    tiers = old_history.get("tiers") or {}
+    old_spatial = (old_history.get("spatial") or {}).get(typ, {}) or {}
+    old_byid = (old_history.get("byid") or {}).get(typ, []) or []
+
+    tier_spatial_paths, tier_byid_paths = [], []
+    touched_cells: set = set()
+    for tier in history_schema.TIERS:
+        entry = tiers.get(tier)
+        if not entry:
+            continue
+        files = (entry.get("files") or {}).get(typ) or {}
+        if files.get("spatial"):
+            tier_spatial_paths.append(files["spatial"])
+        if files.get("byid"):
+            tier_byid_paths.append(files["byid"])
+        touched_cells.update((entry.get("cells") or {}).get(typ, []) or [])
+
+    if not tier_spatial_paths and not tier_byid_paths:
+        spatial_fragment, sp_bytes = _hardlink_history_spatial(root, old_spatial, new_generation, typ)
+        byid_fragment, by_bytes = _hardlink_history_byid(root, old_byid, new_generation, typ)
+        return spatial_fragment, byid_fragment, sp_bytes + by_bytes
+
+    byid_cols = history_schema.history_columns(BYID_COLUMNS[typ](promoted_keys))
+    spatial_cols = history_schema.history_columns(SPATIAL_COLUMNS[typ](promoted_keys))
+
+    # `_write_history_tier_version` always writes a tier's spatial and byid
+    # files together (or neither), so the two path lists are either both
+    # empty (handled above) or both non-empty here.
+    con.execute(
+        f"CREATE OR REPLACE TEMP TABLE _hist_new_spatial_{typ} AS "
+        + " UNION ALL BY NAME ".join(f"SELECT * FROM read_parquet('{_esc(root / p)}')" for p in tier_spatial_paths)
+    )
+    con.execute(
+        f"CREATE OR REPLACE TEMP TABLE _hist_new_byid_{typ} AS "
+        + " UNION ALL BY NAME ".join(f"SELECT * FROM read_parquet('{_esc(root / p)}')" for p in tier_byid_paths)
+    )
+
+    lo, hi = con.execute(f"SELECT min(id), max(id) FROM _hist_new_byid_{typ}").fetchone()
+    touched_idx: set = set()
+    if lo is not None:
+        for i, p in enumerate(old_byid):
+            if p["max_id"] >= lo and p["min_id"] <= hi:
+                touched_idx.add(i)
+    touched_old_byid_paths = [old_byid[i]["path"] for i in sorted(touched_idx)]
+    byid_pool_pieces = [f"SELECT * FROM read_parquet('{_esc(root / p)}')" for p in touched_old_byid_paths]
+    byid_pool_pieces.append(f"SELECT * FROM _hist_new_byid_{typ}")
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE _hist_byid_pool_{typ} AS
+        SELECT * EXCLUDE (valid_to) FROM ({' UNION ALL BY NAME '.join(byid_pool_pieces)}) u
+    """)
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE _hist_byid_filled_{typ} AS
+        SELECT *, LEAD(valid_from) OVER (PARTITION BY id ORDER BY valid_from) AS valid_to
+        FROM _hist_byid_pool_{typ}
+    """)
+
+    byid_fragment, byid_bytes = _compact_history_byid_parts(
+        con, root, old_byid, touched_idx, typ, new_generation, f"_hist_byid_filled_{typ}", byid_cols,
+    )
+
+    con.execute(f"""
+        CREATE OR REPLACE TEMP VIEW _hist_valid_to_{typ} AS
+        SELECT id, version, minor, valid_from, cell, valid_to FROM _hist_byid_filled_{typ}
+    """)
+
+    spatial_fragment: dict = {}
+    spatial_bytes = 0
+    all_cells = set(old_spatial) | touched_cells
+    for cell in sorted(all_cells):
+        if cell not in touched_cells:
+            entry = old_spatial.get(cell)
+            if entry:
+                rel = f"history/{new_generation}/spatial/{typ}/cell={cell}/part-0.parquet"
+                _place_file(root / entry[0]["path"], root / rel)
+                spatial_fragment[cell] = [{"path": rel, "rows": entry[0]["rows"], "bytes": entry[0]["bytes"]}]
+                spatial_bytes += entry[0]["bytes"]
+            continue
+        parts_sql = []
+        old_entry = old_spatial.get(cell)
+        if old_entry:
+            old_path = root / old_entry[0]["path"]
+            parts_sql.append(f"SELECT * FROM read_parquet('{_esc(old_path)}')")
+        cell_esc = cell.replace("'", "''")
+        parts_sql.append(f"SELECT * FROM _hist_new_spatial_{typ} WHERE cell = '{cell_esc}'")
+        rel = f"history/{new_generation}/spatial/{typ}/cell={cell}/part-0.parquet"
+        path = root / rel
+        proj = ", ".join(("vt.valid_to" if c == "valid_to" else f"s.{c}") for c in spatial_cols)
+        sel = f"""
+            SELECT {proj}
+            FROM ({' UNION ALL BY NAME '.join(parts_sql)}) s
+            LEFT JOIN _hist_valid_to_{typ} vt
+              ON vt.id = s.id AND vt.version = s.version AND vt.minor = s.minor
+             AND vt.valid_from = s.valid_from AND vt.cell = s.cell
+            ORDER BY s.hilbert, s.id, s.valid_from
+        """
+        rows, size = common.copy_to_parquet(con, sel, path, row_group_size_bytes=1_000_000)
+        if rows == 0:
+            if path.exists():
+                path.unlink()
+            continue
+        spatial_fragment[cell] = [{"path": rel, "rows": rows, "bytes": size}]
+        spatial_bytes += size
+
+    for t in (f"_hist_new_spatial_{typ}", f"_hist_new_byid_{typ}", f"_hist_byid_pool_{typ}", f"_hist_byid_filled_{typ}"):
+        con.execute(f"DROP TABLE IF EXISTS {t}")
+
+    return spatial_fragment, byid_fragment, spatial_bytes + byid_bytes
+
+
+def _history_stats(con, root: Path, byid_out: dict, spatial_out: dict) -> dict:
+    rows: dict = {}
+    minor_rows: dict = {}
+    total_bytes = 0
+    for typ, parts in byid_out.items():
+        rows[typ] = sum(p["rows"] for p in parts)
+        total_bytes += sum(p["bytes"] for p in parts)
+        if parts:
+            paths = [str(root / p["path"]) for p in parts]
+            minor_rows[typ] = con.execute(f"SELECT count(*) FROM read_parquet({paths!r}) WHERE minor > 0").fetchone()[0]
+        else:
+            minor_rows[typ] = 0
+    for _typ, cells in spatial_out.items():
+        total_bytes += sum(p["bytes"] for parts in cells.values() for p in parts)
+    return {"rows": rows, "minor_rows": minor_rows, "bytes": total_bytes}
+
+
+def _compact_history(con, root: Path, old_man: dict, new_generation: str, promoted_keys: list[str]) -> tuple[Optional[dict], int]:
+    old_history = old_man.get("history")
+    if not old_history:
+        return None, 0
+    spatial_out: dict = {}
+    byid_out: dict = {}
+    total_bytes = 0
+    for typ in ("node", "way", "relation"):
+        sp, by, nbytes = _compact_history_type(con, root, old_history, typ, new_generation, promoted_keys)
+        spatial_out[typ] = sp
+        byid_out[typ] = by
+        total_bytes += nbytes
+    new_history = {
+        "generation": new_generation,
+        "since": old_history.get("since"),
+        "minor_versions": old_history.get("minor_versions", True),
+        "spatial": spatial_out,
+        "byid": byid_out,
+        "tiers": {},
+        "stats": _history_stats(con, root, byid_out, spatial_out),
+    }
+    return new_history, total_bytes
+
+
+# --------------------------------------------------------------------------
 # top-level orchestration
 # --------------------------------------------------------------------------
 
@@ -825,6 +1120,17 @@ def compact(opts: CompactOptions) -> dict:
         _log(
             f"areas: {areas_field['index']['rows']} relation area(s) across {len(areas_field['cells'])} cell(s), "
             f"{areas_field['way_index']['rows']} way area(s) indexed, in {timer.lap('areas'):.2f}s"
+        )
+
+    # ---- history (docs/m4-contracts.md section 5.2) ------------------------------------
+    history_field, history_bytes = _compact_history(con, root, old_man, new_generation, promoted_keys)
+    if history_field is not None:
+        new_man["history"] = history_field
+        new_man["manifest_version"] = max(int(new_man["manifest_version"]), 5)
+        bytes_by_kind["history"] = history_bytes
+        _log(
+            f"history: folded {sum(history_field['stats']['rows'].values())} row(s) into "
+            f"generation {new_generation} in {timer.lap('history'):.2f}s"
         )
 
     n_nodes = sum(p["rows"] for p in node_byid_manifest)

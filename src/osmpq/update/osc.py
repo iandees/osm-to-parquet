@@ -89,6 +89,17 @@ class BatchResult:
     first_seq: Optional[int]
     last_seq: Optional[int]
     n_files: int
+    # docs/m4-contracts.md section 5.1: every occurrence of every element
+    # across the whole batch (not deduplicated to "last occurrence wins"
+    # like ``node``/``way``/``relation`` above), sorted by ``(id,
+    # version)``, so a catch-up batch (several diffs applied in one run)
+    # still gives the history writer a meta row (version, timestamp,
+    # changeset, uid, user, tags/refs/members) for every version an id
+    # passed through -- not just the one it ended the run on. Same columns
+    # as ``node``/``way``/``relation``.
+    node_all: pa.Table = None
+    way_all: pa.Table = None
+    relation_all: pa.Table = None
 
 
 def _tags_of(obj) -> Optional[dict]:
@@ -108,6 +119,9 @@ def parse_batch(seq_files: list[tuple[int, "str | Path"]]) -> BatchResult:
     nodes: dict[int, _NodeRow] = {}
     ways: dict[int, _WayRow] = {}
     relations: dict[int, _RelationRow] = {}
+    nodes_all: list[_NodeRow] = []
+    ways_all: list[_WayRow] = []
+    relations_all: list[_RelationRow] = []
     first_seq: Optional[int] = None
     last_seq: Optional[int] = None
 
@@ -125,24 +139,30 @@ def parse_batch(seq_files: list[tuple[int, "str | Path"]]) -> BatchResult:
                 if loc is not None and loc.valid():
                     lat_e7 = _e7(loc.lat)
                     lon_e7 = _e7(loc.lon)
-                nodes[obj.id] = _NodeRow(
+                row = _NodeRow(
                     id=obj.id, deleted=bool(obj.deleted), version=obj.version,
                     timestamp=ts, changeset=obj.changeset, uid=obj.uid, user=obj.user,
                     tags=_tags_of(obj), lat_e7=lat_e7, lon_e7=lon_e7, seq=seq,
                 )
+                nodes[obj.id] = row
+                nodes_all.append(row)
             elif isinstance(obj, osmium.osm.Way):
-                ways[obj.id] = _WayRow(
+                row = _WayRow(
                     id=obj.id, deleted=bool(obj.deleted), version=obj.version,
                     timestamp=ts, changeset=obj.changeset, uid=obj.uid, user=obj.user,
                     tags=_tags_of(obj), refs=[n.ref for n in obj.nodes], seq=seq,
                 )
+                ways[obj.id] = row
+                ways_all.append(row)
             elif isinstance(obj, osmium.osm.Relation):
-                relations[obj.id] = _RelationRow(
+                row = _RelationRow(
                     id=obj.id, deleted=bool(obj.deleted), version=obj.version,
                     timestamp=ts, changeset=obj.changeset, uid=obj.uid, user=obj.user,
                     tags=_tags_of(obj),
                     members=[(m.type, m.ref, m.role) for m in obj.members], seq=seq,
                 )
+                relations[obj.id] = row
+                relations_all.append(row)
 
     return BatchResult(
         node=_nodes_to_table(nodes),
@@ -151,6 +171,9 @@ def parse_batch(seq_files: list[tuple[int, "str | Path"]]) -> BatchResult:
         first_seq=first_seq,
         last_seq=last_seq,
         n_files=len(seq_files),
+        node_all=_nodes_to_table(sorted(nodes_all, key=lambda r: (r.id, r.version)), presorted=True),
+        way_all=_ways_to_table(sorted(ways_all, key=lambda r: (r.id, r.version)), presorted=True),
+        relation_all=_relations_to_table(sorted(relations_all, key=lambda r: (r.id, r.version)), presorted=True),
     )
 
 
@@ -159,8 +182,8 @@ def _tags_array(tags_list: list[Optional[dict]]) -> pa.Array:
     return pa.array(entries, type=pa.map_(pa.string(), pa.string()))
 
 
-def _nodes_to_table(nodes: dict[int, _NodeRow]) -> pa.Table:
-    rows = sorted(nodes.values(), key=lambda r: r.id)
+def _nodes_to_table(nodes, presorted: bool = False) -> pa.Table:
+    rows = nodes if presorted else sorted(nodes.values(), key=lambda r: r.id)
     return pa.table({
         "id": pa.array([r.id for r in rows], type=pa.int64()),
         "deleted": pa.array([r.deleted for r in rows], type=pa.bool_()),
@@ -176,8 +199,8 @@ def _nodes_to_table(nodes: dict[int, _NodeRow]) -> pa.Table:
     })
 
 
-def _ways_to_table(ways: dict[int, _WayRow]) -> pa.Table:
-    rows = sorted(ways.values(), key=lambda r: r.id)
+def _ways_to_table(ways, presorted: bool = False) -> pa.Table:
+    rows = ways if presorted else sorted(ways.values(), key=lambda r: r.id)
     return pa.table({
         "id": pa.array([r.id for r in rows], type=pa.int64()),
         "deleted": pa.array([r.deleted for r in rows], type=pa.bool_()),
@@ -192,8 +215,8 @@ def _ways_to_table(ways: dict[int, _WayRow]) -> pa.Table:
     })
 
 
-def _relations_to_table(relations: dict[int, _RelationRow]) -> pa.Table:
-    rows = sorted(relations.values(), key=lambda r: r.id)
+def _relations_to_table(relations, presorted: bool = False) -> pa.Table:
+    rows = relations if presorted else sorted(relations.values(), key=lambda r: r.id)
     members = [
         [{"type": t, "ref": ref, "role": role} for (t, ref, role) in r.members]
         for r in rows

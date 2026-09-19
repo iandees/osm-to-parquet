@@ -48,6 +48,7 @@ import numpy as np
 
 from osmpq import store as store_mod
 from osmpq.build import common
+from osmpq.history import schema as history_schema
 from osmpq.layout import cells as cells_mod
 from osmpq.layout import hilbert as hilbert_mod
 from osmpq.layout import manifest as manifest_mod
@@ -91,6 +92,11 @@ class RunSummary:
     dropped: dict[str, int] = field(default_factory=dict)
     seconds: float = 0.0
     no_op: bool = False
+    # docs/m4-contracts.md section 5.1: empty on a root without history, or
+    # on a run whose history batch was empty ("a run that touches nothing
+    # writes no tier file").
+    history_tier_versions: dict[str, int] = field(default_factory=dict)
+    history_tier_bytes: dict[str, int] = field(default_factory=dict)
 
 
 def _print_summary(s: RunSummary) -> None:
@@ -99,10 +105,14 @@ def _print_summary(s: RunSummary) -> None:
         return
     rows = " ".join(f"{k}={v}" for k, v in s.rows_touched.items())
     tiers = " ".join(f"{k}=v{v}" for k, v in s.tier_versions.items())
-    _log(
+    hist = " ".join(f"{k}=v{v}" for k, v in s.history_tier_versions.items())
+    msg = (
         f"applied seq {s.first_seq}..{s.last_seq} ({s.applied} diffs) ts={s.timestamp} "
         f"touched[{rows}] tiers[{tiers}] dropped={s.dropped} in {s.seconds:.1f}s"
     )
+    if hist:
+        msg += f" history_tiers[{hist}]"
+    _log(msg)
 
 
 # --------------------------------------------------------------------------
@@ -351,6 +361,12 @@ def _run_once_impl(
     con.register("batch_node_raw", batch.node)
     con.register("batch_way_raw", batch.way)
     con.register("batch_relation_raw", batch.relation)
+    # docs/m4-contracts.md section 5.1: every version's own meta row, kept
+    # regardless of whether history is enabled on this root (cheap; the
+    # tables are the same size class as the deduplicated ones above).
+    con.register("batch_node_all_raw", batch.node_all)
+    con.register("batch_way_all_raw", batch.way_all)
+    con.register("batch_relation_all_raw", batch.relation_all)
 
     # ---- step 1: load current delta tiers (byid ⊕ tombstones) -----------------
     tier_state = _load_tiers(con, store, man, promoted_keys)
@@ -388,8 +404,29 @@ def _run_once_impl(
         # with upload_file"); push the ones this run actually (re)wrote.
         _upload_new_tier_files(store, root, new_deltas, tier_versions)
 
+    # ---- history tiers (docs/m4-contracts.md section 5.1) ---------------------
+    new_history = man.history
+    history_tier_versions: dict[str, int] = {}
+    history_tier_bytes: dict[str, int] = {}
+    if man.history is not None:
+        has_history_rows = _build_history_batch(
+            con, store, man, promoted_keys, kept, touched_way_ids, touched_relation_ids, batch_timestamp,
+        )
+        if has_history_rows:
+            hour_crossed, day_crossed = _tier_crossings(man.deltas, batch_timestamp)
+            batch_tables = {t: (f"history_batch_byid_{t}", f"history_batch_spatial_{t}") for t in _TYPES}
+            history_tier_versions, history_tier_bytes, new_history = _write_history_tiers(
+                con, root, store, man, promoted_keys, batch_tables, first_seq, last_seq, batch_timestamp,
+                hour_crossed, day_crossed,
+            )
+            if is_remote:
+                _upload_new_history_tier_files(store, root, new_history, history_tier_versions)
+
     # ---- step 8: manifest -----------------------------------------------------------
     source = opts.source or man.replication_source
+    new_manifest_version = max(3, man.manifest_version)
+    if new_history is not None:
+        new_manifest_version = max(new_manifest_version, 5)
     new_man = manifest_mod.Manifest(
         generation=man.generation,
         timestamp_osm_base=batch_timestamp or man.timestamp_osm_base,
@@ -401,7 +438,7 @@ def _run_once_impl(
         index=man.index,
         promoted_keys=man.promoted_keys,
         replication_sequence=last_seq,
-        manifest_version=max(3, man.manifest_version),
+        manifest_version=new_manifest_version,
         schema_version=man.schema_version,
         coordinate_scale=man.coordinate_scale,
         ancestor_depths=man.ancestor_depths or list(cells_mod.DEFAULT_ANCESTOR_DEPTHS),
@@ -411,6 +448,7 @@ def _run_once_impl(
         stats=man.stats,
         replication_source=source,
         deltas=new_deltas,
+        history=new_history,
     )
     # `opts.root`, not `root` (the local write target above, a staging dir
     # for `s3://`): this is the actual root string, and
@@ -422,6 +460,7 @@ def _run_once_impl(
     return RunSummary(
         applied=len(fetched), first_seq=first_seq, last_seq=last_seq, timestamp=batch_timestamp,
         rows_touched=rows_touched, tier_versions=tier_versions, tier_bytes=tier_bytes, dropped=dropped_counts,
+        history_tier_versions=history_tier_versions, history_tier_bytes=history_tier_bytes,
     )
 
 
@@ -462,18 +501,34 @@ class TierState:
     present_tiers: dict[str, dict] = field(default_factory=dict)  # tier -> man.deltas[tier] (or {})
 
 
+# Column name -> DuckDB type, covering every column any base/delta/history
+# row can have (a superset -- callers only ever index the columns they
+# actually use). Shared by ``_empty_delta_table_sql`` (delta byid columns
+# only) and the history-row NULL projections in the section-5.1 code below
+# (which also need ``geometry``/``centroid_*`` and the four history-extra
+# columns, docs/m4-contracts.md section 2.1).
+_BASE_TYPE_MAP: dict[str, str] = {
+    "id": "BIGINT", "lat_e7": "INTEGER", "lon_e7": "INTEGER", "tags": "MAP(VARCHAR,VARCHAR)",
+    "refs": "BIGINT[]", "members": 'STRUCT("type" VARCHAR, ref BIGINT, role VARCHAR)[]',
+    "version": "INTEGER", "changeset": "BIGINT", "timestamp": "TIMESTAMP", "uid": "INTEGER",
+    '"user"': "VARCHAR", "xmin_e7": "INTEGER", "ymin_e7": "INTEGER", "xmax_e7": "INTEGER",
+    "ymax_e7": "INTEGER", "is_closed": "BOOLEAN", "is_area": "BOOLEAN", "cell": "VARCHAR",
+    "hilbert": "UBIGINT", "deleted": "BOOLEAN", "prev_cell": "VARCHAR", "seq": "BIGINT",
+    "geometry": "GEOMETRY", "centroid_lat_e7": "INTEGER", "centroid_lon_e7": "INTEGER",
+    "minor": "INTEGER", "valid_from": "TIMESTAMP", "valid_to": "TIMESTAMP", "visible": "BOOLEAN",
+}
+
+
+def _type_map_with_promoted(promoted_keys: list[str]) -> dict[str, str]:
+    m = dict(_BASE_TYPE_MAP)
+    for k in promoted_keys:
+        m[f'"{k}"'] = "VARCHAR"
+    return m
+
+
 def _empty_delta_table_sql(typ: str, promoted_keys: list[str]) -> str:
     cols = delta_byid_columns(typ, promoted_keys)
-    type_map = {
-        "id": "BIGINT", "lat_e7": "INTEGER", "lon_e7": "INTEGER", "tags": "MAP(VARCHAR,VARCHAR)",
-        "refs": "BIGINT[]", "members": 'STRUCT("type" VARCHAR, ref BIGINT, role VARCHAR)[]',
-        "version": "INTEGER", "changeset": "BIGINT", "timestamp": "TIMESTAMP", "uid": "INTEGER",
-        '"user"': "VARCHAR", "xmin_e7": "INTEGER", "ymin_e7": "INTEGER", "xmax_e7": "INTEGER",
-        "ymax_e7": "INTEGER", "is_closed": "BOOLEAN", "is_area": "BOOLEAN", "cell": "VARCHAR",
-        "hilbert": "UBIGINT", "deleted": "BOOLEAN", "prev_cell": "VARCHAR", "seq": "BIGINT",
-    }
-    for k in promoted_keys:
-        type_map[f'"{k}"'] = "VARCHAR"
+    type_map = _type_map_with_promoted(promoted_keys)
     select = ", ".join(f"NULL::{type_map[c]} AS {c}" for c in cols)
     return f"SELECT {select} WHERE FALSE"
 
@@ -1278,6 +1333,24 @@ def _write_tier_version(
     return meta, total_bytes
 
 
+def _tier_crossings(man_deltas: Optional[dict], batch_timestamp: Optional[str]) -> tuple[bool, bool]:
+    """Whether this batch's timestamp crosses the current hour/day tier's
+    UTC hour/day boundary (docs/m2-contracts.md section 5 step 7) --
+    factored out so the history tiers (docs/m4-contracts.md section 5.1,
+    "folding at the same boundaries as the delta tiers") fold at exactly
+    the same instants as the current-state delta tiers, driven from the
+    *delta* tiers' own timestamps even when the history tiers don't exist
+    yet (a fresh v5 root's history starts with no tiers at all)."""
+    hour_old_meta = man_deltas.get("hour") if man_deltas else None
+    day_old_meta = man_deltas.get("day") if man_deltas else None
+    batch_dt = _parse_ts(batch_timestamp)
+    hour_old_dt = _parse_ts(hour_old_meta["timestamp"]) if hour_old_meta else None
+    day_old_dt = _parse_ts(day_old_meta["timestamp"]) if day_old_meta else None
+    hour_crossed = hour_old_dt is not None and batch_dt is not None and _floor_hour(hour_old_dt) != _floor_hour(batch_dt)
+    day_crossed = hour_crossed and day_old_dt is not None and batch_dt is not None and _floor_day(day_old_dt) != _floor_day(batch_dt)
+    return hour_crossed, day_crossed
+
+
 def _write_tiers(
     con, root: Path, store, man: manifest_mod.Manifest, promoted_keys: list[str], state: TierState,
     resolved: dict[str, str], first_seq: int, last_seq: int, batch_timestamp: Optional[str],
@@ -1286,12 +1359,7 @@ def _write_tiers(
     day_old_meta = man.deltas.get("day") if man.deltas else None
     week_old_meta = man.deltas.get("week") if man.deltas else None
 
-    batch_dt = _parse_ts(batch_timestamp)
-    hour_old_dt = _parse_ts(hour_old_meta["timestamp"]) if hour_old_meta else None
-    day_old_dt = _parse_ts(day_old_meta["timestamp"]) if day_old_meta else None
-
-    hour_crossed = hour_old_dt is not None and batch_dt is not None and _floor_hour(hour_old_dt) != _floor_hour(batch_dt)
-    day_crossed = hour_crossed and day_old_dt is not None and batch_dt is not None and _floor_day(day_old_dt) != _floor_day(batch_dt)
+    hour_crossed, day_crossed = _tier_crossings(man.deltas, batch_timestamp)
 
     for typ in _TYPES:
         cols = BYID_COLUMNS[typ](promoted_keys)
@@ -1367,3 +1435,557 @@ def _write_tiers(
         tier_bytes["hour"] = nbytes
 
     return tier_versions, tier_bytes, new_deltas
+
+
+# ==========================================================================
+# history tier append (docs/m4-contracts.md section 5.1)
+#
+# Runs only when ``man.history is not None``. Uses the same connection
+# state ``_run_once_impl`` already built for the current-state path:
+# ``kept_node``/``kept_way``/``kept_relation`` (the extent-filtered batch,
+# section 2 of docs/m2-contracts.md), ``exists_node``/``exists_way``/
+# ``exists_relation`` (the id's state *before* this batch, from
+# ``_extent_filter``'s ``_fetch_current`` calls) and ``resolved_node``/
+# ``resolved_way``/``resolved_relation`` (this batch's final re-resolved
+# state, from ``_resolve``) -- all TEMP TABLEs/VIEWs still alive on ``con``.
+#
+# Every history row is the base row's columns (``BYID_COLUMNS``/
+# ``SPATIAL_COLUMNS`` -- the same base schema the current-state delta files
+# use) plus ``history_schema.HISTORY_EXTRA_NAMES`` (``minor``,
+# ``valid_from``, ``valid_to``, ``visible``); column *names* drive every
+# SQL projection here (not position), so a DuckDB ``SELECT <cols> FROM
+# <table>`` always lands the right value under the right name regardless of
+# the source table's own physical column order.
+#
+# Approximation documented by the contract (section 5.1's "the one
+# approximation"): a way/relation *own-version* history row for a version
+# superseded within the same run (a catch-up batch applying several diffs
+# at once) gets that version's own tags/refs/members (exact -- they're in
+# the parsed diff) but the *final* resolved state's geometry/bbox/cell/
+# hilbert (approximate -- re-resolving geometry at every intermediate
+# version's point in time would need historical node positions this run
+# doesn't keep). This implementation extends the same substitution to a
+# superseded *node* version's cell/hilbert too (its own lat/lon is still
+# exact), and does not attempt a precise move-tombstone cell for a
+# superseded version that was itself a delete-then-recreate within one
+# run (an edge case that only arises for a very stale updater catching up
+# many diffs at once) -- see the report for the full list.
+# ==========================================================================
+
+
+def _history_type_map(promoted_keys: list[str]) -> dict[str, str]:
+    return _type_map_with_promoted(promoted_keys)
+
+
+def _history_null_or_override(cols: list[str], type_map: dict[str, str], overrides: dict[str, str]) -> str:
+    parts = []
+    for c in cols:
+        if c in overrides:
+            parts.append(f"{overrides[c]} AS {c}")
+        else:
+            parts.append(f"NULL::{type_map[c]} AS {c}")
+    return ", ".join(parts)
+
+
+def _history_touched_only_ids(con, all_touched: np.ndarray, kept_view: str, out_name: str) -> None:
+    """Registers ``out_name`` (TEMP TABLE, ``id BIGINT``): ids in
+    ``all_touched`` (this run's full touched-way/relation-id set from
+    ``_touched_set``) that are *not* in ``kept_view`` (this batch's own
+    changed elements) -- the "touched parent whose version did not change"
+    case (section 5.1), which only ever applies to ways/relations (nodes
+    have no minor versions)."""
+    kept_ids = con.execute(f"SELECT id FROM {kept_view}").fetchnumpy()["id"]
+    only = np.setdiff1d(
+        np.asarray(all_touched, dtype=np.int64), np.asarray(kept_ids, dtype=np.int64),
+    )
+    _register_ids(con, out_name, only)
+
+
+def _history_prev_minor_view(
+    con, store, man: manifest_mod.Manifest, typ: str, ids_table: str, version_lookup_sql: str,
+) -> str:
+    """A TEMP VIEW ``(id, prev_minor)``: the greatest ``minor`` already on
+    record (in the still-open history tiers, or the base history byid
+    parts) for each id in ``ids_table`` *at the version* ``version_lookup_sql``
+    (a ``SELECT id, version`` over the ids' current -- unchanged -- version)
+    gives for that id. An id with no matching row anywhere gets no row here
+    (the caller's ``COALESCE(prev_minor, 0) + 1`` then gives ``1``, section
+    5.1's "unknown -> 1")."""
+    hist = man.history or {}
+    tiers = hist.get("tiers") or {}
+    pieces = []
+    for tier in history_schema.TIERS:
+        entry = tiers.get(tier)
+        if not entry:
+            continue
+        fpath = ((entry.get("files") or {}).get(typ) or {}).get("byid")
+        if fpath and store.exists(fpath):
+            pieces.append(f"SELECT id, version, minor FROM read_parquet('{_esc(store.url(fpath))}')")
+    n, lo, hi = con.execute(f"SELECT count(*), min(id), max(id) FROM {ids_table}").fetchone()
+    if n:
+        base_parts = _select_parts((hist.get("byid") or {}).get(typ, []) or [], lo, hi)
+        if base_parts:
+            paths = [store.url(p) for p in base_parts]
+            pieces.append(f"SELECT id, version, minor FROM read_parquet({paths!r})")
+    view_name = f"__hist_prev_minor_{typ}_{_uid()}"
+    if not pieces:
+        con.execute(f"CREATE OR REPLACE TEMP VIEW {view_name} AS SELECT NULL::BIGINT AS id, NULL::INTEGER AS prev_minor WHERE FALSE")
+        return view_name
+    union_sql = " UNION ALL ".join(pieces)
+    con.execute(f"""
+        CREATE OR REPLACE TEMP VIEW {view_name} AS
+        SELECT h.id, max(h.minor) AS prev_minor
+        FROM ({union_sql}) h
+        JOIN {version_lookup_sql} tv ON tv.id = h.id AND tv.version = h.version
+        GROUP BY h.id
+    """)
+    return view_name
+
+
+def _history_node(con, promoted_keys: list[str]) -> None:
+    """``history_own_node`` (TEMP TABLE): one row per (id, version) in this
+    batch's ``node_all`` occurrences for ids that passed the extent filter
+    (``kept_node``) and are genuinely newer than what existed before this
+    batch (``exists_node``) -- section 5.1's "every resolved row ... becomes
+    a history row" plus "keep every version's meta row"."""
+    con.execute("""
+        CREATE OR REPLACE TEMP VIEW history_all_node_f AS
+        SELECT a.* FROM batch_node_all_raw a
+        JOIN kept_node k ON k.id = a.id
+        LEFT JOIN exists_node p ON p.id = a.id
+        WHERE p.id IS NULL OR a.version > p.version
+    """)
+    promoted_eff = common.promoted_select(promoted_keys, tags_expr="eff_tags")
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE history_own_node AS
+        WITH base AS (
+            SELECT a.*, CASE WHEN a.deleted THEN NULL ELSE a.tags END AS eff_tags
+            FROM history_all_node_f a
+        )
+        SELECT b.id,
+               CASE WHEN b.deleted THEN NULL ELSE b.lat_e7 END AS lat_e7,
+               CASE WHEN b.deleted THEN NULL ELSE b.lon_e7 END AS lon_e7,
+               b.eff_tags AS tags,
+               {promoted_eff},
+               b.version, b.changeset, b.timestamp, b.uid, b."user",
+               CASE WHEN b.deleted THEN NULL ELSE r.hilbert END AS hilbert,
+               CASE WHEN b.deleted THEN r.prev_cell ELSE r.cell END AS cell,
+               0 AS minor, b.timestamp AS valid_from, CAST(NULL AS TIMESTAMP) AS valid_to,
+               (NOT b.deleted) AS visible,
+               CASE WHEN b.version = r.version THEN r.prev_cell ELSE NULL END AS __prev_cell
+        FROM base b JOIN resolved_node r ON r.id = b.id
+    """)
+
+
+def _history_way(con, store, man: manifest_mod.Manifest, promoted_keys: list[str],
+                  touched_way_ids: np.ndarray, batch_ts_sql: str) -> None:
+    con.execute("""
+        CREATE OR REPLACE TEMP VIEW history_all_way_f AS
+        SELECT a.* FROM batch_way_all_raw a
+        JOIN kept_way k ON k.id = a.id
+        LEFT JOIN exists_way p ON p.id = a.id
+        WHERE p.id IS NULL OR a.version > p.version
+    """)
+    promoted_eff = common.promoted_select(promoted_keys, tags_expr="eff_tags")
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE history_own_way AS
+        WITH base AS (
+            SELECT a.*, CASE WHEN a.deleted THEN NULL ELSE a.tags END AS eff_tags,
+                   CASE WHEN a.deleted THEN NULL ELSE a.refs END AS eff_refs
+            FROM history_all_way_f a
+        )
+        SELECT b.id, b.eff_refs AS refs, b.eff_tags AS tags,
+               {promoted_eff},
+               b.version, b.changeset, b.timestamp, b.uid, b."user",
+               CASE WHEN b.deleted THEN NULL ELSE r.xmin_e7 END AS xmin_e7,
+               CASE WHEN b.deleted THEN NULL ELSE r.ymin_e7 END AS ymin_e7,
+               CASE WHEN b.deleted THEN NULL ELSE r.xmax_e7 END AS xmax_e7,
+               CASE WHEN b.deleted THEN NULL ELSE r.ymax_e7 END AS ymax_e7,
+               CASE WHEN b.deleted THEN NULL ELSE r.geometry END AS geometry,
+               CASE WHEN b.deleted THEN NULL ELSE r.is_closed END AS is_closed,
+               CASE WHEN b.deleted THEN NULL ELSE r.is_area END AS is_area,
+               CASE WHEN b.deleted THEN NULL ELSE r.centroid_lat_e7 END AS centroid_lat_e7,
+               CASE WHEN b.deleted THEN NULL ELSE r.centroid_lon_e7 END AS centroid_lon_e7,
+               CASE WHEN b.deleted THEN r.prev_cell ELSE r.cell END AS cell,
+               CASE WHEN b.deleted THEN NULL ELSE r.hilbert END AS hilbert,
+               0 AS minor, b.timestamp AS valid_from, CAST(NULL AS TIMESTAMP) AS valid_to,
+               (NOT b.deleted) AS visible,
+               CASE WHEN b.version = r.version THEN r.prev_cell ELSE NULL END AS __prev_cell
+        FROM base b JOIN resolved_way r ON r.id = b.id
+    """)
+
+    _history_touched_only_ids(con, touched_way_ids, "kept_way", "minor_only_way_ids_t")
+    con.execute("""
+        CREATE OR REPLACE TEMP VIEW way_minor_dep_ts AS
+        SELECT w.id AS way_id, n.timestamp AS ts
+        FROM resolved_way w, UNNEST(w.refs) AS t(ref)
+        JOIN kept_node n ON n.id = t.ref
+        WHERE w.id IN (SELECT id FROM minor_only_way_ids_t)
+    """)
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE way_minor_valid_from AS
+        SELECT m.id, COALESCE(MAX(d.ts), {batch_ts_sql}) AS valid_from
+        FROM minor_only_way_ids_t m LEFT JOIN way_minor_dep_ts d ON d.way_id = m.id
+        GROUP BY m.id
+    """)
+    prev_minor_view = _history_prev_minor_view(
+        con, store, man, "way", "minor_only_way_ids_t",
+        "(SELECT id, version FROM resolved_way WHERE id IN (SELECT id FROM minor_only_way_ids_t))",
+    )
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE way_minor_meta AS
+        SELECT m.id, COALESCE(pm.prev_minor, 0) + 1 AS minor, v.valid_from
+        FROM minor_only_way_ids_t m
+        JOIN way_minor_valid_from v ON v.id = m.id
+        LEFT JOIN {prev_minor_view} pm ON pm.id = m.id
+    """)
+    promoted_r = common.promoted_select(promoted_keys, tags_expr="r.tags")
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE history_minor_way AS
+        SELECT r.id, r.refs, r.tags,
+               {promoted_r},
+               r.version, r.changeset, r.timestamp, r.uid, r."user",
+               r.xmin_e7, r.ymin_e7, r.xmax_e7, r.ymax_e7, r.geometry, r.is_closed, r.is_area,
+               r.centroid_lat_e7, r.centroid_lon_e7, r.cell, r.hilbert,
+               mm.minor AS minor, mm.valid_from AS valid_from, CAST(NULL AS TIMESTAMP) AS valid_to,
+               TRUE AS visible,
+               r.prev_cell AS __prev_cell
+        FROM resolved_way r JOIN way_minor_meta mm ON mm.id = r.id
+        WHERE NOT r.deleted
+    """)
+
+
+def _history_relation(con, store, man: manifest_mod.Manifest, promoted_keys: list[str],
+                       touched_relation_ids: np.ndarray, batch_ts_sql: str) -> None:
+    con.execute("""
+        CREATE OR REPLACE TEMP VIEW history_all_relation_f AS
+        SELECT a.* FROM batch_relation_all_raw a
+        JOIN kept_relation k ON k.id = a.id
+        LEFT JOIN exists_relation p ON p.id = a.id
+        WHERE p.id IS NULL OR a.version > p.version
+    """)
+    promoted_eff = common.promoted_select(promoted_keys, tags_expr="eff_tags")
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE history_own_relation AS
+        WITH base AS (
+            SELECT a.*, CASE WHEN a.deleted THEN NULL ELSE a.tags END AS eff_tags,
+                   CASE WHEN a.deleted THEN NULL ELSE a.members END AS eff_members
+            FROM history_all_relation_f a
+        )
+        SELECT b.id, b.eff_members AS members, b.eff_tags AS tags,
+               {promoted_eff},
+               b.version, b.changeset, b.timestamp, b.uid, b."user",
+               CASE WHEN b.deleted THEN NULL ELSE r.xmin_e7 END AS xmin_e7,
+               CASE WHEN b.deleted THEN NULL ELSE r.ymin_e7 END AS ymin_e7,
+               CASE WHEN b.deleted THEN NULL ELSE r.xmax_e7 END AS xmax_e7,
+               CASE WHEN b.deleted THEN NULL ELSE r.ymax_e7 END AS ymax_e7,
+               CASE WHEN b.deleted THEN NULL ELSE r.geometry END AS geometry,
+               CASE WHEN b.deleted THEN NULL ELSE r.centroid_lat_e7 END AS centroid_lat_e7,
+               CASE WHEN b.deleted THEN NULL ELSE r.centroid_lon_e7 END AS centroid_lon_e7,
+               CASE WHEN b.deleted THEN r.prev_cell ELSE r.cell END AS cell,
+               CASE WHEN b.deleted THEN NULL ELSE r.hilbert END AS hilbert,
+               0 AS minor, b.timestamp AS valid_from, CAST(NULL AS TIMESTAMP) AS valid_to,
+               (NOT b.deleted) AS visible,
+               CASE WHEN b.version = r.version THEN r.prev_cell ELSE NULL END AS __prev_cell
+        FROM base b JOIN resolved_relation r ON r.id = b.id
+    """)
+
+    _history_touched_only_ids(con, touched_relation_ids, "kept_relation", "minor_only_relation_ids_t")
+    con.execute("""
+        CREATE OR REPLACE TEMP VIEW relation_minor_dep_ts AS
+        SELECT rm.rel_id, kn.timestamp AS ts
+        FROM (SELECT rr.id AS rel_id, m.ref AS mref FROM resolved_relation rr, UNNEST(rr.members) AS t(m)
+              WHERE m.type = 'n' AND rr.id IN (SELECT id FROM minor_only_relation_ids_t)) rm
+        JOIN kept_node kn ON kn.id = rm.mref
+        UNION ALL
+        SELECT rm.rel_id, kw.timestamp AS ts
+        FROM (SELECT rr.id AS rel_id, m.ref AS mref FROM resolved_relation rr, UNNEST(rr.members) AS t(m)
+              WHERE m.type = 'w' AND rr.id IN (SELECT id FROM minor_only_relation_ids_t)) rm
+        JOIN kept_way kw ON kw.id = rm.mref
+        UNION ALL
+        SELECT rm.rel_id, kr.timestamp AS ts
+        FROM (SELECT rr.id AS rel_id, m.ref AS mref FROM resolved_relation rr, UNNEST(rr.members) AS t(m)
+              WHERE m.type = 'r' AND rr.id IN (SELECT id FROM minor_only_relation_ids_t)) rm
+        JOIN kept_relation kr ON kr.id = rm.mref
+    """)
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE relation_minor_valid_from AS
+        SELECT m.id, COALESCE(MAX(d.ts), {batch_ts_sql}) AS valid_from
+        FROM minor_only_relation_ids_t m LEFT JOIN relation_minor_dep_ts d ON d.rel_id = m.id
+        GROUP BY m.id
+    """)
+    prev_minor_view = _history_prev_minor_view(
+        con, store, man, "relation", "minor_only_relation_ids_t",
+        "(SELECT id, version FROM resolved_relation WHERE id IN (SELECT id FROM minor_only_relation_ids_t))",
+    )
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE relation_minor_meta AS
+        SELECT m.id, COALESCE(pm.prev_minor, 0) + 1 AS minor, v.valid_from
+        FROM minor_only_relation_ids_t m
+        JOIN relation_minor_valid_from v ON v.id = m.id
+        LEFT JOIN {prev_minor_view} pm ON pm.id = m.id
+    """)
+    promoted_r = common.promoted_select(promoted_keys, tags_expr="r.tags")
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE history_minor_relation AS
+        SELECT r.id, r.members, r.tags,
+               {promoted_r},
+               r.version, r.changeset, r.timestamp, r.uid, r."user",
+               r.xmin_e7, r.ymin_e7, r.xmax_e7, r.ymax_e7, r.geometry,
+               r.centroid_lat_e7, r.centroid_lon_e7, r.cell, r.hilbert,
+               mm.minor AS minor, mm.valid_from AS valid_from, CAST(NULL AS TIMESTAMP) AS valid_to,
+               TRUE AS visible,
+               r.prev_cell AS __prev_cell
+        FROM resolved_relation r JOIN relation_minor_meta mm ON mm.id = r.id
+        WHERE NOT r.deleted
+    """)
+
+
+def _finalize_history_batch(con, typ: str, promoted_keys: list[str], has_minor: bool) -> None:
+    """From ``history_own_{typ}`` (and ``history_minor_{typ}`` for way/
+    relation), each with the spatial column set plus a bookkeeping
+    ``__prev_cell`` column, builds ``history_batch_spatial_{typ}`` (state
+    rows + move-tombstone rows, section 2.1) and ``history_batch_byid_{typ}``
+    (state rows only -- "the byid copy has no move tombstones")."""
+    spatial_cols = history_schema.history_columns(SPATIAL_COLUMNS[typ](promoted_keys))
+    byid_cols = history_schema.history_columns(BYID_COLUMNS[typ](promoted_keys))
+    if has_minor:
+        con.execute(f"""
+            CREATE OR REPLACE TEMP TABLE history_spatial_state_{typ} AS
+            SELECT {', '.join(spatial_cols)}, __prev_cell FROM history_own_{typ}
+            UNION ALL
+            SELECT {', '.join(spatial_cols)}, __prev_cell FROM history_minor_{typ}
+        """)
+    else:
+        con.execute(f"""
+            CREATE OR REPLACE TEMP TABLE history_spatial_state_{typ} AS
+            SELECT {', '.join(spatial_cols)}, __prev_cell FROM history_own_{typ}
+        """)
+    type_map = _history_type_map(promoted_keys)
+    overrides = {
+        "id": "id", "version": "version", "minor": "minor", "valid_from": "valid_from",
+        "timestamp": "valid_from", "cell": "__prev_cell", "visible": "FALSE",
+    }
+    tomb_select = _history_null_or_override(spatial_cols, type_map, overrides)
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE history_batch_spatial_{typ} AS
+        SELECT {', '.join(spatial_cols)} FROM history_spatial_state_{typ}
+        UNION ALL
+        SELECT {tomb_select} FROM history_spatial_state_{typ}
+        WHERE __prev_cell IS NOT NULL AND __prev_cell != cell
+    """)
+    con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE history_batch_byid_{typ} AS
+        SELECT {', '.join(byid_cols)} FROM history_spatial_state_{typ}
+    """)
+
+
+def _build_history_batch(
+    con, store, man: manifest_mod.Manifest, promoted_keys: list[str], kept: dict[str, str],
+    touched_way_ids: np.ndarray, touched_relation_ids: np.ndarray, batch_timestamp: Optional[str],
+) -> bool:
+    """Populates ``history_batch_{byid,spatial}_{node,way,relation}`` TEMP
+    TABLEs for this run (docs/m4-contracts.md section 5.1). Returns True
+    iff at least one type has at least one row -- the caller skips writing
+    tiers otherwise ("a run that touches nothing writes no tier file")."""
+    batch_dt = _parse_ts(batch_timestamp)
+    batch_ts_sql = f"TIMESTAMP '{batch_dt.strftime('%Y-%m-%d %H:%M:%S')}'" if batch_dt else "NULL::TIMESTAMP"
+
+    _history_node(con, promoted_keys)
+    _finalize_history_batch(con, "node", promoted_keys, has_minor=False)
+
+    _history_way(con, store, man, promoted_keys, touched_way_ids, batch_ts_sql)
+    _finalize_history_batch(con, "way", promoted_keys, has_minor=True)
+
+    _history_relation(con, store, man, promoted_keys, touched_relation_ids, batch_ts_sql)
+    _finalize_history_batch(con, "relation", promoted_keys, has_minor=True)
+
+    total = sum(con.execute(f"SELECT count(*) FROM history_batch_byid_{t}").fetchone()[0] for t in _TYPES)
+    return total > 0
+
+
+# --------------------------------------------------------------------------
+# history tier fold (append-only) + write
+# --------------------------------------------------------------------------
+
+
+def _history_load_old(con, store, typ: str, tier_meta: Optional[dict]) -> tuple[Optional[str], Optional[str]]:
+    if tier_meta is None:
+        return None, None
+    files = tier_meta["files"][typ]
+    byid_url = store.url(files["byid"])
+    spatial_url = store.url(files["spatial"])
+    byid_name = f"__hist_old_byid_{typ}_{_uid()}"
+    spatial_name = f"__hist_old_spatial_{typ}_{_uid()}"
+    con.execute(f"CREATE OR REPLACE TEMP VIEW {byid_name} AS SELECT * FROM read_parquet('{_esc(byid_url)}')")
+    con.execute(f"CREATE OR REPLACE TEMP VIEW {spatial_name} AS SELECT * FROM read_parquet('{_esc(spatial_url)}')")
+    return byid_name, spatial_name
+
+
+def _history_append_tables(
+    con, typ: str, promoted_keys: list[str], new_byid: str, old_byid: Optional[str],
+    new_spatial: str, old_spatial: Optional[str],
+) -> tuple[str, str]:
+    """Append-only fold (docs/m4-contracts.md section 2.2: "the hour tier's
+    new version = old hour rows + this run's rows ... nothing is ever
+    merged by id")."""
+    byid_cols = history_schema.history_columns(BYID_COLUMNS[typ](promoted_keys))
+    spatial_cols = history_schema.history_columns(SPATIAL_COLUMNS[typ](promoted_keys))
+    out_byid = f"__hist_merged_byid_{typ}_{_uid()}"
+    out_spatial = f"__hist_merged_spatial_{typ}_{_uid()}"
+    if old_byid is None:
+        con.execute(f"CREATE OR REPLACE TEMP TABLE {out_byid} AS SELECT {', '.join(byid_cols)} FROM {new_byid}")
+        con.execute(f"CREATE OR REPLACE TEMP TABLE {out_spatial} AS SELECT {', '.join(spatial_cols)} FROM {new_spatial}")
+    else:
+        con.execute(f"""
+            CREATE OR REPLACE TEMP TABLE {out_byid} AS
+            SELECT {', '.join(byid_cols)} FROM {old_byid}
+            UNION ALL SELECT {', '.join(byid_cols)} FROM {new_byid}
+        """)
+        con.execute(f"""
+            CREATE OR REPLACE TEMP TABLE {out_spatial} AS
+            SELECT {', '.join(spatial_cols)} FROM {old_spatial}
+            UNION ALL SELECT {', '.join(spatial_cols)} FROM {new_spatial}
+        """)
+    return out_byid, out_spatial
+
+
+def _write_history_tier_version(
+    con, root: Path, man: manifest_mod.Manifest, promoted_keys: list[str], tier: str,
+    merged: dict[str, tuple[str, str]], seq_from: Optional[int], seq_to: Optional[int],
+    timestamp: Optional[str], version: int,
+) -> Optional[tuple[dict, int]]:
+    total_rows = sum(con.execute(f"SELECT count(*) FROM {merged[t][0]}").fetchone()[0] for t in _TYPES)
+    if total_rows == 0:
+        return None
+    gen = (man.history or {}).get("generation") or man.generation
+    out_dir = root / history_schema.tier_dir(gen, tier, version)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    files: dict[str, Any] = {}
+    rows: dict[str, int] = {}
+    cells: dict[str, list[str]] = {}
+    total_bytes = 0
+    for typ in _TYPES:
+        byid_name, spatial_name = merged[typ]
+        byid_cols = history_schema.history_columns(BYID_COLUMNS[typ](promoted_keys))
+        spatial_cols = history_schema.history_columns(SPATIAL_COLUMNS[typ](promoted_keys))
+        byid_path = out_dir / f"{typ}.byid.parquet"
+        spatial_path = out_dir / f"{typ}.spatial.parquet"
+        n_rows, n_bytes = common.copy_to_parquet(
+            con, f"SELECT {', '.join(byid_cols)} FROM {byid_name} ORDER BY id, valid_from",
+            byid_path, row_group_size_bytes=1_000_000,
+        )
+        _srows, s_bytes = common.copy_to_parquet(
+            con, f"SELECT {', '.join(spatial_cols)} FROM {spatial_name} ORDER BY cell, id, valid_from",
+            spatial_path, row_group_size_bytes=1_000_000,
+        )
+        files[typ] = {"spatial": _rel(root, spatial_path), "byid": _rel(root, byid_path)}
+        rows[typ] = n_rows
+        total_bytes += n_bytes + s_bytes
+        cell_rows = con.execute(f"SELECT DISTINCT cell FROM {spatial_name} WHERE cell IS NOT NULL").fetchall()
+        cells[typ] = sorted(c[0] for c in cell_rows)
+    meta = {
+        "version": version, "seq_from": seq_from, "seq_to": seq_to, "timestamp": timestamp,
+        "rows": rows, "cells": cells, "files": files,
+    }
+    return meta, total_bytes
+
+
+def _write_history_tiers(
+    con, root: Path, store, man: manifest_mod.Manifest, promoted_keys: list[str],
+    batch_tables: dict[str, tuple[str, str]], first_seq: int, last_seq: int,
+    batch_timestamp: Optional[str], hour_crossed: bool, day_crossed: bool,
+) -> tuple[dict[str, int], dict[str, int], dict]:
+    """Mirrors ``_write_tiers``'s hour/day/week roll (docs/m2-contracts.md
+    section 5 step 7, folding at the same instants -- ``hour_crossed``/
+    ``day_crossed`` are computed once from the *delta* tiers by the caller
+    and passed in here unchanged), but with append-only folds
+    (``_history_append_tables``) instead of newest-wins-per-id merges.
+    Returns (tier_versions, tier_bytes, new "history" manifest dict)."""
+    hist = man.history or {}
+    old_tiers = hist.get("tiers") or {}
+    hour_old = old_tiers.get("hour")
+    day_old = old_tiers.get("day")
+    week_old = old_tiers.get("week")
+
+    tier_versions: dict[str, int] = {}
+    tier_bytes: dict[str, int] = {}
+    new_tiers: dict = dict(old_tiers)
+
+    if not hour_crossed:
+        merged_hour = {}
+        for typ in _TYPES:
+            old_byid, old_spatial = _history_load_old(con, store, typ, hour_old)
+            new_byid, new_spatial = batch_tables[typ]
+            merged_hour[typ] = _history_append_tables(con, typ, promoted_keys, new_byid, old_byid, new_spatial, old_spatial)
+        seq_from = hour_old["seq_from"] if hour_old else first_seq
+        version = (hour_old["version"] if hour_old else 0) + 1
+        out = _write_history_tier_version(con, root, man, promoted_keys, "hour", merged_hour, seq_from, last_seq, batch_timestamp, version)
+        if out:
+            meta, nbytes = out
+            new_tiers["hour"] = meta
+            tier_versions["hour"] = meta["version"]
+            tier_bytes["hour"] = nbytes
+        return tier_versions, tier_bytes, {**hist, "tiers": new_tiers}
+
+    # ---- hour boundary crossed: fold hour_old into day, hour' = batch alone ---
+    merged_day = {}
+    for typ in _TYPES:
+        hour_byid, hour_spatial = _history_load_old(con, store, typ, hour_old)
+        day_byid, day_spatial = _history_load_old(con, store, typ, day_old)
+        merged_day[typ] = _history_append_tables(con, typ, promoted_keys, hour_byid, day_byid, hour_spatial, day_spatial)
+    day_seq_from = min(x for x in [(day_old or {}).get("seq_from"), hour_old["seq_from"]] if x is not None)
+    day_seq_to = hour_old["seq_to"]
+    day_timestamp = hour_old["timestamp"]
+    day_version = (day_old["version"] if day_old else 0) + 1
+
+    if day_crossed:
+        merged_week = {}
+        for typ in _TYPES:
+            week_byid, week_spatial = _history_load_old(con, store, typ, week_old)
+            mb, ms = merged_day[typ]
+            merged_week[typ] = _history_append_tables(con, typ, promoted_keys, mb, week_byid, ms, week_spatial)
+        week_seq_from = min(x for x in [(week_old or {}).get("seq_from"), day_seq_from] if x is not None)
+        week_seq_to = day_seq_to
+        week_timestamp = day_timestamp
+        week_version = (week_old["version"] if week_old else 0) + 1
+        out = _write_history_tier_version(con, root, man, promoted_keys, "week", merged_week, week_seq_from, week_seq_to, week_timestamp, week_version)
+        if out:
+            meta, nbytes = out
+            new_tiers["week"] = meta
+            tier_versions["week"] = meta["version"]
+            tier_bytes["week"] = nbytes
+        merged_day_final = {typ: batch_tables[typ] for typ in _TYPES}
+        out = _write_history_tier_version(con, root, man, promoted_keys, "day", merged_day_final, first_seq, last_seq, batch_timestamp, day_version)
+    else:
+        out = _write_history_tier_version(con, root, man, promoted_keys, "day", merged_day, day_seq_from, day_seq_to, day_timestamp, day_version)
+    if out:
+        meta, nbytes = out
+        new_tiers["day"] = meta
+        tier_versions["day"] = meta["version"]
+        tier_bytes["day"] = nbytes
+
+    merged_hour_final = {typ: batch_tables[typ] for typ in _TYPES}
+    hour_version = (hour_old["version"] if hour_old else 0) + 1
+    out = _write_history_tier_version(con, root, man, promoted_keys, "hour", merged_hour_final, first_seq, last_seq, batch_timestamp, hour_version)
+    if out:
+        meta, nbytes = out
+        new_tiers["hour"] = meta
+        tier_versions["hour"] = meta["version"]
+        tier_bytes["hour"] = nbytes
+
+    return tier_versions, tier_bytes, {**hist, "tiers": new_tiers}
+
+
+def _upload_new_history_tier_files(store, write_root: Path, new_history: Optional[dict], tier_versions: dict) -> None:
+    """s3:// counterpart of ``_upload_new_tier_files``, for history tier
+    files (docs/m4-contracts.md section 5.1: "the s3:// root path must work
+    for tier files")."""
+    tiers = (new_history or {}).get("tiers") or {}
+    for tier_name in tier_versions:
+        entry = tiers.get(tier_name) or {}
+        files = entry.get("files") or {}
+        for _typ, kinds in files.items():
+            for _kind, relpath in (kinds or {}).items():
+                if relpath:
+                    store.upload_file(str(write_root / relpath), relpath)
