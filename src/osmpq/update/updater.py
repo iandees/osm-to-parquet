@@ -1075,7 +1075,6 @@ def _assignment_table(ids: np.ndarray, cell: np.ndarray, hilbert: np.ndarray, cl
 # step 7/8: rolling tiers (merge/fold), file writing, manifest deltas
 # --------------------------------------------------------------------------
 
-_TYPE_LETTER = {"node": "n", "way": "w", "relation": "r"}
 _uid_counter = [0]
 
 
@@ -1181,6 +1180,7 @@ def _write_tier_version(
     out_dir.mkdir(parents=True, exist_ok=True)
     files: dict[str, Any] = {}
     rows: dict[str, int] = {}
+    cells: dict[str, list[str]] = {}
     tomb_pieces = []
     total_bytes = 0
     for typ in _TYPES:
@@ -1200,8 +1200,13 @@ def _write_tier_version(
         files[typ] = {"spatial": _rel(root, spatial_path), "byid": _rel(root, byid_path)}
         rows[typ] = n_rows
         total_bytes += n_bytes + s_bytes
+        # Every row (deleted or not) carries a real cell value (deleted rows
+        # have cell = prev_cell), so this is exactly "every cell this tier
+        # has at least one row -- live or tombstone -- for, for this table".
+        cell_rows = con.execute(f"SELECT DISTINCT cell FROM {spatial_name} WHERE cell IS NOT NULL").fetchall()
+        cells[typ] = sorted(c[0] for c in cell_rows)
         tomb_pieces.append(
-            f"SELECT '{_TYPE_LETTER[typ]}' AS type, id, prev_cell, seq FROM {byid_name} "
+            f"SELECT '{typ}' AS type, id, prev_cell, seq FROM {byid_name} "
             f"WHERE prev_cell IS NOT NULL AND (prev_cell != cell OR deleted)"
         )
     tomb_path = out_dir / "tombstones.parquet"
@@ -1211,7 +1216,10 @@ def _write_tier_version(
     )
     total_bytes += tomb_bytes
     files["tombstones"] = _rel(root, tomb_path)
-    meta = {"version": version, "seq_from": seq_from, "seq_to": seq_to, "timestamp": timestamp, "rows": rows, "files": files}
+    meta = {
+        "version": version, "seq_from": seq_from, "seq_to": seq_to, "timestamp": timestamp,
+        "rows": rows, "cells": cells, "files": files,
+    }
     return meta, total_bytes
 
 

@@ -155,6 +155,14 @@ def _cmd_validate(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = argv if argv is not None else sys.argv[1:]
+    if argv[:1] == ["compact"]:
+        from osmpq.build.compact import compact_main
+        return compact_main(argv[1:])
+    if argv[:1] == ["gc"]:
+        from osmpq.build.gc import gc_main
+        return gc_main(argv[1:])
+
     parser = argparse.ArgumentParser(prog="osmpq")
     sub = parser.add_subparsers(dest="command", required=True)
 

@@ -1,16 +1,21 @@
 """End-to-end test of the M2 updater against the Bermuda dataset
 (docs/m2-contracts.md sections 2, 3, 5).
 
-Builds Bermuda with ``--max-nodes-per-cell 20000`` through the same two
-stages as ``osmpq build`` (``raw_build`` + ``build_from_raw``), plus the
-separate ``osmpq-raw node-way-index`` pass -- required here because the
-updater's touched-set computation (docs/m2-contracts.md section 5 step 4)
-needs a real ``node_way`` index, which docs/m1-contracts.md section 3.3
-explicitly calls "optional in M1... the updater (M2) will [need it]".
-``raw_build`` (the ``osmpq raw-py`` producer used by plain ``osmpq build``)
-never writes one; the Rust ``osmpq-raw`` binary's separate pass does, and
-only needs ``rawdir/way/*.parquet`` to do it, so it works regardless of
-which producer wrote that directory.
+Builds Bermuda with ``--max-nodes-per-cell 20000`` through the Rust
+``osmpq-raw`` producer (``build`` then the separate ``node-way-index``
+pass) and ``osmpq build --raw`` (``build_from_raw``), i.e. what plain
+``osmpq build <pbf> <root>`` does except for two things this test needs
+that the Python ``raw-py`` producer doesn't give it:
+
+- a real ``node_way`` index, which the updater's touched-set computation
+  (docs/m2-contracts.md section 5 step 4) needs -- docs/m1-contracts.md
+  section 3.3 explicitly calls it "optional in M1... the updater (M2)
+  will [need it]" and only the Rust producer's separate pass builds one;
+- real metadata (in particular ``version``, which a hand-written ``.osc``
+  must exceed) on *untagged* nodes -- ``raw-py`` leaves it NULL by design
+  (docs/m0-contracts.md section 5, "a known gap fixed by the Rust reader
+  in M1"), and several of the ids this test moves/retags/deletes are
+  untagged way vertices.
 
 Applies a hand-written ``.osc`` batch (via a fake replication client
 pointing at local files -- no network) covering every extent-filter and
@@ -30,7 +35,6 @@ import duckdb
 import pytest
 
 from osmpq.build.builder import BuildFromRawOptions, build_from_raw
-from osmpq.build.raw import RawBuildOptions, raw_build
 from osmpq.layout import manifest as manifest_mod
 from osmpq.update import updater as updater_mod
 from osmpq.update.replication import FetchResult
@@ -71,8 +75,7 @@ def _osmpq_raw(*args: str) -> None:
 def rawdir(tmp_path_factory) -> Path:
     d = tmp_path_factory.mktemp("bermuda-upd-raw")
     tmp = tmp_path_factory.mktemp("bermuda-upd-raw-tmp")
-    opts = RawBuildOptions(pbf_path=str(PBF_PATH), rawdir=str(d), max_nodes_per_cell=20_000, tmpdir=str(tmp))
-    raw_build(opts)
+    _osmpq_raw("build", str(PBF_PATH), str(d), "--max-nodes-per-cell", "20000", "--tmpdir", str(tmp))
     _osmpq_raw("node-way-index", str(d))
     return d
 
@@ -260,6 +263,10 @@ def test_first_run_upgrades_manifest_to_v3(root, run1):
     assert man.deltas["hour"]["version"] == 1
     assert man.deltas["hour"]["seq_from"] == 1
     assert man.deltas["hour"]["seq_to"] == 1
+    cells = man.deltas["hour"]["cells"]
+    assert set(cells.keys()) == {"node", "way", "relation"}
+    assert cells["node"] == sorted(cells["node"])  # sorted cell keys
+    assert len(cells["node"]) > 0 and len(cells["way"]) > 0 and len(cells["relation"]) > 0
 
 
 def test_run1_summary(run1):
@@ -327,7 +334,7 @@ def test_moved_node_row_and_tombstone(root, run1, base_versions):
     assert row["prev_cell"] is not None
     # the node actually changed cell (moved far away): a tombstone must
     # shadow the old cell.
-    tomb = _rows(con, str(d / "tombstones.parquet"), where=f"type='n' AND id = {MOVE_NODE}")
+    tomb = _rows(con, str(d / "tombstones.parquet"), where=f"type='node' AND id = {MOVE_NODE}")
     assert len(tomb) == 1
     assert tomb[0]["prev_cell"] == row["prev_cell"]
 
@@ -343,7 +350,7 @@ def test_moved_node_parent_way_bbox_changed(root, run1):
     assert row["xmin_e7"] <= -700000000 <= row["xmax_e7"]
     assert row["ymin_e7"] <= 250000000 <= row["ymax_e7"]
     # its cell changed too (bbox grew a lot) -> tombstoned
-    tomb = _rows(con, str(d / "tombstones.parquet"), where=f"type='w' AND id = {WAY_AFFECTED_BY_MOVE}")
+    tomb = _rows(con, str(d / "tombstones.parquet"), where=f"type='way' AND id = {WAY_AFFECTED_BY_MOVE}")
     assert len(tomb) == 1
 
 
@@ -355,7 +362,7 @@ def test_retagged_node_kept_cell_unchanged_no_tombstone(root, run1):
     row = rows[0]
     assert row["amenity"] == "cafe"
     assert row["prev_cell"] == row["cell"]  # didn't move
-    tomb = _rows(con, str(d / "tombstones.parquet"), where=f"type='n' AND id = {RETAG_NODE}")
+    tomb = _rows(con, str(d / "tombstones.parquet"), where=f"type='node' AND id = {RETAG_NODE}")
     assert tomb == []  # unchanged cell -> no tombstone needed
 
 
@@ -372,7 +379,7 @@ def test_deleted_way_tombstoned_cell_equals_prev_cell_payload_null(root, run1):
     spatial = _rows(con, str(d / "way.spatial.parquet"), where=f"id = {WAY_TO_DELETE}")
     assert spatial[0]["cell"] == row["prev_cell"]
     assert spatial[0]["hilbert"] is None
-    tomb = _rows(con, str(d / "tombstones.parquet"), where=f"type='w' AND id = {WAY_TO_DELETE}")
+    tomb = _rows(con, str(d / "tombstones.parquet"), where=f"type='way' AND id = {WAY_TO_DELETE}")
     assert len(tomb) == 1 and tomb[0]["prev_cell"] == row["prev_cell"]
 
 
@@ -392,7 +399,7 @@ def test_deleted_relation_row(root, run1):
     assert len(rows) == 1
     assert rows[0]["deleted"] is True
     assert rows[0]["members"] is None
-    tomb = _rows(con, str(d / "tombstones.parquet"), where=f"type='r' AND id = {DELETE_REL}")
+    tomb = _rows(con, str(d / "tombstones.parquet"), where=f"type='relation' AND id = {DELETE_REL}")
     assert len(tomb) == 1
 
 
