@@ -12,6 +12,8 @@ from osmpq.build.builder import BuildFromRawOptions, BuildOptions, build, build_
 from osmpq.build.raw import RawBuildOptions, raw_build
 from osmpq.layout import cells as cells_mod
 from osmpq.layout import manifest as manifest_mod
+from osmpq.update.updater import UpdateOptions
+from osmpq.update.updater import run as update_run
 
 
 def _parse_bbox(s: str) -> tuple[float, float, float, float]:
@@ -129,6 +131,21 @@ def _cmd_manifest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_update(args: argparse.Namespace) -> int:
+    opts = UpdateOptions(
+        root=args.root,
+        source=args.source,
+        max_diffs=args.max_diffs,
+        tmpdir=args.tmpdir,
+        threads=args.threads,
+        memory_limit=args.memory_limit,
+        follow=args.follow,
+        poll_interval=args.poll_interval,
+    )
+    update_run(opts)
+    return 0
+
+
 def _cmd_validate(args: argparse.Namespace) -> int:
     from osmpq.build.validate import validate
 
@@ -180,6 +197,19 @@ def main(argv: list[str] | None = None) -> int:
     p_validate = sub.add_parser("validate", help="check a dataset root against the manifest contract")
     p_validate.add_argument("root")
     p_validate.set_defaults(func=_cmd_validate)
+
+    p_update = sub.add_parser("update", help="apply minutely replication diffs (docs/m2-contracts.md section 5)")
+    p_update.add_argument("root")
+    p_update.add_argument("--source", default=None, help="replication source URL (defaults to the manifest's)")
+    once_group = p_update.add_mutually_exclusive_group()
+    once_group.add_argument("--once", action="store_true", help="apply one batch and exit (default)")
+    once_group.add_argument("--follow", action="store_true", help="poll the source and run repeatedly")
+    p_update.add_argument("--max-diffs", type=int, default=60)
+    p_update.add_argument("--tmpdir", default=None)
+    p_update.add_argument("--threads", type=int, default=None)
+    p_update.add_argument("--memory-limit", default=None)
+    p_update.add_argument("--poll-interval", type=float, default=30.0, help="seconds between --follow polls")
+    p_update.set_defaults(func=_cmd_update)
 
     args = parser.parse_args(argv)
     return args.func(args)

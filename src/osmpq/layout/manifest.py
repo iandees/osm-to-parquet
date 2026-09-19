@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 MANIFEST_VERSION = 1
+CURRENT_MANIFEST_VERSION = 3
 SCHEMA_VERSION = 1
 COORDINATE_SCALE = 10_000_000
 
@@ -73,6 +74,13 @@ class Manifest:
     rowgroup_index: dict[str, str] = field(default_factory=dict)
     producer: dict[str, str] = field(default_factory=dict)
     stats: dict[str, Any] = field(default_factory=dict)
+    # -- v3 fields (docs/m2-contracts.md section 3); None/empty when absent
+    # from a v1/v2 manifest. ``replication_source`` is the osmosis-style
+    # replication directory URL the updater last pulled from.
+    # ``deltas`` maps tier name ("hour"/"day"/"week") -> that tier's current
+    # version metadata; a tier absent from ``deltas`` is empty (base only).
+    replication_source: Optional[str] = None
+    deltas: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -96,6 +104,9 @@ class Manifest:
             d["rowgroup_index"] = self.rowgroup_index
             d["producer"] = self.producer
             d["stats"] = self.stats
+        if self.manifest_version >= 3:
+            d["replication_source"] = self.replication_source
+            d["deltas"] = self.deltas
         return d
 
     @classmethod
@@ -119,6 +130,8 @@ class Manifest:
             rowgroup_index=d.get("rowgroup_index", {}),
             producer=d.get("producer", {}),
             stats=d.get("stats", {}),
+            replication_source=d.get("replication_source"),
+            deltas=d.get("deltas", {}),
         )
 
     # -- convenience accessors -------------------------------------------------
@@ -151,6 +164,15 @@ class Manifest:
                 paths.append(part["path"])
         for path in self.rowgroup_index.values():
             paths.append(path)
+        for _tier, entry in self.deltas.items():
+            files = entry.get("files", {})
+            for _table, table_files in files.items():
+                if isinstance(table_files, dict):
+                    for _kind, p in table_files.items():
+                        if p:
+                            paths.append(p)
+                elif table_files:
+                    paths.append(table_files)
         return paths
 
 
