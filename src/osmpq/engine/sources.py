@@ -1,0 +1,323 @@
+"""SQL builders that read the on-disk (or on-S3) Parquet layout into the
+canonical set schema (schema.py). One function per access path from
+contract section 8: spatial bbox scan, byid id lookup, and set-sourced
+(input-set) queries.
+"""
+from __future__ import annotations
+
+from typing import Optional
+
+from osmpq.ql.ast import TagFilter
+
+from . import catalog, tagsql
+from .schema import empty_set_sql, project
+
+BBox = tuple[float, float, float, float]
+
+
+def to_e7(deg: float) -> int:
+    return int(round(deg * 1e7))
+
+
+def _quote_list(paths: list[str]) -> str:
+    return "[" + ",".join("'" + p.replace("'", "''") + "'" for p in paths) + "]"
+
+
+def _node_files(manifest: catalog.Manifest, cells: list[str], partition: str) -> list[str]:
+    tc = manifest.table_cells("node")
+    out = []
+    for c in cells:
+        entry = tc.get(c, {})
+        part = entry.get(partition)
+        if part:
+            out.append(manifest.path(part["path"]))
+    return out
+
+
+def _way_files(manifest: catalog.Manifest, cells: list[str]) -> list[str]:
+    tc = manifest.table_cells("way")
+    return [manifest.path(tc[c]["path"]) for c in cells if c in tc]
+
+
+def _relation_files(manifest: catalog.Manifest, cells: list[str]) -> list[str]:
+    tc = manifest.table_cells("relation")
+    return [manifest.path(tc[c]["path"]) for c in cells if c in tc]
+
+
+# --------------------------------------------------------------------------
+# Spatial (bbox) scans
+# --------------------------------------------------------------------------
+
+
+def build_node_spatial_select(
+    manifest: catalog.Manifest,
+    bbox: Optional[BBox],
+    tag_filters: list[TagFilter],
+    ids: Optional[list[int]],
+    promoted_keys: set[str],
+) -> tuple[str, int]:
+    cells = catalog.cells_for_bbox(manifest, "node", bbox)
+    need_untagged = tagsql.is_negative_only(tag_filters)
+    files = _node_files(manifest, cells, "tagged")
+    if need_untagged:
+        files = files + _node_files(manifest, cells, "untagged")
+    if not files:
+        return empty_set_sql(), 0
+
+    where = []
+    if bbox is not None:
+        s, w, n, e = bbox
+        where.append(
+            f"lat_e7 BETWEEN {to_e7(s)} AND {to_e7(n)} AND lon_e7 BETWEEN {to_e7(w)} AND {to_e7(e)}"
+        )
+    if ids:
+        where.append(f"id IN ({','.join(str(i) for i in ids)})")
+    where.append(tagsql.tag_filters_sql(tag_filters, promoted_keys))
+    where_sql = " AND ".join(f"({w})" for w in where)
+
+    cols = {
+        "type": "'node'",
+        "id": "id",
+        "cell": "cell",
+        "lat_e7": "lat_e7",
+        "lon_e7": "lon_e7",
+        "tags": "tags",
+        "version": "version",
+        "changeset": "changeset",
+        "timestamp": "timestamp",
+        "uid": "uid",
+        "user": '"user"',
+        "hilbert": "hilbert",
+    }
+    sql = (
+        f"SELECT {project(cols)}\n"
+        f"FROM read_parquet({_quote_list(files)}, hive_partitioning=true, union_by_name=true)\n"
+        f"WHERE {where_sql}"
+    )
+    return sql, len(files)
+
+
+def build_way_spatial_select(
+    manifest: catalog.Manifest,
+    bbox: Optional[BBox],
+    tag_filters: list[TagFilter],
+    ids: Optional[list[int]],
+    promoted_keys: set[str],
+) -> tuple[str, int]:
+    cells = catalog.cells_for_bbox(manifest, "way", bbox)
+    files = _way_files(manifest, cells)
+    if not files:
+        return empty_set_sql(), 0
+
+    where = []
+    if bbox is not None:
+        s, w, n, e = bbox
+        se, we, ne, ee = to_e7(s), to_e7(w), to_e7(n), to_e7(e)
+        where.append(
+            f"xmax_e7 >= {we} AND xmin_e7 <= {ee} AND ymax_e7 >= {se} AND ymin_e7 <= {ne}"
+        )
+    if ids:
+        where.append(f"id IN ({','.join(str(i) for i in ids)})")
+    where.append(tagsql.tag_filters_sql(tag_filters, promoted_keys))
+    where_sql = " AND ".join(f"({w})" for w in where)
+
+    cols = {
+        "type": "'way'",
+        "id": "id",
+        "cell": "cell",
+        "refs": "refs",
+        "tags": "tags",
+        "version": "version",
+        "changeset": "changeset",
+        "timestamp": "timestamp",
+        "uid": "uid",
+        "user": '"user"',
+        "xmin_e7": "xmin_e7",
+        "ymin_e7": "ymin_e7",
+        "xmax_e7": "xmax_e7",
+        "ymax_e7": "ymax_e7",
+        "geometry": "geometry",
+        "hilbert": "hilbert",
+    }
+    sql = (
+        f"SELECT {project(cols)}\n"
+        f"FROM read_parquet({_quote_list(files)}, hive_partitioning=true, union_by_name=true)\n"
+        f"WHERE {where_sql}"
+    )
+    return sql, len(files)
+
+
+def build_relation_spatial_select(
+    manifest: catalog.Manifest,
+    bbox: Optional[BBox],
+    tag_filters: list[TagFilter],
+    ids: Optional[list[int]],
+    promoted_keys: set[str],
+) -> tuple[str, int]:
+    cells = catalog.cells_for_bbox(manifest, "relation", bbox)
+    files = _relation_files(manifest, cells)
+    if not files:
+        return empty_set_sql(), 0
+
+    where = []
+    if bbox is not None:
+        s, w, n, e = bbox
+        se, we, ne, ee = to_e7(s), to_e7(w), to_e7(n), to_e7(e)
+        where.append(
+            f"xmax_e7 >= {we} AND xmin_e7 <= {ee} AND ymax_e7 >= {se} AND ymin_e7 <= {ne}"
+        )
+    if ids:
+        where.append(f"id IN ({','.join(str(i) for i in ids)})")
+    where.append(tagsql.tag_filters_sql(tag_filters, promoted_keys))
+    where_sql = " AND ".join(f"({w})" for w in where)
+
+    cols = {
+        "type": "'relation'",
+        "id": "id",
+        "cell": "cell",
+        "members": "members",
+        "tags": "tags",
+        "version": "version",
+        "changeset": "changeset",
+        "timestamp": "timestamp",
+        "uid": "uid",
+        "user": '"user"',
+        "xmin_e7": "xmin_e7",
+        "ymin_e7": "ymin_e7",
+        "xmax_e7": "xmax_e7",
+        "ymax_e7": "ymax_e7",
+        "geometry": "geometry",
+        "hilbert": "hilbert",
+    }
+    sql = (
+        f"SELECT {project(cols)}\n"
+        f"FROM read_parquet({_quote_list(files)}, hive_partitioning=true, union_by_name=true)\n"
+        f"WHERE {where_sql}"
+    )
+    return sql, len(files)
+
+
+SPATIAL_BUILDERS = {
+    "node": build_node_spatial_select,
+    "way": build_way_spatial_select,
+    "relation": build_relation_spatial_select,
+}
+
+
+# --------------------------------------------------------------------------
+# byid (id lookup, no bbox)
+# --------------------------------------------------------------------------
+
+
+def build_byid_select(
+    manifest: catalog.Manifest,
+    element_type: str,
+    ids: list[int],
+    tag_filters: list[TagFilter],
+    promoted_keys: set[str],
+) -> tuple[str, int]:
+    parts = catalog.byid_parts_for_ids(manifest, element_type, ids)
+    files = [manifest.path(p["path"]) for p in parts]
+    if not files or not ids:
+        return empty_set_sql(), 0
+
+    idlist = ",".join(str(i) for i in ids)
+    where = [f"id IN ({idlist})", tagsql.tag_filters_sql(tag_filters, promoted_keys)]
+    where_sql = " AND ".join(f"({w})" for w in where)
+
+    if element_type == "node":
+        cols = {
+            "type": "'node'",
+            "id": "id",
+            "cell": "cell",
+            "lat_e7": "lat_e7",
+            "lon_e7": "lon_e7",
+            "tags": "tags",
+            "version": "version",
+            "changeset": "changeset",
+            "timestamp": "timestamp",
+            "uid": "uid",
+            "user": '"user"',
+            "hilbert": "opq_node_hilbert(lon_e7, lat_e7)",
+        }
+    elif element_type == "way":
+        cols = {
+            "type": "'way'",
+            "id": "id",
+            "cell": "cell",
+            "refs": "refs",
+            "tags": "tags",
+            "version": "version",
+            "changeset": "changeset",
+            "timestamp": "timestamp",
+            "uid": "uid",
+            "user": '"user"',
+            "xmin_e7": "xmin_e7",
+            "ymin_e7": "ymin_e7",
+            "xmax_e7": "xmax_e7",
+            "ymax_e7": "ymax_e7",
+            "hilbert": "opq_bbox_hilbert(xmin_e7, ymin_e7, xmax_e7, ymax_e7)",
+        }
+    else:
+        cols = {
+            "type": "'relation'",
+            "id": "id",
+            "cell": "cell",
+            "members": "members",
+            "tags": "tags",
+            "version": "version",
+            "changeset": "changeset",
+            "timestamp": "timestamp",
+            "uid": "uid",
+            "user": '"user"',
+            "xmin_e7": "xmin_e7",
+            "ymin_e7": "ymin_e7",
+            "xmax_e7": "xmax_e7",
+            "ymax_e7": "ymax_e7",
+            "hilbert": "opq_bbox_hilbert(xmin_e7, ymin_e7, xmax_e7, ymax_e7)",
+        }
+    sql = (
+        f"SELECT {project(cols)}\n"
+        f"FROM read_parquet({_quote_list(files)}, union_by_name=true)\n"
+        f"WHERE {where_sql}"
+    )
+    return sql, len(files)
+
+
+# --------------------------------------------------------------------------
+# Set-sourced query (input sets: node.a[amenity=cafe])
+# --------------------------------------------------------------------------
+
+
+def build_from_set_select(
+    set_names: list[str],
+    types: list[str],
+    tag_filters: list[TagFilter],
+    ids: Optional[list[int]],
+    bbox: Optional[BBox],
+) -> str:
+    base = f"set_{set_names[0]}"
+    joins = "".join(f" INNER JOIN set_{s} USING (type, id)" for s in set_names[1:])
+
+    type_list = ",".join(f"'{t}'" for t in types)
+    where = [f"{base}.type IN ({type_list})"]
+    if ids:
+        where.append(f"{base}.id IN ({','.join(str(i) for i in ids)})")
+    if bbox is not None:
+        s, w, n, e = bbox
+        se, we, ne, ee = to_e7(s), to_e7(w), to_e7(n), to_e7(e)
+        where.append(
+            f"(({base}.type='node' AND {base}.lat_e7 BETWEEN {se} AND {ne} "
+            f"AND {base}.lon_e7 BETWEEN {we} AND {ee}) "
+            f"OR ({base}.type IN ('way','relation') AND {base}.xmax_e7 >= {we} "
+            f"AND {base}.xmin_e7 <= {ee} AND {base}.ymax_e7 >= {se} AND {base}.ymin_e7 <= {ne}))"
+        )
+    where.append(tagsql.tag_filters_sql(tag_filters, set(), prefix=f"{base}."))
+    where_sql = " AND ".join(f"({w})" for w in where)
+
+    cols = {name: f"{base}.{name}" if name != "user" else f'{base}."user"'
+            for name in ["type", "id", "cell", "lat_e7", "lon_e7", "refs", "members", "tags",
+                         "version", "changeset", "timestamp", "uid", "user",
+                         "xmin_e7", "ymin_e7", "xmax_e7", "ymax_e7", "geometry", "hilbert"]}
+    sql = f"SELECT {project(cols)}\nFROM {base}{joins}\nWHERE {where_sql}"
+    return sql
