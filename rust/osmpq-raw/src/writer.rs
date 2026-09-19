@@ -298,12 +298,6 @@ pub struct PartWriter {
     kind: TableKind,
     max_rows_per_part: usize,
     sizing: RowGroupSizing,
-    /// Resolved once, from the first batch of the first part, and reused
-    /// for every subsequent part of this table (byte density doesn't
-    /// meaningfully vary part-to-part the way it does cell-to-cell for
-    /// spatial files, so re-probing per part isn't worth the extra
-    /// compression pass).
-    resolved_row_group_size: Option<usize>,
     part_idx: usize,
     rows_in_part: usize,
     writer: Option<ArrowWriter<File>>,
@@ -337,7 +331,6 @@ impl PartWriter {
             kind,
             max_rows_per_part,
             sizing,
-            resolved_row_group_size: None,
             part_idx: 0,
             rows_in_part: 0,
             writer: None,
@@ -354,10 +347,11 @@ impl PartWriter {
     }
 
     fn open(&mut self, first_batch: Option<&RecordBatch>) -> Result<()> {
-        if self.resolved_row_group_size.is_none() {
-            self.resolved_row_group_size = Some(self.sizing.resolve(&self.schema, self.kind, first_batch)?);
-        }
-        let row_group_size = self.resolved_row_group_size.unwrap();
+        // Resolved fresh for every part (not cached): byte density can
+        // drift across a table's id range (e.g. tag/ref density changes
+        // over the id-ordered history of a way byid file), so each part
+        // gets its own row-group row count from its own first batch.
+        let row_group_size = self.sizing.resolve(&self.schema, self.kind, first_batch)?;
         let path = self.part_path();
         let file = File::create(&path)?;
         let props = writer_properties(row_group_size, None, self.kind);
