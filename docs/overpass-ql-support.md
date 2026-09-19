@@ -4,6 +4,11 @@ The reference is the [Overpass QL wiki page](https://wiki.openstreetmap.org/wiki
 and the behavior of `overpass-api.de`. Tiers are the order we intend to
 implement features in; "how" points at the mechanism in `design.md`.
 
+Compatibility target: **most real-world queries produce the same set of
+elements with the same tags and geometry.** Byte-identical output, exact
+ordering under `qt`, and exotic evaluator corner cases are explicitly not
+goals; differences are documented rather than chased.
+
 Legend: T1 = milestone 0/1 (must have for overpass turbo and JOSM to work),
 T2 = milestone 3, T3 = milestone 5, T4 = attic (milestone 4), N = not planned.
 
@@ -11,13 +16,13 @@ T2 = milestone 3, T3 = milestone 5, T4 = attic (milestone 4), N = not planned.
 
 | Feature | Tier | Notes |
 | --- | --- | --- |
-| `[out:json]`, `[out:xml]` | T1 | Byte-compatible envelope incl. `osm3s.timestamp_osm_base`, `remark` |
+| `[out:json]`, `[out:xml]` | T1 | Same envelope shape incl. `osm3s.timestamp_osm_base`, `remark` |
 | `[out:csv(...)]` | T2 | Column list, header flag, separator |
 | `[out:popup]`, `[out:custom]` | T3 | Rarely used |
 | `[timeout:n]` | T1 | Cancels the DuckDB query; Overpass-style runtime error remark |
 | `[maxsize:n]` | T1 | Maps to DuckDB memory limit for the query |
 | `[bbox:s,w,n,e]` | T1 | Global bbox applied to every query statement |
-| `[date:"..."]` | T4 | Attic |
+| `[date:"..."]` | T4 | History table, `valid_from <= t < valid_to` |
 | `[diff:"a","b"]`, `[adiff:"a","b"]` | T4 | Attic |
 
 ## Query statements and filters
@@ -45,7 +50,7 @@ T2 = milestone 3, T3 = milestone 5, T4 = attic (milestone 4), N = not planned.
 
 | Feature | Tier | Notes |
 | --- | --- | --- |
-| `out` with `ids`, `skel`, `body`, `tags`, `meta`, `noids`, `geom`, `bb`, `center`, `count`, `qt`, `asc`, limit `N` | T1 | `qt` order uses our Hilbert key; documented difference from Overpass's Z-order quadtiles unless we store both |
+| `out` with `ids`, `skel`, `body`, `tags`, `meta`, `noids`, `geom`, `bb`, `center`, `count`, `qt`, `asc`, limit `N` | T1 | `qt` order uses our Hilbert key; a documented difference from Overpass's Z-order quadtiles |
 | `out geom(s,w,n,e)` (clipped geometry) | T2 | |
 | `.set;` item, `->.set` | T1 | |
 | `>` , `>>` , `<` , `<<` | T1 | Core recursion |
@@ -82,11 +87,11 @@ T2 = milestone 3, T3 = milestone 5, T4 = attic (milestone 4), N = not planned.
 
 | Feature | Tier | Notes |
 | --- | --- | --- |
-| Element ordering (nodes, ways, relations; by id; `qt`) | T1 | Part of the differential test corpus |
+| Element ordering (nodes, ways, relations; by id) | T1 | Default order matched; `qt` order differs (see above) |
 | `count` element for `out count` | T1 | |
 | `remark` on timeout/errors, HTTP 400 with the Overpass HTML error page for parse errors | T1 | overpass turbo parses the error page |
 | `bounds` on `out bb`/`geom`, `center` on `out center` | T1 | |
-| Coordinates as 7-decimal doubles in JSON, strings in XML | T1 | Match Overpass formatting |
+| Coordinates as 7-decimal doubles in JSON, strings in XML | T1 | Match Overpass formatting where cheap; not a hard goal |
 | `/api/status`, `/api/timestamp`, `/api/kill_my_queries` | T2 | |
 | Overpass XML query language (`<osm-script>`) | N | Could be added as a converter to the same AST later |
 | overpass turbo shortcuts (`{{bbox}}`, `{{geocodeArea}}`) | N | Expanded client-side by overpass turbo, not by the server |

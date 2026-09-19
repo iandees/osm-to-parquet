@@ -7,11 +7,17 @@ a large local NVMe database, kept current with the minutely replication diffs.
 The public Overpass API is a great tool, but running your own instance means
 provisioning roughly 600+ GB of fast local SSD per server plus a single-writer
 update process, and every read replica repeats that cost. This project explores
-the opposite trade: put the planet in cloud-optimized columnar files on a blob
-store, use an embedded analytical engine (DuckDB) with HTTP range reads as the
-execution layer, and translate Overpass QL into queries against that layout.
-Query workers become stateless and disposable; the only stateful machine is
-the small updater.
+the opposite trade: put the planet in cloud-optimized columnar files on
+Cloudflare R2, use an embedded analytical engine (DuckDB) with HTTP range
+reads as the execution layer, and translate Overpass QL into queries against
+that layout. Queries mostly wait on I/O, so the query engine runs serverless
+(Cloudflare Workers in front of Cloudflare Containers that sleep when idle);
+the only always-on, stateful machine is the small updater.
+
+Decisions so far: R2 for storage; serverless query compute; "most real
+queries work" rather than byte-identical Overpass compatibility; full history
+back to 2012 and earlier as a real goal, prototyped on small regional history
+extracts first. See the decisions table at the top of the design document.
 
 Status: **design phase**. Nothing runs yet. The documents below are the
 proposal; the repository name is historical and Parquet is a means, not the
@@ -36,18 +42,20 @@ goal.
    geometry and bounding box so the common case (`out geom`, `area`, `around`)
    never has to join back to nodes over the network. Node references are kept
    too, so `>` / `<` recursion still works exactly like Overpass.
-3. **Minutely updates as deltas.** A small updater applies `.osc` diffs to a
-   local replication store, re-resolves geometry for touched ways and
-   relations, and publishes small delta Parquet files. Readers see
-   `base ⊕ deltas`, last version wins. Deltas are compacted hourly and daily,
-   and folded into a new base periodically.
-4. **Overpass QL front end.** A parser produces an AST; a planner turns each
-   statement into SQL over the lake, with Overpass sets materialized as
-   temporary tables inside a per-query DuckDB instance. Output is byte-for-byte
-   compatible Overpass JSON/XML so overpass turbo, JOSM and existing clients
-   keep working.
-5. **Attic (history) later.** Keep an append-only history dataset alongside the
-   current one; `date:` / `retro` / `timeline` are a later phase.
+3. **Minutely updates as rolling deltas.** A small updater applies `.osc`
+   diffs to a local replication store, re-resolves geometry for touched ways
+   and relations, and rewrites three rolling delta files (hour, day, week)
+   that prune like the base. A cold reader needs one manifest fetch and then
+   reads base cells plus at most three delta files; last version wins.
+   Deltas fold into a new base generation weekly.
+4. **Overpass QL front end, serverless.** A Worker handles caching and rate
+   limits; a container runs the parser, a planner that turns each statement
+   into SQL over the lake, and DuckDB. Output is Overpass-shaped JSON/XML so
+   overpass turbo, JOSM and existing clients work for the common subset.
+5. **History as an Iceberg table.** An append-only history dataset on R2 Data
+   Catalog with `valid_from`/`valid_to` per element state (including minor
+   versions caused by node moves) backs `date:` / `retro` / `timeline` /
+   `diff` / `adiff`, loaded from the full-history planet in a later phase.
 
 Nobody appears to have built exactly this. The closest existing pieces are
 ohsome-planet (minutely-updated GeoParquet, no query language), Postpass
