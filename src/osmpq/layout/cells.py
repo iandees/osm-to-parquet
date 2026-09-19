@@ -196,6 +196,26 @@ class LeafIndex:
     def leaves_by_lo(self) -> list[str]:
         return self._keys_by_lo
 
+    def contains_qk(self, idx: np.ndarray, qk: np.ndarray) -> np.ndarray:
+        """Whether ``qk`` actually falls inside the ``[lo, hi]`` range of the
+        leaf at position ``idx`` (as returned by :meth:`leaf_index_for_qk`).
+
+        Leaves are built by splitting only while a cell has *any* nodes
+        (``osmpq.build.common.select_leaf_cells``: a cell with zero nodes is
+        never added as a leaf, not even as an empty placeholder), so on an
+        extract -- unlike the planet, which has leaves everywhere -- there
+        can be whole regions with no leaf at all (e.g. a sliver of a
+        neighbouring state pulled in by "smart" bbox extraction's "keep a
+        boundary-crossing way's every node" rule, docs/m0-contracts.md
+        section 5). ``leaf_index_for_qk``'s binary search still returns
+        *some* leaf for a point in such a gap (the nearest one by sort
+        order), because it assumes the leaves tile the world with no gaps.
+        Callers that need to know whether a match is real must check this.
+        """
+        idx = np.asarray(idx)
+        qk = np.asarray(qk, dtype=np.uint64)
+        return qk <= self._his[idx]
+
     def leaf_for_qk(self, qk: np.ndarray) -> np.ndarray:
         """Vectorized leaf key lookup; returns an object array of str."""
         idx = self.leaf_index_for_qk(qk)
@@ -377,15 +397,23 @@ def containing_cells_v2_np(
         still &= ~mismatch
 
     # Depth of the actual leaf covering the SW corner (shared by the NE
-    # corner too, for any depth <= lcp_depth, since they agree that far).
+    # corner too, for any depth <= lcp_depth, since they agree that far) --
+    # *if* the leaf search's nearest match genuinely covers the point.
+    # It may not (a gap in leaf coverage; see LeafIndex.contains_qk), in
+    # which case ``leaf_depth`` is meaningless as an exact-leaf depth but
+    # still a reasonable (safe) bound to round the ancestor depth from: it
+    # can never make ``is_leaf_c`` true below, so the row always falls
+    # through to the ancestor_depths rounding and never returns the
+    # nearest-but-wrong leaf's own key or an unrounded intermediate depth.
     leaf_idx = index.leaf_index_for_qk(qk_sw)
     leaf_depth_by_lo = np.array(
         [0 if k == ROOT else len(k) for k in index.leaves_by_lo], dtype=np.int64
     )
     leaf_depth = leaf_depth_by_lo[leaf_idx]
+    leaf_valid = index.contains_qk(leaf_idx, qk_sw)
 
     truncated_depth = np.minimum(lcp_depth, leaf_depth)
-    is_leaf_c = truncated_depth == leaf_depth
+    is_leaf_c = (truncated_depth == leaf_depth) & leaf_valid
 
     ad_sorted = np.array(sorted(set(ancestor_depths)), dtype=np.int64)
     idx = np.searchsorted(ad_sorted, truncated_depth, side="right") - 1

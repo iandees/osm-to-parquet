@@ -198,6 +198,39 @@ def _read_latest(root: str) -> Optional[int]:
     return int(path.read_text().strip())
 
 
+def _atomic_write_text(path: Path, body: str) -> None:
+    """Write ``body`` to ``path`` without mutating whatever inode ``path``
+    currently names.
+
+    A plain ``path.write_text()`` opens the existing file and truncates it
+    in place, which is wrong here: dataset roots are routinely duplicated
+    with ``cp -al`` (a hardlinked, near-free snapshot -- e.g. before a
+    stateless ``osmpq update`` run, or by ``osmpq compact``/``gc`` between
+    generations), and ``manifest/LATEST`` in particular is the same
+    filename in every one of those snapshots. Truncating it in place would
+    silently corrupt every other snapshot sharing that inode. Writing to a
+    temp file in the same directory and ``os.replace``-ing it over the
+    target instead always lands on a fresh inode, leaving any other
+    hardlinked copy's file untouched -- the same pattern already used by
+    ``osmpq.build.builder._place_file``'s hardlink mode.
+    """
+    import os
+    import tempfile
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(body)
+        os.replace(tmp_name, str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def write_manifest(root: str, manifest: Manifest, number: int) -> None:
     """Write ``manifest/<number>.json``, then update ``manifest/LATEST`` last."""
     body = json.dumps(manifest.to_dict(), indent=2, sort_keys=False)
@@ -207,10 +240,10 @@ def write_manifest(root: str, manifest: Manifest, number: int) -> None:
         return
     manifest_dir = local_root_path(root) / "manifest"
     manifest_dir.mkdir(parents=True, exist_ok=True)
-    (manifest_dir / f"{number}.json").write_text(body)
+    _atomic_write_text(manifest_dir / f"{number}.json", body)
     # Written last: an engine that already loaded manifest n stays consistent
     # even while n+1 is being written.
-    (manifest_dir / "LATEST").write_text(str(number))
+    _atomic_write_text(manifest_dir / "LATEST", str(number))
 
 
 def load(root: str, number: int) -> Manifest:

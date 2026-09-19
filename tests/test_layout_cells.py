@@ -282,3 +282,115 @@ def test_containing_cells_v2_np_batch_matches_scalar():
             (ymin[i], xmin[i], ymax[i], xmax[i]), li, cells.DEFAULT_ANCESTOR_DEPTHS, 13
         )
         assert batch[i] == scalar, (i, batch[i], scalar)
+
+
+# --------------------------------------------------------------------------
+# containing_cell_v2 / containing_cells_v2_np with a gap in leaf coverage.
+#
+# osmpq.build.common.select_leaf_cells never adds a zero-node cell as a
+# leaf (not even as an empty placeholder), so leaves don't tile the world
+# on an extract: there can be whole regions with no leaf at all (an extract
+# pulls in a boundary-crossing way's every node, "smart" bbox extraction,
+# docs/m0-contracts.md section 5, so a new element from a later replication
+# diff can land somewhere the base build never put a node). Found live on
+# the Minnesota extract: a batch of new ways at (44.016, -88.150), inside
+# the dataset's wide recorded extent but in a part of the quadtree with no
+# real leaf, placed at cell "03000003" (depth 8) -- neither a real leaf nor
+# one of ancestor_depths [0,3,6,9,12], which osmpq validate rejects.
+# --------------------------------------------------------------------------
+
+
+def test_leaf_index_contains_qk_true_for_a_real_leaf_point():
+    leaves = {"0300000" + d for d in "012"}  # "0300003" deliberately missing
+    li = cells.LeafIndex(leaves)
+    south, west, north, east = cells.cell_bbox("03000001")
+    cx, cy = (west + east) / 2, (south + north) / 2
+    qk = cells.point_to_qk(cy, cx)
+    idx = li.leaf_index_for_qk(np.array([qk], dtype=np.uint64))
+    assert li.leaves_by_lo[idx[0]] == "03000001"
+    assert bool(li.contains_qk(idx, np.array([qk], dtype=np.uint64))[0]) is True
+
+
+def test_leaf_index_contains_qk_false_in_a_coverage_gap():
+    """A point inside the *missing* child "03000003" gets matched to its
+    nearest sorted neighbour ("03000002") by leaf_index_for_qk, but that
+    leaf's own range doesn't actually reach the point: contains_qk must say
+    so, which is what lets containing_cells_v2_np detect the gap."""
+    leaves = {"0300000" + d for d in "012"}
+    li = cells.LeafIndex(leaves)
+    south, west, north, east = cells.cell_bbox("03000003")
+    cx, cy = (west + east) / 2, (south + north) / 2
+    qk = np.array([cells.point_to_qk(cy, cx)], dtype=np.uint64)
+    idx = li.leaf_index_for_qk(qk)
+    assert li.leaves_by_lo[idx[0]] == "03000002"  # nearest match, but wrong
+    assert bool(li.contains_qk(idx, qk)[0]) is False
+
+
+def test_containing_cell_v2_bbox_in_coverage_gap_snaps_to_allowed_depth_not_the_nearest_leaf():
+    """Regression test for the real Minnesota incident: a tiny bbox fully
+    inside a gap (no leaf at any depth covers it) must resolve to a real
+    leaf or an ancestor_depths value -- never the depth of whatever leaf
+    happened to sort nearest, if that leaf doesn't actually contain it."""
+    leaves = {"0300000" + d for d in "012"}  # depth 8; "...3" has no leaf
+    li = cells.LeafIndex(leaves)
+    south, west, north, east = cells.cell_bbox("03000003")
+    cx, cy = (west + east) / 2, (south + north) / 2
+    tiny = (cy - 1e-7, cx - 1e-7, cy + 1e-7, cx + 1e-7)
+    result = cells.containing_cell_v2(tiny, li, cells.DEFAULT_ANCESTOR_DEPTHS, 13)
+    assert result != "03000002"  # must not silently reuse the wrong neighbour
+    assert result != "03000003"  # must not return the unrounded depth-8 prefix either
+    assert result in li or len(result) in cells.DEFAULT_ANCESTOR_DEPTHS or result == "root"
+    # deterministic: nearest (invalid) leaf is at depth 8, greatest allowed
+    # ancestor_depth <= 8 is 6, so the depth-8 prefix is rounded up to 6.
+    assert result == "030000"
+
+
+def test_containing_cell_v2_bbox_entirely_outside_the_leaf_tree_falls_back_to_root():
+    """No leaf anywhere near the query bbox at all (not just one missing
+    sibling): the nearest sorted match is far away and shallow, so even the
+    smallest allowed ancestor depth (0) is the only safe answer."""
+    leaves = {"00"}  # a single very shallow leaf, nowhere near branch "3"
+    li = cells.LeafIndex(leaves)
+    south, west, north, east = cells.cell_bbox("321")
+    cx, cy = (west + east) / 2, (south + north) / 2
+    tiny = (cy - 1e-7, cx - 1e-7, cy + 1e-7, cx + 1e-7)
+    result = cells.containing_cell_v2(tiny, li, cells.DEFAULT_ANCESTOR_DEPTHS, 13)
+    assert result == "root"
+
+
+def test_containing_cell_v2_bbox_in_coverage_gap_shallow_neighbour_rounds_to_depth_3():
+    """Same gap scenario, but the nearest (invalid) leaf match is shallow
+    (depth 3), so the rounded answer is ancestor_depths' depth-3 entry, not
+    depth 6 or root -- i.e. the rounding genuinely tracks the nearest
+    match's depth, it isn't hardcoded to a single fallback depth."""
+    leaves = {"123"}  # depth 3, only under branch "1"
+    li = cells.LeafIndex(leaves)
+    south, west, north, east = cells.cell_bbox("2000")  # branch "2": no leaf there at all
+    cx, cy = (west + east) / 2, (south + north) / 2
+    tiny = (cy - 1e-7, cx - 1e-7, cy + 1e-7, cx + 1e-7)
+    result = cells.containing_cell_v2(tiny, li, cells.DEFAULT_ANCESTOR_DEPTHS, 13)
+    assert result == "200"  # depth-3 ancestor of the query point
+
+
+def test_containing_cells_v2_np_batch_with_gaps_matches_scalar():
+    """The batched/vectorized path and the scalar wrapper must agree even
+    when every row falls in a coverage gap (not just the happy path
+    covered by test_containing_cells_v2_np_batch_matches_scalar)."""
+    leaves = {"0300000" + d for d in "012"}
+    li = cells.LeafIndex(leaves)
+    rng = np.random.default_rng(3)
+    south, west, north, east = cells.cell_bbox("03000003")
+    n = 50
+    lat = rng.uniform(south, north, n)
+    lon = rng.uniform(west, east, n)
+    lat_e7 = np.round(lat * 1e7).astype(np.int64)
+    lon_e7 = np.round(lon * 1e7).astype(np.int64)
+    batch = cells.containing_cells_v2_np(
+        lat_e7, lon_e7, lat_e7, lon_e7, li, cells.DEFAULT_ANCESTOR_DEPTHS, 13
+    )
+    for i in range(n):
+        scalar = cells.containing_cell_v2(
+            (lat[i], lon[i], lat[i], lon[i]), li, cells.DEFAULT_ANCESTOR_DEPTHS, 13
+        )
+        assert batch[i] == scalar, (i, batch[i], scalar)
+        assert batch[i] == "030000"
