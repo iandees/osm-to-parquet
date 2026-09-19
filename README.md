@@ -14,7 +14,10 @@ that layout. Queries mostly wait on I/O, so the query engine runs serverless
 (Cloudflare Workers in front of Cloudflare Containers that sleep when idle);
 the only always-on, stateful machine is the small updater.
 
-Decisions so far: R2 for storage; serverless query compute; "most real
+Decisions so far: R2 for storage; serverless query compute with containers
+that shut down quickly until there is real traffic; a public endpoint; the
+initial load runs on a laptop or a rented node while minutely updates run in
+a cloud container, which forces the updater to be stateless; "most real
 queries work" rather than byte-identical Overpass compatibility; full history
 back to 2012 and earlier as a real goal, prototyped on small regional history
 extracts first. See the decisions table at the top of the design document.
@@ -33,19 +36,22 @@ goal.
 
 ## Short version of the design
 
-1. **Base snapshot.** Convert the weekly planet PBF into three families of
-   Parquet tables (nodes, ways, relations) plus derived tables (areas, reverse
-   membership index, id-to-cell index). Files are partitioned by a spatial cell
-   key and sorted by a space-filling curve inside each file, so a bounding-box
-   query touches a handful of files and a few row groups.
+1. **Base snapshot, two copies.** Convert the planet PBF into Parquet tables
+   for nodes, ways and relations in two sort orders: a spatial copy
+   (partitioned by adaptive quadtree cell, Hilbert-sorted inside each file, so
+   a bounding-box query touches a few files and a few row groups) and an
+   id-sorted copy that serves id lookups and replaces the local replication
+   store an updater would otherwise need. Plus reverse membership indexes and
+   derived areas.
 2. **Denormalized geometry.** Ways and relations carry their resolved
    geometry and bounding box so the common case (`out geom`, `area`, `around`)
    never has to join back to nodes over the network. Node references are kept
    too, so `>` / `<` recursion still works exactly like Overpass.
-3. **Minutely updates as rolling deltas.** A small updater applies `.osc`
-   diffs to a local replication store, re-resolves geometry for touched ways
-   and relations, and rewrites three rolling delta files (hour, day, week)
-   that prune like the base. A cold reader needs one manifest fetch and then
+3. **Minutely updates as rolling deltas, from a stateless container.** A
+   scheduled container fetches the `.osc`, looks up the current state of
+   everything it touches from the id-sorted copy on R2, re-resolves geometry,
+   and rewrites three rolling delta files (hour, day, week) that prune like
+   the base. A cold reader needs one manifest fetch and then
    reads base cells plus at most three delta files; last version wins.
    Deltas fold into a new base generation weekly.
 4. **Overpass QL front end, serverless.** A Worker handles caching and rate

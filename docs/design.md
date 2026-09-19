@@ -8,6 +8,10 @@ Status: proposal, revised September 2026. Nothing here is implemented yet.
 | --- | --- |
 | Object store | **Cloudflare R2.** Zero egress, and the serverless compute below runs on the same network. S3 stays possible through the same `object_store`/httpfs abstraction but is not the target. |
 | Query compute | **Serverless.** Queries mostly wait on I/O, so pay-per-active-time compute that sleeps when idle is the right shape. Primary target: Cloudflare Workers (front door) + Cloudflare Containers (engine). AWS Lambda is the fallback. |
+| Warm pool | **Shut down quickly at first** (one user, a short `sleepAfter`, cold starts are acceptable). Lengthen `sleepAfter` and keep a warm instance once there is real traffic. |
+| Initial load | **Runs on a laptop or a rented big node**, not in the cloud. It is a one-off batch job with a few hundred GB of scratch disk; nothing about it needs to be serverless. |
+| Minutely updates | **Must run in a cloud container**, which has no persistent disk. So the updater is **stateless**: every piece of state it needs lives on R2, and it keeps only an ephemeral cache. This is the biggest consequence of the decisions so far and shapes section 4. |
+| Public endpoint | **Yes.** A hosted `/api/interpreter` with Overpass-style rate limits and status endpoints, ODbL attribution in every response. Publishing the bucket for people to run their own engine can come later. |
 | Compatibility | **"Most real queries work", not byte-identical.** Same language, same JSON/XML shape, documented differences on edge cases (ordering under `qt`, exotic evaluators, error page formatting). |
 | Attic | **Full history, back to 2012 and earlier eventually.** Loaded from the full-history planet; prototyped on small/recent regional history extracts first. |
 | Table format | Hand-rolled manifest for the hot query path (one small JSON per version); Iceberg on R2 Data Catalog for the history dataset and for offline/analytical access. Revisit if the manifest grows complex. |
@@ -45,42 +49,46 @@ relations; a few million element changes per day arriving in minutely
 ## 2. Architecture overview
 
 ```
-                weekly planet PBF / history PBF          minutely .osc diffs
-                          |                                     |
-                   [ base builder ]                        [ updater ]   <- the one stateful process:
-                    (batch job)                             small VM, local replication store
-                          |                                     |
-                          v                                     v
-  +------------------------------------------------------------------------------------+
-  |  R2 bucket                                                                         |
-  |  base/<gen>/{node,way,relation,area}/cell=.../*.parquet   member_index/ node_idx/  |
-  |  delta/<gen>/{hour,day,week}-<ver>.parquet  (rolling, cell-sorted, rewritten)      |
-  |  manifest/<n>.json  manifest/LATEST        history/ (Iceberg via R2 Data Catalog)  |
-  +------------------------------------------------------------------------------------+
+      weekly planet PBF / history PBF                       minutely .osc diffs
+                |                                                  |
+         [ base builder ]                                   [ updater ]  <- scheduled cloud container,
+     (one-off batch on a laptop                              stateless: reads what it needs
+      or a rented big node)                                  from R2, ephemeral cache only
+                |                                                  |
+                v                                                  v
+  +------------------------------------------------------------------------------------------+
+  |  R2 bucket                                                                               |
+  |  spatial/<gen>/{node,way,relation,area}/cell=.../*.parquet      <- query copy            |
+  |  byid/<gen>/{node,way,relation}/*.parquet  node_way_index/  member_index/  <- id copy    |
+  |  delta/<gen>/{hour,day,week}-<ver>.{spatial,byid}.parquet   (rolling, rewritten)         |
+  |  manifest/<n>.json  manifest/LATEST            history/ (Iceberg via R2 Data Catalog)    |
+  +------------------------------------------------------------------------------------------+
                           ^                                     ^
-                          | HTTP range reads                    | one GET per minute
+                          | HTTP range reads                    | one GET per query
                           |                                     |
    [ Cloudflare Worker ] --> [ Container: query engine ] x N  (DuckDB + Overpass QL planner;
-     rate limit, cache,          sleeps when idle, ephemeral disk = cache)
+     rate limit, cache,          short sleepAfter at first, ephemeral disk = cache)
      /api/interpreter
 ```
 
-Three processes:
+Three processes, none of which owns a database:
 
-1. **Base builder** (batch, weekly or less): planet PBF to the partitioned
-   Parquet layout of section 3, plus derived tables. Runs anywhere with a few
-   hundred GB of scratch disk (a rented VM for a few hours, or the updater VM).
-2. **Updater** (always on, exactly one): applies minutely diffs to a local
-   replication store, re-resolves geometry for everything a change touches,
-   rewrites the rolling delta files and publishes a new manifest. Also runs
-   compaction and appends to the history dataset. This process is inherently
-   continuous and stateful, so it is a small VM, not serverless (section 4.6
-   discusses a stateless variant for later).
+1. **Base builder** (one-off batch, laptop or rented big node): planet PBF to
+   the two copies of the current state described in section 3 (a spatially
+   clustered copy for queries and an id-sorted copy for lookups and for the
+   updater), plus the reverse-membership indexes and derived tables. Writes
+   straight to R2, or locally and then syncs.
+2. **Updater** (a container run every minute, exactly one at a time):
+   fetches the next `.osc`, works out what it touches, reads the current
+   state of those elements and their nodes from the id-sorted copy on R2,
+   re-resolves geometry, rewrites the rolling delta files and publishes a
+   new manifest. Everything it needs is on R2; its disk is a cache.
+   Compaction is the same program run with a bigger instance and a longer
+   schedule.
 3. **Query engines** (serverless, N of them): a Worker receives
    `/api/interpreter`, applies caching and rate limits, and forwards to a
-   container running the Overpass QL parser, planner and DuckDB. The
-   container reads base and delta files from R2 with range requests, caches
-   what it touched on its ephemeral disk, and goes to sleep after idling.
+   container running the Overpass QL parser, planner and DuckDB, which reads
+   base and delta files from R2 with range requests and sleeps after idling.
 
 ## 3. Storage layout
 
@@ -177,20 +185,36 @@ Because the way row carries its coordinates, `out geom`, `out center`,
 | geometry | GEOMETRY | MULTIPOLYGON for multipolygon/boundary, GEOMETRYCOLLECTION otherwise, NULL if unresolvable |
 | centroid_lat, centroid_lon | INT32 | |
 
+**The id-sorted copy: `byid/{node,way,relation}`**
+
+The same rows as the spatial tables (nodes as `(id, lat, lon, tags, meta,
+cell)`, ways and relations with refs/members, tags, meta, bbox and `cell`, but
+no geometry), sorted by id and split into files of a few hundred thousand
+row groups' worth. Row-group min/max on `id` makes "fetch these 50k ids" a
+merge over the row groups that cover them, and ids issued in one editing
+session are contiguous, so real batches touch far fewer row groups than
+their size suggests.
+
+This copy exists for two reasons. It answers `node(123)` and id-set inputs
+for queries (replacing a separate id-to-cell index; the `cell` column then
+says where the spatial row lives). And it is what makes the updater
+stateless: the replication store that Overpass, ohsome-planet and OSMExpress
+keep on local disk is here a Parquet table on R2 that the updater reads by
+range request. Doubling the current-state data costs roughly $4-6/month at R2
+prices, which is the whole thesis of the project.
+
+**`node_way_index`** (sorted by node_id; ~11 billion rows, tens of GB)
+
+`(node_id, way_id)`. Needed by the updater ("which ways contain the node that
+just moved") and by `<` from nodes to ways. The earlier draft deferred it in
+favour of scanning ways in the node's cell; the stateless updater makes it
+mandatory.
+
 **`member_index`** (sorted by member_type, member_id; ~150M rows)
 
-`(member_type, member_id, parent_id, role, parent_cell)`. Answers
-node→relation, way→relation, relation→relation for `<`, `<<` and the
-`(bn|bw|br)` filters. node→way is *not* materialized at first (~11 billion
-rows); `<` from nodes scans ways in the node's cell and ancestors with
-`list_contains(refs, id)`. Add a `node_way_index` later if measurements say so.
-
-**`node_idx`, `way_idx`** (sorted by id; `(id, cell)`)
-
-Id-to-cell index for `node(123)` and id-set inputs. Node ids are nearly
-monotonic in creation time, so delta encoding makes this ~3-4 bytes per row
-(tens of GB for nodes, a few GB for ways). A lookup for a sorted batch of ids
-touches one row group per id range. Relations need no index (13M rows).
+`(member_type, member_id, parent_id, role)`. Answers node→relation,
+way→relation, relation→relation for the updater, for `<`, `<<` and the
+`(bn|bw|br)` filters.
 
 **`area`** (partitioned by loose cell)
 
@@ -254,57 +278,77 @@ bespoke rules (loose placement, id index).
 
 ## 4. Update pipeline
 
-### 4.1 Replication store
+### 4.1 No replication store
 
-The updater keeps, on local NVMe (budget ~300 GB, growing slowly):
+Overpass, ohsome-planet, OSMExpress and QLever's updater all keep a local
+random-access copy of the current state (hundreds of GB on NVMe) so that a
+moved node can be turned into a re-resolved way geometry. Our updater runs in
+a container with ephemeral disk, so that state lives on R2 instead, in the
+id-sorted copy and the two reverse indexes of section 3.3. The updater's
+local disk is a read-through cache that happens to be warm across
+consecutive runs while the container stays alive, and is allowed to be empty.
 
-- latest version of every node (id → lat, lon, tags-or-null, meta),
-- every way (id → refs, tags, meta) and relation (id → members, tags, meta),
-- reverse indexes: node→ways, node→relations, way→relations, relation→relations,
-- the cell each element currently lives in.
+The trade is round trips for state. A minute of planet edits is on the order
+of thousands to a few tens of thousands of node changes, a few thousand way
+changes and hundreds of relation changes. Re-resolving the touched ways needs
+the coordinates of all their nodes, which is typically 100k-600k node
+lookups. Edits are spatially and id-locally clustered (a changeset touches
+contiguous ids in one area), so those lookups collapse into hundreds to a few
+thousand row groups, i.e. a few GB of range reads issued with high
+concurrency. On R2 that is a few thousand Class B operations (fractions of a
+cent) and tens of seconds of wall clock. If a minute turns out to be too
+tight, running every 2-3 minutes is still "minutely updates" in the sense
+that matters; Overpass instances routinely lag that much.
 
-Candidates: RocksDB (ohsome-planet's choice), LMDB via OSMExpress (already
-implements the store, `.osc` application and S2 indexing in ~1,500 lines of
-C++), or a purpose-built store. Recommendation: prototype with OSMExpress to
-avoid writing the store, then decide.
+### 4.2 Per-run cycle (scheduled every minute)
 
-### 4.2 Per-minute cycle
+1. Fetch `manifest/LATEST` and the manifest; load the current generation's
+   rolling deltas in their id-sorted variant (section 4.3) into memory (a few
+   MB to ~1-2 GB late in a generation; the container has 8-12 GiB). Build an
+   in-memory inverted index of delta ways' refs and delta relations' members,
+   because the base `node_way_index`/`member_index` are static per generation
+   and do not know about ways created or re-noded since.
+2. Fetch the next `.osc.gz` by replication sequence (pyosmium-style state
+   file, retries, gap detection). Apply to the in-memory delta view.
+3. Compute the **touched set**: every created/modified/deleted element, plus
+   parent ways of moved/deleted nodes (`node_way_index` ⊕ delta index), plus
+   parent relations of anything touched (`member_index` ⊕ delta index),
+   transitively for nested relations.
+4. Fetch current state for the touched ways/relations and coordinates for
+   every node they reference, from the id-sorted copy on R2 shadowed by the
+   in-memory deltas and this minute's changes. Batched, sorted, concurrent
+   range reads; cached on local disk for the next run.
+5. Re-resolve geometry, bbox, centroid, `is_area` and cell. Re-derive area
+   rows for touched pivots. Append the previous state of every touched
+   element to the history dataset (section 4.5).
+6. Rewrite the rolling delta files (both sort variants) and write manifest
+   *n+1*, then `LATEST`.
 
-1. Fetch the next `.osc.gz` by replication sequence (pyosmium-style state
-   handling, retries, gap detection).
-2. Apply to the store; collect **touched elements**: every created/modified/
-   deleted node, way, relation, plus every parent way of a moved/deleted node
-   and every parent relation of a touched node/way/relation, transitively
-   for nested relations. QLever's `osm-live-updates` and ohsome-planet do the
-   same step; Freiburg reports under 7 s per minute for the planet.
-3. Re-resolve geometry, bbox, centroid, `is_area` and cell for touched ways
-   and relations. Re-derive area rows for touched pivots.
-4. Rewrite the rolling delta files (4.3) and append the touched elements'
-   previous versions to the history dataset (4.5).
-5. Write manifest *n+1*, then `LATEST`.
+A single Durable Object owns the schedule: its alarm fires every minute,
+starts (or wakes) the updater container, and refuses to start another run
+while one is in flight. That is the "cron with a lock" the pipeline needs;
+Cloudflare Cron Triggers alone do not guarantee exclusivity. If Containers'
+beta limits bite, the identical image runs under any scheduler that can
+promise one instance at a time.
 
-Target latency: under 60 seconds behind planet.openstreetmap.org.
+### 4.3 Rolling deltas, in two sort orders
 
-### 4.3 Rolling deltas, designed for cold readers
-
-An earlier draft had workers preload a week of deltas into memory. That is
-the wrong shape for compute that sleeps and wakes. Instead the deltas are
-**a small fixed number of remote files that prune like the base**:
+Deltas are **a small fixed number of remote files that prune like the base**,
+each written twice: sorted by (cell, hilbert) for the query engines and
+sorted by id for the updater and for id lookups.
 
 | file | content | rewritten |
 | --- | --- | --- |
-| `delta/<gen>/hour-<ver>.parquet` | every element touched since the top of the hour, newest version wins | every minute (a few MB) |
-| `delta/<gen>/day-<ver>.parquet` | touched since midnight | hourly (tens to a few hundred MB) |
-| `delta/<gen>/week-<ver>.parquet` | touched since the base generation | daily (~1-2 GB) |
+| `delta/<gen>/hour-<ver>.*.parquet` | every element touched since the top of the hour, newest version wins | every run (a few MB) |
+| `delta/<gen>/day-<ver>.*.parquet` | touched since midnight | hourly (tens to a few hundred MB) |
+| `delta/<gen>/week-<ver>.*.parquet` | touched since the base generation | daily (~1-2 GB) |
 
-Each is sorted by (cell, hilbert) with the same flat bbox columns and row
-group sizes as the base, so a bbox query reads a few row groups from each.
-Rows carry `deleted BOOLEAN`, `cell` and `prev_cell` so readers can shadow the
-old row wherever it was. Rewriting a few-MB file every minute and a ~1 GB
+Rows carry `deleted BOOLEAN`, `cell` and `prev_cell` so readers can shadow
+the old row wherever it was. Rewriting a few-MB file every minute and a ~1 GB
 file daily is trivial on R2 (Class A operations are ~$4.50 per million).
 
-A query therefore touches: the base cells for its bbox, plus at most three
-delta files. Read path per table:
+A query touches the base cells for its bbox plus at most three delta files.
+Read path per table:
 
 ```sql
 WITH d AS (SELECT * FROM read_parquet([hour, day, week]) WHERE <bbox pruning>
@@ -316,24 +360,26 @@ UNION ALL
 SELECT ... FROM d WHERE NOT deleted AND <predicates>
 ```
 
-Elements that moved *out* of the queried cells are handled by `prev_cell`:
-a delta row whose `prev_cell` is in the queried set but whose `cell` is not
-still shadows the base row.
-
-A warm container keeps the delta files it has read in its disk cache; new
+Elements that moved *out* of the queried cells are handled by `prev_cell`.
+A warm container keeps delta files it has read in its disk cache; new
 versions have new names, so the cache never serves stale data.
 
 ### 4.4 Compaction
 
-- Every minute, hour and day: the rolling files above (this *is* the
+- Every run, hour and day: the rolling files above (this *is* the
   hourly/daily compaction).
-- Weekly, or when the week file exceeds a few percent of the base: rewrite
-  the touched base cell files into a new generation and start a fresh set of
-  rolling deltas. Untouched cells are referenced, not rewritten. Areas and
-  `tag_stats` are refreshed for touched cells.
+- Weekly, or when the week file exceeds a few percent of the base: a
+  compaction run rewrites the touched base cell files (both copies) and the
+  affected slices of `node_way_index`/`member_index` into a new generation,
+  then starts fresh rolling deltas. This is a streaming job (read old file
+  plus delta rows, write new file, per cell) with no large local state, so
+  it runs in a bigger scheduled container (`standard-4`) for a few hours, or
+  on the big node used for the initial load if that is cheaper. Untouched
+  cells are referenced, not rewritten. Areas and `tag_stats` are refreshed
+  for touched cells.
 
-All of this runs on the updater; none of it blocks readers, because manifests
-are immutable and swapped atomically.
+All of this happens without blocking readers, because manifests are
+immutable and swapped atomically.
 
 ### 4.5 History (attic)
 
@@ -349,31 +395,41 @@ earlier. Modelled as an append-only **`history`** dataset with one row per
   parent way/relation the updater re-resolves. This inflates the dataset
   (ohsome-planet's history is a few times the size of the current planet)
   and is the price of correct `[date:]` geometry.
-- Initial load from the full-history PBF (150 GB) through the same geometry
-  assembler, then continuous appends from the updater (step 4 in 4.2 writes
-  the *previous* state with its `valid_to` closed and the new state with
-  `valid_to = NULL`).
+- Initial load from the full-history PBF (150 GB) on the big node through
+  the same geometry assembler, then continuous appends from the updater
+  (step 5 in 4.2 writes the *previous* state with its `valid_to` closed and
+  the new state with `valid_to = NULL`).
 - Stored as an **Iceberg table in R2 Data Catalog**, partitioned by cell and
   by `valid_to` year (closed versions) with an "open" partition for current
-  ones. This dataset is append-mostly and read by analytical and attic
-  queries where a catalog round trip is acceptable; R2 Data Catalog's
-  automatic compaction (64-512 MB target) and snapshot expiration handle
-  maintenance, and DuckDB 1.4+ can both read and append to it. DuckDB cannot
-  `DELETE` on partitioned Iceberg tables, which is fine for append-only.
+  ones. It is append-mostly and read by analytical and attic queries where a
+  catalog round trip is acceptable; R2 Data Catalog's automatic compaction
+  (64-512 MB target) and snapshot expiration handle maintenance, and DuckDB
+  1.4+ can both read and append to it. DuckDB cannot `DELETE` on partitioned
+  Iceberg tables, which is fine for append-only.
 - `[date:t]` / `retro` become `valid_from <= t AND (valid_to IS NULL OR
   valid_to > t)`; `timeline` is a per-id scan; `diff`/`adiff` are two such
   scans compared. Prototype on a regional history extract (osmium
   `extract --with-history` of a small area) before touching the planet.
 
-### 4.6 A stateless updater, later
+### 4.6 Initial load
 
-Once `node_idx`, `member_index` and (if added) `node_way_index` exist on R2,
-the per-minute working set (changed nodes → parent ways → their node
-coordinates) could in principle be fetched from R2 instead of a local store,
-which would let the updater run as a scheduled container too. It costs
-thousands of range reads per minute and the geometry assembler would need a
-read-through cache to stay under the minute budget. Worth an experiment after
-milestone 2, not before.
+Runs once on a laptop or a rented node with a few hundred GB of scratch
+space. Passes over the planet PBF:
+
+1. Nodes: stream, assign cells, write the id-sorted copy directly (PBF is
+   already id-ordered); spill (cell, hilbert, row) to local scratch for the
+   spatial copy.
+2. Ways: stream, look up node coordinates from the local scratch node table
+   (this is the one place a local random-access store is used, and it is
+   thrown away afterwards), build geometry/bbox/cell, write both copies,
+   emit `node_way_index` pairs to scratch.
+3. Relations: same, plus `member_index`.
+4. Sort and write the index tables, derive `area` and `tag_stats`, write
+   the first manifest.
+
+DuckDB can do most of the sorting and Parquet writing with spilling; the
+geometry assembly and PBF decoding are Rust. Output can go straight to R2
+or be synced afterwards with `rclone`.
 
 ## 5. Query engine
 
@@ -460,6 +516,15 @@ client --> Cloudflare Worker (/api/interpreter, /api/status, /api/timestamp)
   disk is ephemeral and is used purely as a `cache_httpfs`-style block cache.
   Instances sleep after an idle timeout and are billed per 10 ms of active
   time, so a quiet service costs nothing beyond storage.
+- **Sleep policy.** Initially a short `sleepAfter` (on the order of a minute
+  or two): with one user, paying a cold start now and then is cheaper than
+  paying for an idle instance. As traffic grows, lengthen it and keep one
+  instance warm during busy hours; that is a configuration change on the
+  Durable Object that manages the pool, not a design change.
+- **Public endpoint hygiene.** Overpass-style per-IP concurrency slots and a
+  daily quota in the Worker's rate-limiting binding, hard caps on `timeout`
+  and `maxsize`, the ODbL attribution line in every response, and `/api/status`
+  reporting slots and the current data timestamp as clients expect.
 - **Cold start budget.** Container boot plus DuckDB init is on the order of a
   second or two. To keep it there: extensions are baked into the image (no
   `INSTALL` at runtime), the manifest is one GET, and nothing is preloaded.
@@ -489,12 +554,13 @@ client --> Cloudflare Worker (/api/interpreter, /api/status, /api/timestamp)
 
 | Item | Estimate |
 | --- | --- |
-| Current dataset on R2 (nodes ~100 GB, ways ~150-200 GB, relations, indexes, areas) | ~350-500 GB → ~$5-8/month at $0.015/GB-month; egress $0 |
+| Current dataset on R2: spatial copy (nodes ~100 GB, ways ~150-200 GB, relations, areas) plus id-sorted copy plus `node_way_index`/`member_index` | ~600-900 GB → ~$9-14/month at $0.015/GB-month; egress $0 |
 | History dataset (Iceberg) | ~0.5-1.5 TB once complete with minor versions → ~$8-25/month |
 | R2 operations | Class B (reads) ~$0.36/M, Class A (writes) ~$4.50/M. A typical query issues 10-200 range requests → roughly $0.01-0.07 per 1,000 queries. The updater's minutely rewrites are a few hundred writes per hour. |
 | Container compute | `standard-3` active: 8 GiB × $0.0000025/GiB-s + 2 vCPU × $0.00002/vCPU-s + 16 GB × $0.00000007/GB-s ≈ $0.00006 per active second, i.e. ~$0.22 per active hour; a 2-second query ≈ $0.00012. Workers Paid plan $5/month includes 25 GiB-hours memory and 375 vCPU-minutes. Sleeping instances cost nothing. |
 | Crossover | At sustained load (say 100k two-second queries per day ≈ 55 active hours/day) serverless is ~$12/day, and a fixed VM pool becomes cheaper. The design does not care: the same container image runs on a VM. |
-| Updater VM | 8 vCPU / 32 GB RAM / 400 GB NVMe: ~$40-120/month depending on provider |
+| Updater container | One run per minute, active for perhaps 15-40 s on `standard-3`: roughly $0.02-0.04 per hour active-equivalent → ~$20-45/month, plus a few thousand R2 reads per minute (~$1-2/month). Weekly compaction on `standard-4` for a few hours adds a few dollars. |
+| Initial load | A rented big node for a day, or a laptop and patience; one-off. |
 | Compare: self-hosted Overpass | ~1 TB NVMe + 32-64 GB RAM *per replica*, always on |
 
 ## 8. Risks and how to check them early
@@ -507,6 +573,8 @@ client --> Cloudflare Worker (/api/interpreter, /api/status, /api/timestamp)
 | Relation geometry assembly (multipolygon rings, broken rings) | Reuse a proven assembler (libosmium via bindings, or a Rust port of its ring builder); NULL geometry for unresolvable relations, members still returned. |
 | Cloudflare Containers is still beta | Same image runs on Lambda, Fly, or a VM; nothing in the engine depends on Cloudflare APIs, only the Worker front door does. |
 | Rolling delta files grow large late in a generation | Compact into a new base generation on size, not only weekly. |
+| The stateless updater cannot finish a minute's diff inside a minute | Measure on real diffs in M2 with a cold and a warm cache; raise concurrency; run every 2-3 minutes if needed; as a last resort give the updater a persistent volume on another provider (the code path is the same, the cache just never empties). |
+| A generation's static indexes miss ways/relations created since | Every run builds an in-memory inverted index from the delta ways/relations before computing parents (4.2 step 1). |
 | History with minor versions is large | It is append-only cold data on R2; prototype on a regional history extract to measure the multiplier before the planet load. |
 | DuckDB spheroid distance is slower than Overpass's integer math | Bbox pre-filter; planar approximation with correction for `around`. |
 
@@ -540,12 +608,14 @@ and copy no code; this project can be Apache-2/MIT.
 - Publish cold and warm latency and cost per query. **Go/no-go gate.**
 
 **M1: full planet base build**
-- Build the planet; record build time, file counts, sizes, cell depth
-  distribution; tune cell split thresholds and row group sizes.
+- Build the planet on a laptop or rented node (section 4.6); record build
+  time, file counts, sizes, cell depth distribution; tune cell split
+  thresholds and row group sizes; sync to R2.
 
 **M2: minutely updates**
-- Updater with replication store, rolling deltas, manifests; run for a month
-  and measure lag and compaction cost.
+- Stateless updater in a scheduled container: rolling deltas, manifests,
+  Durable Object scheduler; run for a month and measure per-run wall clock,
+  lag behind planet.osm.org, R2 operation counts and compaction cost.
 
 **M3: public beta**
 - Tier-2 features (areas, around, poly, is_in, changed/newer/user,
@@ -560,11 +630,12 @@ DuckDB-Wasm browser mode.
 
 ## 11. Open questions
 
-1. **Warm pool policy.** How long should containers stay awake after a query
-   (`sleepAfter`)? Longer means fewer cold starts and more idle cost; decide
-   from M0 latency numbers.
-2. **Public endpoint or bucket-plus-tooling?** A hosted endpoint needs abuse
-   handling; publishing the bucket and the engine (including the Wasm mode)
-   lets anyone run it. Both can coexist.
-3. **Stateless updater** (section 4.6): worth pursuing after M2 if the VM is
-   the only non-serverless piece left?
+1. **Run cadence for the updater.** Every minute is the goal; whether a
+   stateless run fits in a minute on real diffs is the first thing M2
+   measures. Every 2-3 minutes is the fallback.
+2. **Where compaction runs.** A big scheduled container, or the same node
+   used for the initial load, whichever is cheaper once we know the touched
+   cell ratio per week.
+3. **Bucket publishing.** Whether and when to make the bucket public so others
+   can run the engine (including the Wasm mode) against it, alongside the
+   hosted endpoint.
