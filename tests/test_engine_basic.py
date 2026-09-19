@@ -75,8 +75,10 @@ def test_backward_recurse_from_node_gets_parent_ways(engine, fixture):
     r = engine.run(f"[out:json];node({fixture.cafe_node_id});<;out ids;")
     got = sorted((e["type"], e["id"]) for e in r.elements)
     # node 1 is referenced by way 102 and way 110, and is itself a member of
-    # relation 201.
-    assert got == [("relation", 201), ("way", 102), ("way", 110)]
+    # relation 201. relation 206 has no direct node/way member of node 1 --
+    # its only member is way 110 -- so it's only reachable via `<`'s second
+    # hop ("relations that have a *found way* as a member").
+    assert got == [("relation", 201), ("relation", fixture.way_only_relation_id), ("way", 102), ("way", 110)]
 
 
 def test_transitive_forward_recurse(engine, fixture):
@@ -98,6 +100,81 @@ def test_transitive_backward_recurse(engine, fixture):
     assert ("way", 102) in got
     assert ("way", 110) in got
     assert ("relation", 201) in got
+
+
+def test_forward_recurse_from_relation_includes_member_way_nodes(engine, fixture):
+    # Overpass's `>` from a relation: the way's own row, PLUS the nodes of
+    # that member way (not just the way itself) -- and the relation's
+    # direct node member too. The way and its nodes live in a different
+    # leaf than the relation's own storage cell, and are only resolvable
+    # via byid, which is exactly what was missing before this fix.
+    r = engine.run(f"[out:json];relation({fixture.far_way_relation_id});>;out ids;")
+    got = {(e["type"], e["id"]) for e in r.elements}
+    assert got == {
+        ("way", fixture.far_way_id),
+        ("node", fixture.far_way_node_ids[0]),
+        ("node", fixture.far_way_node_ids[1]),
+        ("node", fixture.far_way_relation_label_node_id),
+    }
+
+
+def test_forward_recurse_from_relation_excludes_relation_members(engine, fixture):
+    # Plain `>` (one hop) must NOT follow a relation-type member -- that's
+    # `>>`'s job. relation 205's only member is relation 204.
+    r = engine.run(f"[out:json];relation({fixture.nested_relation_id});>;out ids;")
+    assert r.elements == []
+
+
+def test_transitive_forward_recurse_follows_nested_relation(engine, fixture):
+    # `>>` from relation 205 (whose only member is relation 204) must
+    # follow the relation-type member down into 204's own members too.
+    r = engine.run(f"[out:json];relation({fixture.nested_relation_id});>>;out ids;")
+    got = {(e["type"], e["id"]) for e in r.elements}
+    assert ("relation", fixture.far_way_relation_id) in got
+    assert ("way", fixture.far_way_id) in got
+    assert ("node", fixture.far_way_node_ids[0]) in got
+    assert ("node", fixture.far_way_node_ids[1]) in got
+    assert ("node", fixture.far_way_relation_label_node_id) in got
+    # The nested relation is *discovered* via recursion (unlike
+    # test_transitive_forward_recurse's relation 203, which has no relation
+    # members and is only kept by the >>-retains-input-relations rule).
+    assert ("relation", fixture.nested_relation_id) in got
+
+
+def test_backward_recurse_finds_relation_via_found_way(engine, fixture):
+    # `<` from way 110: relation 206's only member is way 110 itself, so
+    # it's found directly (first hop), same as relation 201 (which
+    # references node 1 directly, not way 110).
+    r = engine.run(f"[out:json];way({fixture.spanning_way_id});<;out ids;")
+    got = {(e["type"], e["id"]) for e in r.elements}
+    assert ("relation", fixture.way_only_relation_id) in got
+
+
+def test_way_bbox_exact_geometry_test(engine, fixture):
+    # The diagonal way's flat bbox covers the whole leaf, but its actual
+    # line only ever visits the SW->NE diagonal.
+    miss = bbox_args(fixture.diagonal_bbox_miss)
+    r_miss = engine.run(f"[out:json];way({fixture.diagonal_way_id})({miss});out ids;")
+    assert r_miss.elements == []
+
+    hit = bbox_args(fixture.diagonal_bbox_hit)
+    r_hit = engine.run(f"[out:json];way({fixture.diagonal_way_id})({hit});out ids;")
+    ids = [e["id"] for e in r_hit.elements]
+    assert ids == [fixture.diagonal_way_id]
+
+
+def test_relation_bbox_exact_member_test(engine, fixture):
+    # Same exact-bbox test, but for a relation: its only member is the
+    # diagonal way, and relation rows carry no geometry of their own, so
+    # this must resolve the member way's geometry to decide.
+    miss = bbox_args(fixture.diagonal_bbox_miss)
+    r_miss = engine.run(f"[out:json];relation({fixture.diagonal_relation_id})({miss});out ids;")
+    assert r_miss.elements == []
+
+    hit = bbox_args(fixture.diagonal_bbox_hit)
+    r_hit = engine.run(f"[out:json];relation({fixture.diagonal_relation_id})({hit});out ids;")
+    ids = [e["id"] for e in r_hit.elements]
+    assert ids == [fixture.diagonal_relation_id]
 
 
 def test_inline_recurse_filter_w(engine, fixture):

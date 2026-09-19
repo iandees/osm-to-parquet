@@ -70,6 +70,41 @@ class FixtureInfo:
     leaf_relation_id: int = 201
     spanning_relation_id: int = 202
     node_way_relation_id: int = 203
+    # far_way_relation_id (204): stored at ancestor "00" (like
+    # spanning_relation_id) but its *way* member (far_way_id, 111) and that
+    # way's nodes all live entirely in leaf "002" -- a different leaf than
+    # some of the relation's own members. Exercises `>`/`>>` resolving a
+    # relation's member way to its nodes via byid regardless of which cell
+    # anything is stored in (recurse.py never consults `cell`).
+    far_way_relation_id: int = 204
+    far_way_id: int = 111
+    far_way_node_ids: list = field(default_factory=list)
+    far_way_relation_label_node_id: int = 0  # the relation's other (node) member
+    # nested_relation_id (205): a relation whose only member is
+    # far_way_relation_id (204) -- a relation-of-a-relation, for `>>`.
+    nested_relation_id: int = 205
+    # way_only_relation_id (206): a relation whose only member is
+    # spanning_way_id (110), itself with no direct member of any node --
+    # only reachable via "relations that have a *found way* as a member",
+    # the second hop `<` was missing.
+    way_only_relation_id: int = 206
+    # diagonal_way_id (112): a single straight segment across leaf "000"
+    # from its SW corner to its NE corner, i.e. its stored bbox covers the
+    # whole leaf even though the line itself never visits most of it --
+    # for the exact (ST_Intersects) bbox test vs. the flat-bbox prune.
+    diagonal_way_id: int = 112
+    diagonal_node_ids: list = field(default_factory=list)  # [sw, ne]
+    # A bbox in leaf "000"'s NW quadrant: the diagonal way's flat bbox
+    # overlaps it, but its actual geometry (the SW->NE segment) never does.
+    diagonal_bbox_miss: tuple = None
+    # A bbox straddling the middle of the diagonal: the geometry does
+    # intersect this one.
+    diagonal_bbox_hit: tuple = None
+    # diagonal_relation_id (207): a relation whose only member is
+    # diagonal_way_id -- for the same exact-bbox test, but for relations
+    # (member way resolution instead of the relation's own geometry, which
+    # is always NULL).
+    diagonal_relation_id: int = 207
     all_node_ids: list = field(default_factory=list)
     all_way_ids: list = field(default_factory=list)
     all_relation_ids: list = field(default_factory=list)
@@ -156,6 +191,42 @@ def build(root_dir: str, con: duckdb.DuckDBPyConnection | None = None) -> Fixtur
         tags = {"amenity": "cafe"} if i == 0 else None
         add_node(nid, "002", i, len(leaf002_ids), tags)
 
+    # Two untagged nodes in leaf "002", dedicated to `far_way_id` (111):
+    # a way member of `far_way_relation_id` (204), which is stored at
+    # ancestor "00" -- a different cell than these nodes' own leaf.
+    far_way_node_ids = [alloc() for _ in range(2)]
+    for i, nid in enumerate(far_way_node_ids):
+        add_node(nid, "002", i + len(leaf002_ids), len(leaf002_ids) + 2, None)
+    info.far_way_node_ids = far_way_node_ids
+
+    # Two untagged nodes at the SW and NE corners of leaf "000", dedicated
+    # to `diagonal_way_id` (112): a single segment whose flat bbox covers
+    # the whole leaf but whose actual line only ever visits the diagonal.
+    diagonal_bbox = leaf_bbox["000"]
+    sw_lon, sw_lat = _inset_point(diagonal_bbox, frac_lat=0.1, frac_lon=0.1)
+    ne_lon, ne_lat = _inset_point(diagonal_bbox, frac_lat=0.9, frac_lon=0.9)
+    diagonal_sw_id, diagonal_ne_id = alloc(), alloc()
+    nodes.append({"id": diagonal_sw_id, "lon": sw_lon, "lat": sw_lat, "cell": "000", "tags": None})
+    nodes.append({"id": diagonal_ne_id, "lon": ne_lon, "lat": ne_lat, "cell": "000", "tags": None})
+    info.diagonal_node_ids = [diagonal_sw_id, diagonal_ne_id]
+
+    def _sub_bbox(frac_s: float, frac_w: float, frac_n: float, frac_e: float):
+        s, w, n, e = diagonal_bbox
+        return (
+            s + (n - s) * frac_s,
+            w + (e - w) * frac_w,
+            s + (n - s) * frac_n,
+            w + (e - w) * frac_e,
+        )
+
+    # NW quadrant of the leaf: overlaps the diagonal way's flat bbox
+    # (lat/lon both span [0.1, 0.9]) but the SW->NE segment (lat_frac ==
+    # lon_frac throughout) never enters a region where lat is high and lon
+    # is low.
+    info.diagonal_bbox_miss = _sub_bbox(0.6, 0.1, 0.9, 0.4)
+    # Straddles the middle of the diagonal (around the (0.5, 0.5) point).
+    info.diagonal_bbox_hit = _sub_bbox(0.4, 0.4, 0.6, 0.6)
+
     info.all_node_ids = [n["id"] for n in nodes]
     info.untagged_node_in_cafe_cell = leaf000_extra_ids[0]
 
@@ -182,6 +253,14 @@ def build(root_dir: str, con: duckdb.DuckDBPyConnection | None = None) -> Fixtur
 
     # way 110: spans leaf "000" and leaf "002" -> ancestor cell "00"
     ways.append({"id": 110, "refs": [1, leaf002_ids[0]], "tags": {"railway": "rail"}, "cell": "00"})
+
+    # way 111: far_way_id, untagged, entirely within leaf "002" -- the way
+    # member of far_way_relation_id (204), which itself lives at ancestor "00".
+    ways.append({"id": 111, "refs": far_way_node_ids, "tags": {}, "cell": "002"})
+
+    # way 112: diagonal_way_id, a single segment across leaf "000" from its
+    # SW corner to its NE corner (see the node comment above).
+    ways.append({"id": 112, "refs": [diagonal_sw_id, diagonal_ne_id], "tags": {}, "cell": "000"})
 
     info.open_way_ids = [w["id"] for w in ways if w["id"] != 101]
     info.all_way_ids = [w["id"] for w in ways]
@@ -229,6 +308,40 @@ def build(root_dir: str, con: duckdb.DuckDBPyConnection | None = None) -> Fixtur
         "members": [{"type": "n", "ref": leaf001_ids[0], "role": "stop"}, {"type": "w", "ref": 105, "role": "platform"}],
         "tags": {"public_transport": "stop_area", "name": "Downtown Stop"},
     })
+    # rel 204: far_way_relation_id -- way 111 (leaf "002") + a node in leaf
+    # "000" -> ancestor "00", like rel 202, but the way's nodes (111's refs)
+    # are only reachable via byid, not via the relation's own cell.
+    relations.append({
+        "id": 204, "cell": "00",
+        "members": [{"type": "w", "ref": 111, "role": "outer"}, {"type": "n", "ref": leaf000_extra_ids[1], "role": "label"}],
+        "tags": {"type": "multipolygon", "natural": "water"},
+    })
+    info.far_way_relation_label_node_id = leaf000_extra_ids[1]
+    # rel 205: nested_relation_id -- a relation whose only member is
+    # relation 204 (a relation-of-a-relation, for `>>`).
+    relations.append({
+        "id": 205, "cell": "00",
+        "members": [{"type": "r", "ref": 204, "role": "outer"}],
+        "tags": {"type": "multipolygon", "leisure": "park"},
+    })
+    # rel 206: way_only_relation_id -- its only member is way 110 (which
+    # itself has node 1 as a ref); it has no direct node/way member of
+    # node 1, so it's only reachable from node 1 via the second `<` hop
+    # ("relations that have a *found way* as a member").
+    relations.append({
+        "id": 206, "cell": "00",
+        "members": [{"type": "w", "ref": 110, "role": "outer"}],
+        "tags": {"type": "multipolygon", "railway": "rail"},
+    })
+    # rel 207: diagonal_relation_id -- its only member is the diagonal way
+    # 112, for the same exact-bbox test as the way itself, but through
+    # relation member resolution (relation rows carry no geometry of
+    # their own in M0).
+    relations.append({
+        "id": 207, "cell": "000",
+        "members": [{"type": "w", "ref": 112, "role": "outer"}],
+        "tags": {"type": "multipolygon", "leisure": "park"},
+    })
     info.all_relation_ids = [r["id"] for r in relations]
 
     def relation_bbox(members: list[dict]):
@@ -241,6 +354,14 @@ def build(root_dir: str, con: duckdb.DuckDBPyConnection | None = None) -> Fixtur
                 w = next((w for w in ways if w["id"] == m["ref"]), None)
                 if w and w["xmin"] is not None:
                     xs.extend([w["xmin"], w["xmax"]]); ys.extend([w["ymin"], w["ymax"]])
+            elif m["type"] == "r":
+                # One-level nested relation bbox (contract section 4): the
+                # referenced relation must already have its own bbox
+                # computed -- true as long as it appears earlier in
+                # `relations` than this one, which it does here.
+                rr = next((rr for rr in relations if rr["id"] == m["ref"]), None)
+                if rr is not None and rr.get("xmin") is not None:
+                    xs.extend([rr["xmin"], rr["xmax"]]); ys.extend([rr["ymin"], rr["ymax"]])
         if not xs:
             return (None, None, None, None)
         return (min(xs), min(ys), max(xs), max(ys))

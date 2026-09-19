@@ -172,25 +172,44 @@ def build_forward_one_hop(con, manifest: catalog.Manifest, source_table: str, pr
     hop_table = forward_new_ids_table(con, source_table, restrict_source_types, role, rel_member_types={"n", "w"})
     if hop_table is None:
         return empty_set_sql(), 0
-    sql, nfiles = hydrate_ids_table(con, manifest, hop_table, [], promoted_keys)
-    total_files = nfiles
-    if sql is None:
+    total_files = 0
+    selects: list[str] = []
+
+    # Hydrate the way-type ids (relation member ways) first -- we need
+    # their `refs` both for their own row and to find their nodes below.
+    way_rows_sql, nfiles_w = hydrate_ids_table(con, manifest, hop_table, [], promoted_keys, only_types={"way"})
+    total_files += nfiles_w
+    way_rows_table: Optional[str] = None
+    if way_rows_sql:
+        way_rows_table = idset.fresh_table_name("fwdwayrows")
+        con.execute(f"CREATE TEMP TABLE {way_rows_table} AS {way_rows_sql}")
+        selects.append(f"SELECT * FROM {way_rows_table}")
+
+    # Nodes directly in hop_table (nodes of ways-in-source, or direct node
+    # members of relations-in-source) plus nodes referenced by the
+    # relation-member ways above, hydrated together in a *single* pass over
+    # the node byid parts -- node ids from a `>` hop are typically scattered
+    # across the whole id space, so a byid part covering their min..max
+    # range usually covers most of the table; hydrating node ids in two
+    # separate passes (as an earlier version of this function did) doubles
+    # that scan for no reason.
+    node_id_parts = [f"SELECT id FROM {hop_table} WHERE type = 'node'"]
+    if way_rows_table is not None:
+        way_node_ids = forward_new_ids_table(con, way_rows_table, restrict_source_types={"way"})
+        if way_node_ids is not None:
+            node_id_parts.append(f"SELECT id FROM {way_node_ids} WHERE type = 'node'")
+    node_ids_table = idset.fresh_table_name("fwdnodeids")
+    con.execute(
+        f"CREATE TEMP TABLE {node_ids_table} AS "
+        f"SELECT DISTINCT 'node' AS type, id FROM ({' UNION ALL '.join(node_id_parts)}) __u"
+    )
+    node_sql, nfiles_n = hydrate_ids_table(con, manifest, node_ids_table, [], promoted_keys, only_types={"node"})
+    total_files += nfiles_n
+    if node_sql:
+        selects.append(node_sql)
+
+    if not selects:
         return empty_set_sql(), total_files
-    hop_rows_table = idset.fresh_table_name("fwdrows")
-    con.execute(f"CREATE TEMP TABLE {hop_rows_table} AS {sql}")
-    selects = [f"SELECT * FROM {hop_rows_table}"]
-
-    # Second level: nodes of the way members found above. `hop_rows_table`
-    # already carries full way rows (with `refs`) for any way that came in
-    # as a relation member, so this is just another forward hop restricted
-    # to those.
-    node_ids_table = forward_new_ids_table(con, hop_rows_table, restrict_source_types={"way"})
-    if node_ids_table is not None:
-        node_sql, nfiles2 = hydrate_ids_table(con, manifest, node_ids_table, [], promoted_keys)
-        total_files += nfiles2
-        if node_sql:
-            selects.append(node_sql)
-
     return "\nUNION ALL\n".join(selects), total_files
 
 
