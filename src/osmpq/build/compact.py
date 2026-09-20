@@ -569,6 +569,7 @@ def _compact_areas(
     promoted_keys: list[str],
     way_byid_manifest: list[dict],
     has_rel_byid: bool, relation_byid_winners_view: str,
+    threads: Optional[int] = None,
 ) -> tuple[Optional[dict], int]:
     """Re-derives relation-area rows for touched pivots -- winners of type
     relation, which already include every relation that lists a touched
@@ -596,7 +597,7 @@ def _compact_areas(
 
     new_cat_manifest = engine_catalog.Manifest(root=str(root), data=new_man)
     placed_table, _files_read = areas_mod.derive_relation_areas_for_pivots(
-        con, new_cat_manifest, promoted_keys, touched_relation_ids,
+        con, new_cat_manifest, promoted_keys, touched_relation_ids, threads=threads,
     )
 
     old_index_path = root / old_areas["index"]["path"]
@@ -1058,6 +1059,7 @@ def compact(opts: CompactOptions) -> dict:
     areas_field, areas_bytes = _compact_areas(
         con, root, old_man, new_man, new_generation, promoted_keys,
         way_byid_manifest, has_rel_byid, "relation_byid_winners",
+        threads=opts.threads,
     )
     if areas_field is not None:
         new_man["areas"] = areas_field

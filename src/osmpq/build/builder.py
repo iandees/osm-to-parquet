@@ -261,7 +261,7 @@ def build_from_raw(opts: BuildFromRawOptions) -> manifest_mod.Manifest:
         areas_tmpdir.mkdir(parents=True, exist_ok=True)
         acon = areas_mod._connect(opts.threads, opts.memory_limit, areas_tmpdir)
         cat_manifest = catalog.Manifest(root=str(opts.root), data=man.to_dict())
-        man.areas = areas_mod.build_areas_for_manifest(acon, Path(opts.root), cat_manifest, promoted_keys)
+        man.areas = areas_mod.build_areas_for_manifest(acon, Path(opts.root), cat_manifest, promoted_keys, threads=opts.threads)
         acon.close()
         man.manifest_version = 4
         man.stats["areas"] = man.areas["index"]["rows"]

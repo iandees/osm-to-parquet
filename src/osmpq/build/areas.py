@@ -49,6 +49,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -296,17 +297,176 @@ def _assemble_relation_geometry(outer_way_ids: list[int], inner_way_ids: list[in
     inner_rings = _rings_from_way_ids(inner_way_ids, way_wkt)
     polys = []
     for op in outer_rings:
-        poly = op
-        for ip in inner_rings:
-            if op.intersects(ip):
-                try:
-                    poly = poly.difference(ip)
-                except Exception:
-                    continue
-        polys.append(poly)
+        matching_inner = [ip for ip in inner_rings if op.intersects(ip)]
+        polys.append(_subtract_holes(op, matching_inner))
     geom = polys[0] if len(polys) == 1 else unary_union(polys)
     geom = make_valid(geom)
     return None if geom.is_empty else geom
+
+
+def _subtract_holes(op, matching_inner: list):
+    """Subtracts every ring in `matching_inner` from `op`. Real relations
+    (a Great Lake's shoreline, a large admin boundary) can have thousands
+    of intersecting holes (Lake Huron: 2 outer rings, 14,105 inner --
+    almost every one of its many islands is its own closed way): calling
+    `.difference()` once per hole in a loop, as this used to do, makes
+    each successive call operate on an increasingly complex `poly` (more
+    accumulated cutouts = more vertices/rings for GEOS to carry), so cost
+    grows with hole count in a way that dominated real build time (27+
+    minutes single-threaded for Lake Huron alone, found benchmarking a
+    ~10x-Minnesota-scale region -- see docs/progress.md). Set difference
+    distributes over union (`A - (B1 union B2 union ...) == A - B1 - B2 -
+    ...`), so union every intersecting hole once and subtract in a single
+    call instead -- `unary_union` uses a proper spatial algorithm
+    (internally an STRtree-backed sweep), not the pairwise-degrading
+    pattern the old loop had. Falls back to the original one-hole-at-a-time
+    loop (with the same per-hole exception tolerance as before) only if
+    the batched path itself raises, so a malformed hole still degrades
+    the same way it used to rather than losing every hole."""
+    from shapely.ops import unary_union
+
+    if not matching_inner:
+        return op
+    try:
+        holes = matching_inner[0] if len(matching_inner) == 1 else unary_union(matching_inner)
+        return op.difference(holes)
+    except Exception:
+        poly = op
+        for ip in matching_inner:
+            try:
+                poly = poly.difference(ip)
+            except Exception:
+                continue
+        return poly
+
+
+# --------------------------------------------------------------------------
+# relation-area parallelism: `_assemble_relation_geometry` is pure-Python
+# shapely/GEOS work with no I/O, so it never releases the GIL usefully --
+# threads buy nothing here (and DuckDB's own `--threads` only ever
+# controlled *its* SQL execution, never this loop). Fan it out across
+# processes instead, sized from the same `--threads` this module already
+# gives DuckDB (`_area_max_workers` mirrors `_connect`'s own
+# threads-or-fallback rule). `way_wkt` (potentially large: every way
+# referenced by every candidate relation) is sent to each worker exactly
+# once via `ProcessPoolExecutor`'s `initializer`, not per task -- macOS's
+# default `spawn` start method re-imports this module fresh in every
+# worker (no `fork`-inherited memory to rely on), so a plain module-level
+# global set at import time wouldn't be populated; the initializer is what
+# actually runs inside the freshly-spawned interpreter, once per worker.
+# --------------------------------------------------------------------------
+
+# Below this many candidate relations, a ProcessPoolExecutor's own startup
+# cost (spawning N interpreters, importing duckdb/shapely/numpy in each)
+# would dominate or even lose to just running in-process -- this also
+# keeps the test suite's tiny fixtures (a handful of relations) fast and
+# free of multiprocessing pickling/startup flakiness, and keeps compact's
+# touched-pivot re-derive (normally a handful of relations) on the cheap
+# serial path without any special-casing.
+AREA_PARALLEL_MIN_CANDIDATES = 2000
+
+_worker_way_wkt: dict[int, str] = {}
+
+
+def _init_relation_area_worker(way_wkt: dict[int, str]) -> None:
+    """`ProcessPoolExecutor(initializer=..., initargs=(way_wkt,))`: runs
+    once per worker process (not per task), stashing `way_wkt` in a
+    worker-local module global so `_relation_area_task_worker` never has
+    to repickle it on any of the hundreds of thousands of individual
+    per-relation tasks."""
+    global _worker_way_wkt
+    _worker_way_wkt = way_wkt
+
+
+def _relation_area_task(task: tuple, way_wkt: dict[int, str]) -> Optional[dict]:
+    """One relation's area row (or None) -- exactly the body of the
+    original per-relation loop, unchanged, shared by the serial and
+    parallel paths so both call identical code. `task` is a plain
+    picklable tuple: (rel_id, tags, version, changeset, timestamp, uid,
+    user, xmin, ymin, xmax, ymax, outer_way_ids, inner_way_ids); the bbox
+    columns are threaded through for parity with the original row shape
+    even though, as in the original loop, only the assembled geometry's
+    own bounds end up used."""
+    (rel_id, tags, version, changeset, timestamp, uid, user,
+     _xmin, _ymin, _xmax, _ymax, outer_way_ids, inner_way_ids) = task
+    geom = _assemble_relation_geometry(outer_way_ids, inner_way_ids, way_wkt)
+    if geom is None:
+        return None
+    gxmin, gymin, gxmax, gymax = geom.bounds
+    return {
+        "id": rel_id + RELATION_ID_OFFSET,
+        "pivot_id": rel_id,
+        "tags": dict(tags) if tags else {},
+        "version": version, "changeset": changeset, "timestamp": timestamp,
+        "uid": uid, "user": user,
+        "xmin_e7": _to_e7(gxmin), "ymin_e7": _to_e7(gymin),
+        "xmax_e7": _to_e7(gxmax), "ymax_e7": _to_e7(gymax),
+        "wkb": geom.wkb,
+    }
+
+
+def _relation_area_task_worker(task: tuple) -> Optional[dict]:
+    """Top-level, picklable `ProcessPoolExecutor` task function: reads
+    `way_wkt` from the worker-global `_init_relation_area_worker` set,
+    instead of receiving it as a (repeatedly-repickled) argument."""
+    return _relation_area_task(task, _worker_way_wkt)
+
+
+def _area_max_workers(threads: Optional[int]) -> int:
+    """Same threads-or-fallback rule as `_connect`'s DuckDB `--threads`
+    (DuckDB itself defaults to the available core count when `SET
+    threads` is never called) -- reused here so the relation-area process
+    pool defaults to the same parallelism as DuckDB's own SQL phases of
+    this module when `--threads` isn't given explicitly."""
+    if threads:
+        return int(threads)
+    return os.cpu_count() or 1
+
+
+def _area_chunksize(n_tasks: int, max_workers: int) -> int:
+    """Relation cost is not just "hugely variable", it's *power-law*
+    skewed: measured on a real ~55k-candidate region, a chunksize of 200
+    (this function's previous "~8 chunks per worker" formula) left 12 of
+    14 workers idle while 2 workers each sat on a chunk that happened to
+    contain one of a handful of dominant relations (a big admin
+    boundary/coastline-like one), for a ~1.15x wall-clock speedup instead
+    of anything close to 14x. `ProcessPoolExecutor.map` only rebalances
+    *between* chunks, never within one, so any chunksize above 1 risks
+    the same failure mode again for a different skewed input -- and
+    per-task IPC overhead here is cheap to pay per-task (measured:
+    pickling one task tuple, or the whole `way_wkt` initializer payload,
+    both take well under a second even at hundreds of thousands of
+    tasks/hundreds of MB -- see the initializer docstring above), so
+    there's no real amortization benefit to weigh against that risk.
+    Always hand out one relation at a time so the pool can keep every
+    worker fed until the true last relation finishes."""
+    return 1
+
+
+def _relation_area_rows_from_tasks(
+    tasks: list[tuple], way_wkt: dict[int, str], threads: Optional[int],
+) -> list[dict]:
+    """Runs `_relation_area_task` over `tasks`: serially in-process for
+    small inputs (exactly today's behavior -- no process-pool startup
+    cost, no multiprocessing pickling edge cases) or fanned out across a
+    `ProcessPoolExecutor` for large ones. Exceptions raised by a
+    pathological relation's assembly are not caught anywhere in here:
+    `ProcessPoolExecutor.map`'s result iterator re-raises a worker's
+    exception exactly where that task's result would otherwise be, same
+    as calling `_relation_area_task` directly would -- this deliberately
+    adds no new exception handling around either path."""
+    if not tasks:
+        return []
+    max_workers = _area_max_workers(threads)
+    if max_workers <= 1 or len(tasks) < AREA_PARALLEL_MIN_CANDIDATES:
+        rows = [_relation_area_task(t, way_wkt) for t in tasks]
+    else:
+        chunksize = _area_chunksize(len(tasks), max_workers)
+        with ProcessPoolExecutor(
+            max_workers=max_workers, initializer=_init_relation_area_worker, initargs=(way_wkt,),
+        ) as ex:
+            rows = list(ex.map(_relation_area_task_worker, tasks, chunksize=chunksize))
+    return [r for r in rows if r is not None]
 
 
 def _relation_qualifying_sql(tags_expr: str = "tags") -> str:
@@ -323,12 +483,17 @@ def _relation_qualifying_sql(tags_expr: str = "tags") -> str:
     )
 
 
-def _relation_area_rows(con, manifest: catalog.Manifest, relation_ids: Optional[list[int]]) -> tuple[list[dict], int]:
+def _relation_area_rows(
+    con, manifest: catalog.Manifest, relation_ids: Optional[list[int]], threads: Optional[int] = None,
+) -> tuple[list[dict], int]:
     """Python list of area-row dicts for relations matching the
     `areas.osm3s` rule (9 fact 3) that also assemble into at least one
     valid ring, restricted to `relation_ids` pivots when given (compact's
     touched-pivot re-derive; None means every relation). An explicit empty
-    `relation_ids` short-circuits to no rows with no file reads at all."""
+    `relation_ids` short-circuits to no rows with no file reads at all.
+    `threads` sizes the process pool the actual ring-assembly work runs on
+    (see `_relation_area_rows_from_tasks`); None uses the same fallback as
+    DuckDB's own `--threads`."""
     if relation_ids is not None and not relation_ids:
         return [], 0
     files_read = 0
@@ -407,25 +572,13 @@ def _relation_area_rows(con, manifest: catalog.Manifest, relation_ids: Optional[
     ).fetchall()
     con.execute("DROP TABLE _rel_area_cand")
 
-    area_rows: list[dict] = []
+    tasks: list[tuple] = []
     for (rel_id, tags, version, changeset, timestamp, uid, user, xmin, ymin, xmax, ymax) in cand_rows:
         m = members_by_rel.get(rel_id)
         if not m:
             continue
-        geom = _assemble_relation_geometry(m["outer"], m["inner"], way_wkt)
-        if geom is None:
-            continue
-        gxmin, gymin, gxmax, gymax = geom.bounds
-        area_rows.append({
-            "id": rel_id + RELATION_ID_OFFSET,
-            "pivot_id": rel_id,
-            "tags": dict(tags) if tags else {},
-            "version": version, "changeset": changeset, "timestamp": timestamp,
-            "uid": uid, "user": user,
-            "xmin_e7": _to_e7(gxmin), "ymin_e7": _to_e7(gymin),
-            "xmax_e7": _to_e7(gxmax), "ymax_e7": _to_e7(gymax),
-            "wkb": geom.wkb,
-        })
+        tasks.append((rel_id, tags, version, changeset, timestamp, uid, user, xmin, ymin, xmax, ymax, m["outer"], m["inner"]))
+    area_rows = _relation_area_rows_from_tasks(tasks, way_wkt, threads)
     return area_rows, files_read
 
 
@@ -462,13 +615,16 @@ def _relation_area_final(con, area_rows: list[dict]) -> str:
 # --------------------------------------------------------------------------
 
 
-def derive_relation_areas(con, manifest: catalog.Manifest, relation_ids: Optional[list[int]] = None) -> tuple[str, int]:
+def derive_relation_areas(
+    con, manifest: catalog.Manifest, relation_ids: Optional[list[int]] = None, threads: Optional[int] = None,
+) -> tuple[str, int]:
     """TEMP TABLE of every derived relation-area row (id, pivot_type,
     pivot_id, tags, meta cols, bbox, geometry -- no cell/hilbert yet),
     restricted to `relation_ids` pivots when given. Returns (table_name,
     files_read). Way areas are not stored (9.1) -- see `build_way_area_index`
-    for the way side."""
-    rel_rows, nfiles_r = _relation_area_rows(con, manifest, relation_ids)
+    for the way side. `threads` sizes the ring-assembly process pool
+    (`_relation_area_rows_from_tasks`)."""
+    rel_rows, nfiles_r = _relation_area_rows(con, manifest, relation_ids, threads=threads)
     rel_final = _relation_area_final(con, rel_rows)
     return rel_final, nfiles_r
 
@@ -570,15 +726,18 @@ def write_area_layout(con, root: Path, generation: str, placed_table: str, promo
     return {"index": {"path": index_rel, "rows": index_rows, "bytes": index_size}, "cells": cells_manifest}
 
 
-def build_areas_for_manifest(con, root: Path, cat_manifest: catalog.Manifest, promoted_keys: list[str]) -> dict:
+def build_areas_for_manifest(
+    con, root: Path, cat_manifest: catalog.Manifest, promoted_keys: list[str], threads: Optional[int] = None,
+) -> dict:
     """Full derivation (every qualifying relation, plus the way index)
     against `cat_manifest`'s *current* tables, writing spatial/index files
     under `cat_manifest.generation`. Returns the new `areas` manifest field
     ({"index", "cells", "way_index"}) to merge into the caller's manifest
     dict; does not read or write `cat_manifest.data["areas"]` itself, so
     callers (``osmpq areas``, ``osmpq compact``, the test fixture) control
-    how the result folds into their manifest."""
-    derived, _files_read = derive_relation_areas(con, cat_manifest)
+    how the result folds into their manifest. `threads` sizes the
+    relation-area ring-assembly process pool (see `_area_max_workers`)."""
+    derived, _files_read = derive_relation_areas(con, cat_manifest, threads=threads)
     placed = place_areas(con, derived, cat_manifest, promoted_keys)
     area_field = write_area_layout(con, root, cat_manifest.generation, placed, promoted_keys)
     way_index_field, _files_read_w = build_way_area_index(con, root, cat_manifest.generation, cat_manifest, promoted_keys)
@@ -588,6 +747,7 @@ def build_areas_for_manifest(con, root: Path, cat_manifest: catalog.Manifest, pr
 
 def derive_relation_areas_for_pivots(
     con, cat_manifest: catalog.Manifest, promoted_keys: list[str], relation_ids: list[int],
+    threads: Optional[int] = None,
 ) -> tuple[str, int]:
     """Re-derives relation-area rows for exactly the given touched
     relations (used by ``osmpq compact``, 9.2): returns (TEMP TABLE of
@@ -596,8 +756,11 @@ def derive_relation_areas_for_pivots(
     ring, or was deleted) simply produces no row here -- callers remove its
     old area row by id. The way index is not touched-pivot re-derived at
     all; ``osmpq compact`` rebuilds it in full instead
-    (`build_way_area_index_from_files`)."""
-    derived, files_read = derive_relation_areas(con, cat_manifest, relation_ids=relation_ids)
+    (`build_way_area_index_from_files`). `relation_ids` here is normally a
+    small touched-pivot set, so this naturally lands on
+    `_relation_area_rows_from_tasks`'s serial fallback without any
+    special-casing."""
+    derived, files_read = derive_relation_areas(con, cat_manifest, relation_ids=relation_ids, threads=threads)
     placed = place_areas(con, derived, cat_manifest, promoted_keys)
     return placed, files_read
 
@@ -621,7 +784,7 @@ def build_areas(opts: BuildAreasOptions) -> dict:
     con = _connect(opts.threads, opts.memory_limit, tmpdir)
     cat_manifest = catalog.Manifest(root=str(root), data=old_man)
 
-    area_field = build_areas_for_manifest(con, root, cat_manifest, promoted_keys)
+    area_field = build_areas_for_manifest(con, root, cat_manifest, promoted_keys, threads=opts.threads)
     con.close()
 
     new_man = copy.deepcopy(old_man)

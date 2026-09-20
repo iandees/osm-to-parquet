@@ -90,3 +90,69 @@ corpus query needed a bbox because the reference is worldwide), the
 - **`osmpq manifest`** does not print the way-area index yet.
 - Compaction rewrites the way-area index in full (6 MB here; fine until
   the planet, where it joins the byid-rewrite concern from M2).
+
+## 5. Addendum (2026-09-20): relation-area assembly at planet scale
+
+`osmpq areas`'s 136 s on Minnesota (9,919 relation areas, section 2) did
+not predict its cost at scale: benchmarking against Geofabrik's
+`us-midwest` extract (54,376 relation areas, 5.5x Minnesota's count) took
+**6,518 s (108.6 min) single-threaded** -- 47.9x Minnesota's time for only
+5.5x the areas, i.e. wildly super-linear, not the roughly-linear cost the
+Minnesota number alone suggested. Two distinct causes, both in
+`src/osmpq/build/areas.py`, both fixed:
+
+1. **No parallelism.** `_relation_area_rows`'s per-relation ring assembly
+   (`shapely`: `linemerge`, `.difference()`, `unary_union`, `make_valid`)
+   ran in a single-threaded Python loop that ignored `--threads` entirely
+   (that flag only ever controlled DuckDB's own SQL phases elsewhere in
+   the module) -- 99.7% of the whole build pass's wall time on
+   `us-midwest`. Fixed by fanning the loop out across a
+   `ProcessPoolExecutor` sized from `--threads`, with `way_wkt` (the
+   dict every candidate relation's member-way geometry is read from, up
+   to ~255 MB pickled at `us-midwest` scale) sent to each worker exactly
+   once via the executor's `initializer` rather than per task.
+2. **Pathological cost skew, and a chunking bug that made it worse.**
+   Relation cost is not just variable, it is power-law skewed: one
+   relation, Lake Huron (id 1205151, a multipolygon with 524 outer-role
+   and 14,228 inner-role members -- 14,105 separate islands after
+   `linemerge`), took **27+ minutes on its own**, single-threaded, and
+   was still running when killed for inspection. The parallel fix's first
+   cut used a chunksize of ~200 relations per pool task to amortize IPC;
+   with cost this skewed, `ProcessPoolExecutor.map` can only rebalance
+   *between* chunks, so Lake Huron and one other large relation landed in
+   different chunks assigned to only 2 of 14 workers, which then ran for
+   the whole job while the other 12 sat idle (~1.15x wall-clock
+   improvement for a 14-core machine -- confirmed by process inspection
+   mid-run, not just inferred). Switching to `chunksize=1` fixed the
+   distribution (all 14 cores stayed busy) but only dropped total time to
+   89.2 min, because Lake Huron's own single-relation cost was still the
+   floor. The real fix was algorithmic: `_assemble_relation_geometry`
+   subtracted inner rings from an outer ring one `.difference()` call at
+   a time in a loop, so each of Lake Huron's ~14,105 intersecting islands
+   made the next call operate on an increasingly complex polygon (more
+   accumulated cutouts). Since set difference distributes over union
+   (`A - (B1 ∪ B2 ∪ ...) == A - B1 - B2 - ...`), unioning all of an outer
+   ring's intersecting holes once and subtracting in a single call
+   (`_subtract_holes`, falling back to the old one-at-a-time loop only if
+   the batched call itself raises, to keep the same per-hole exception
+   tolerance) took Lake Huron from >27 min to **6.9 s** -- confirmed
+   identical output via a 200-trial randomized equivalence test between
+   the two algorithms (`tests/test_areas_parallel.py`) plus the full
+   `us-midwest` run producing the same 54,376/684,202 row counts as every
+   earlier attempt.
+
+**Combined result**: `us-midwest`'s `osmpq areas` went from 6,518 s to
+**86.5 s** -- a 75x speedup, with identical output at every step
+(relation/way-area row counts, and a WKB hash comparison on the parallel
+vs. serial path for a real 3,000-relation subset). Linearly extrapolated
+to the planet's ~14M relations (36.5x `us-midwest`'s count), the original
+algorithm implied 60-70+ *hours* for this one build step alone -- by far
+the dominant risk to `docs/m1-runbook.md`'s planet-build estimate; the
+fixed algorithm implies roughly 50-60 *minutes*, back in line with the
+rest of the pipeline. Not yet measured at actual planet scale, and a
+planet-scale run could still contain a relation more extreme than Lake
+Huron (a real coastline, Antarctica, a very large country boundary) that
+takes meaningfully longer than 6.9 s on its own -- but the fix addresses
+the root cause (an algorithm whose cost grew with hole count in an
+increasingly expensive way) rather than papering over one specific
+relation, so it should generalize.

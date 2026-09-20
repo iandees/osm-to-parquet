@@ -61,6 +61,10 @@ Code:
   current-table scans (4x cost today).
 - **Way-area index by name** for planet-scale `area[name=...]` lookups on
   closed ways (M3 follow-up); relation areas at an extract's edge.
+- ~~`osmpq areas` single-threaded, 99.7% of build wall time at 10x
+  Minnesota scale~~ found and fixed benchmarking `us-midwest`: parallelism
+  plus an O(hole-count) algorithmic fix took it from 6,518 s to 86.5 s, a
+  75x speedup (`docs/m3-report.md` section 5).
 - **Rust producer**: compaction rewrites the way-area index in full; the
   chunked sort for a root-level way cell (M1 caveat) is implemented but
   untested at actual planet scale (no real planet-scale run has happened
