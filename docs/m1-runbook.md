@@ -172,3 +172,108 @@ Per pass wall time and peak RSS, leaf count and depth distribution, file
 count and bytes per table, `validate` output, R2 upload time, and the
 harness table over R2 with `local_ms`. Those numbers replace the
 extrapolations in `docs/m1-report.md`.
+
+## 9. Attic (history) data after the build
+
+Sections 1-8 build the *current*-state dataset only. This project's history
+subsystem (`docs/m4-contracts.md`) can add attic data on top of it, but the
+two ways to do that are at very different levels of readiness.
+
+### Forward path — implemented, do this now
+
+This is exactly the machinery M4 validated on Minnesota
+(`docs/m4-report.md`), unchanged for planet scale:
+
+1. Right after `osmpq build --raw` (section 5) — before any `osmpq update`
+   run, while the root is still one generation with no delta tiers —
+   turn the current tables into history:
+   ```
+   osmpq history init /fast/root --threads $(nproc) --memory-limit 48GB --tmpdir $TMP
+   ```
+   Every current row becomes its own state (`minor=0`, `valid_from` = the
+   row's own `timestamp`, `visible=true`) — exactly the dataset's history
+   at the instant the planet extract was taken. It streams one Parquet
+   file at a time and never materializes a full table, so cost is flat
+   regardless of extract size: 70s on Minnesota's ~55M nodes
+   (`docs/m4-report.md`). Correct that estimate once you've run it at
+   planet scale.
+2. Point `osmpq update` at the planet's own minutely diffs, starting from
+   the sequence recorded in section 3 (already carried in the manifest via
+   section 5's `--replication-sequence`/`--timestamp`):
+   ```
+   osmpq update /fast/root --source https://planet.openstreetmap.org/replication/minute/ \
+       --max-diffs 60 --threads $(nproc) --memory-limit 48GB --tmpdir $TMP --once
+   ```
+   (`--source` is saved into the manifest on first use, so later runs and
+   the scheduled container can omit it.) From here every `osmpq update` run
+   appends real, complete history to the rolling hour/day/week tiers
+   (`docs/m4-contracts.md` section 5.1); `osmpq compact` folds them into
+   the base history on whatever schedule you use for the current-state
+   deltas (section 5.2).
+3. `[date:]`, `retro`, `timeline`, `[diff:]`/`[adiff:]` and exact
+   `(changed:)` now work for any date from the build's own timestamp
+   onward. Dates before it are unavailable — this is the one gap the
+   forward path can't close (see below).
+
+### Backfill path (OSM's full 2004-present history) — not planet-ready
+
+`osmpq history build --osh <full-history.osh.pbf>` recomputes every state
+from a raw object-version stream instead of starting from "now", so it is
+the only path that can produce true retroactive history back through OSM's
+whole edit history rather than just from the build's own timestamp
+forward. It does not fit even Minnesota's ~55M nodes today: the
+node-version cell-assignment pass materializes every node version in
+memory and hits a 14 GB cgroup ceiling regardless of the memory fixes
+tried so far (`docs/m4-report.md`, "History build: what worked and what
+did not"). A full planet history is dramatically larger than Minnesota's:
+OSM's full-history planet file is about 150 GB compressed / on the order
+of 3.7 TB uncompressed (vs. a ~90 GB current-state planet PBF), covering
+a planet with on the order of 10 billion nodes, 1.1 billion ways and 13
+million relations (`docs/design.md` section 1) — and, because it carries
+every version of every element back to 2004, a multiple of that object
+count in object-versions (an OSHDB paper measured about 8.4 billion
+versions for 6.1 billion entities on an earlier, smaller planet; today's
+planet is roughly twice that entity count, so tens of billions of object
+versions is the right order of magnitude — "a few times the current
+planet's row count", per `docs/design.md` section 4.5).
+
+Making the builder fit is the same *class* of fix already used for the
+Rust way-cell sort (`rust/osmpq-raw/src/ways.rs`, `docs/m1-contracts.md`
+section 3.2): chunk oversized work into bounded ranges and spill/merge
+instead of holding it all in memory. Applied here that means
+`history/build.py`'s node-state computation (`_compute_node_states`) and
+the way/relation minor-version joins (`_compute_way_states`,
+`_compute_relation_states`) processing node ids in bounded ranges instead
+of materializing `node_states`/`multi_version_node_ids` whole — the
+`common.range_bounds`/`range_cond` id-chunking idiom this codebase already
+uses elsewhere (e.g. `history/writer.py`'s `write_byid`) is the natural
+fit, though the way/relation minor-version join would need reworking to
+run per range rather than against one in-memory node table. This is
+unscoped, unscheduled future work (`docs/progress.md`, `docs/m4-report.md`
+section 6), not something to attempt as part of a planet deployment today.
+
+**Reconciling a later backfill with an already-running forward history:**
+no splicing is needed. `history build` recomputes the *entire* base
+history from its input in one pass, and a full-history dump taken later
+necessarily already contains every version the forward path captured in
+the meantime — they're the same real OSM edit history, just read from a
+file that goes back further. So once the bounded-range rewrite exists,
+backfilling is: fetch a full-history dump covering the extent through
+"now", run `osmpq history build --osh` against it once (this wholesale
+replaces whatever `history init` + the updater had built, not merges with
+it), then resume `osmpq update` from that dump's own replication sequence
+exactly as in step 2 above. One sharp edge in the code as it stands today:
+`history_build` writes into `history/<gen>/...` for whatever generation
+the root is currently on and does not refuse to run when `man.history` is
+already set (unlike `history_init`, which does refuse) — so do this into a
+new generation/copy and swap the manifest, not in place, until that gets a
+guard.
+
+### Recommendation
+
+For a planet build today: run `history init` and start `osmpq update`
+immediately (steps 1-2 above), and accept that dates before the build's
+own timestamp are unavailable. Defer full 2004-present backfill until the
+bounded-id-range rewrite of `osmpq history build` exists — there is
+currently no tested, working way to backfill true historical attic data
+at planet scale.

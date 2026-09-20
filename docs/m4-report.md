@@ -333,7 +333,10 @@ rather than re-querying the reference.
   minor-version join to run per range) before a full-history planet
   load; the Minnesota-from-PBF run needs more than the sandbox's 14 GB.
   `history init` + updater covers regional datasets from their base
-  timestamp.
+  timestamp. The same recipe applies to a planet build; see
+  `docs/m1-runbook.md` section 9 for the operator procedure, the backfill
+  reconciliation question, and a data-volume estimate for the full
+  history load.
 - **`adiff` over very large result sets** renders both passes before
   diffing (58 s for 2.1M nodes per pass). Diffing the two passes' set
   rows in SQL and rendering only the changed ids would cut that to the

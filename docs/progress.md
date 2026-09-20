@@ -40,7 +40,16 @@ Code:
 - **Planet-scale history builder.** `osmpq history build` (raw object
   stream → states with minor versions) materializes every node version in
   memory; it needs to work in bounded id ranges before a full-history
-  planet load. Regional datasets use `osmpq history init` + the updater.
+  planet load (`docs/m4-report.md` section 6). Until then, a planet build
+  gets attic data the same way regional datasets do: `history init` right
+  after the build, then the updater, accumulating real history forward
+  from the build's own timestamp (`docs/m1-runbook.md` section 9 has the
+  exact procedure) — full 2004-present backfill has to wait for the
+  rewrite above. When it exists, backfilling a root that already has
+  forward history running needs no splicing: `history build --osh`
+  recomputes the whole base history in one pass from a dump that already
+  contains everything the forward path captured meanwhile, so it is a
+  wholesale replace-and-resume, not a merge.
 - **Updater over object storage.** 224 s for a 30-diff batch against R2
   versus 6-12 s locally: profile the by-id reads of touched parents
   (DuckDB reads whole row groups over HTTP); cache byid parts in the
