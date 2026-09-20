@@ -1,4 +1,4 @@
-// bbox: minneapolis_eatery_cluster (tests/corpus/bboxes.json), hardcoded --
+// bbox: a Minneapolis restaurant cluster near (44.948,-93.253), hardcoded --
 // a small cluster of restaurants around (44.948,-93.253) with several
 // amenity nodes created and two modified between 19:34 and 19:51 UTC on
 // 2026-09-19 (well after the history base and after the retro date below),
