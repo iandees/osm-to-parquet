@@ -145,6 +145,12 @@ def _cmd_manifest(args: argparse.Namespace) -> int:
         idx = areas["index"]
         n_cells = len(areas.get("cells", {}))
         print(f"areas: {idx.get('rows', 0)} rows, {n_cells} cells, {idx.get('bytes', 0)} index bytes")
+    if man.history:
+        h = man.history
+        print(f"history: generation={h.get('generation')} since={h.get('since')} minor_versions={h.get('minor_versions')}")
+        print(f"  stats: {h.get('stats')}")
+        if h.get("tiers"):
+            print(f"  tiers: {sorted(h['tiers'].keys())}")
     return 0
 
 
@@ -160,6 +166,42 @@ def _cmd_update(args: argparse.Namespace) -> int:
         poll_interval=args.poll_interval,
     )
     update_run(opts)
+    return 0
+
+
+def _cmd_history_init(args: argparse.Namespace) -> int:
+    from osmpq.history.init import HistoryInitOptions, history_init
+
+    summary = history_init(HistoryInitOptions(
+        root=args.root, threads=args.threads, memory_limit=args.memory_limit, tmpdir=args.tmpdir,
+    ))
+    print(f"osmpq history init: {args.root}")
+    print(f"  since={summary['since']} rows={summary['rows']} bytes={summary['bytes']} seconds={summary['seconds']:.1f}")
+    return 0
+
+
+def _cmd_history_build(args: argparse.Namespace) -> int:
+    from osmpq.history.build import HistoryBuildOptions, history_build
+
+    if args.osh and (args.pbf or args.osc):
+        raise SystemExit("osmpq history build: --osh is mutually exclusive with --pbf/--osc")
+    if not args.osh and not args.pbf:
+        raise SystemExit("osmpq history build: give --pbf (+ optional --osc) or --osh")
+
+    opts = HistoryBuildOptions(
+        root=args.root,
+        pbf_path=args.pbf,
+        osc_paths=args.osc,
+        osh_path=args.osh,
+        threads=args.threads,
+        memory_limit=args.memory_limit,
+        tmpdir=args.tmpdir,
+    )
+    summary = history_build(opts)
+    print(f"osmpq history build: {args.root}")
+    print(f"  since: {summary['since']}")
+    print(f"  rows: {summary['stats']['rows']}  minor_rows: {summary['stats']['minor_rows']}  bytes: {summary['stats']['bytes']}")
+    print(f"  {summary['seconds']:.1f}s total")
     return 0
 
 
@@ -270,6 +312,32 @@ def main(argv: list[str] | None = None) -> int:
     p_update.add_argument("--memory-limit", default=None)
     p_update.add_argument("--poll-interval", type=float, default=30.0, help="seconds between --follow polls")
     p_update.set_defaults(func=_cmd_update)
+
+    p_history = sub.add_parser("history", help="history (attic) dataset commands (docs/m4-contracts.md section 4)")
+    history_sub = p_history.add_subparsers(dest="history_command", required=True)
+    p_history_build = history_sub.add_parser(
+        "build", help="add history/<gen>/ and a v5 manifest to an existing dataset root"
+    )
+    p_history_build.add_argument("root")
+    p_history_build.add_argument("--pbf", default=None, help="base extract PBF (the first state of every element)")
+    p_history_build.add_argument(
+        "--osc", action="append", default=None,
+        help="a .osc/.osc.gz file or a directory of them, sorted by sequence number; may be given more than once",
+    )
+    p_history_build.add_argument("--osh", default=None, help="a full-history .osh.pbf file (mutually exclusive with --pbf/--osc)")
+    p_history_build.add_argument("--threads", type=int, default=None)
+    p_history_build.add_argument("--memory-limit", default=None)
+    p_history_build.add_argument("--tmpdir", default=None)
+    p_history_build.set_defaults(func=_cmd_history_build)
+    p_history_init = history_sub.add_parser(
+        "init", help="start history from the root's current tables (every current row as its first state); "
+        "then `osmpq update` appends later versions"
+    )
+    p_history_init.add_argument("root")
+    p_history_init.add_argument("--threads", type=int, default=None)
+    p_history_init.add_argument("--memory-limit", default=None)
+    p_history_init.add_argument("--tmpdir", default=None)
+    p_history_init.set_defaults(func=_cmd_history_init)
 
     p_serve = sub.add_parser("serve", help="run the query API server (docs/m3-contracts.md section 6.1)")
     p_serve.add_argument("--host", default="0.0.0.0")

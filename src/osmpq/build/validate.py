@@ -114,8 +114,9 @@ def validate(root: str) -> tuple[bool, list[str]]:
                 "WHERE xmin_e7 IS NOT NULL"
             ).fetchall()
             for cell, ymin, xmin, ymax, xmax in rows:
+                cell = str(cell)
                 south, west, north, east = ymin / 1e7, xmin / 1e7, ymax / 1e7, xmax / 1e7
-                c_south, c_west, c_north, c_east = cells_mod.cell_bbox(cell)
+                c_south, c_west, c_north, c_east = cells_mod.cell_bbox(str(cell))
                 if not (south >= c_south and west >= c_west and north <= c_north and east <= c_east):
                     problems.append(f"{label} cell {cell} does not contain its bbox in {rel_path}")
                     continue
@@ -150,7 +151,7 @@ def validate(root: str) -> tuple[bool, list[str]]:
             ).fetchall()
             for ymin, xmin, ymax, xmax in rows:
                 south, west, north, east = ymin / 1e7, xmin / 1e7, ymax / 1e7, xmax / 1e7
-                c_south, c_west, c_north, c_east = cells_mod.cell_bbox(cell)
+                c_south, c_west, c_north, c_east = cells_mod.cell_bbox(str(cell))
                 if not (south >= c_south and west >= c_west and north <= c_north and east <= c_east):
                     problems.append(f"area cell {cell} does not contain its bbox in {rel_path}")
                     continue
@@ -228,6 +229,10 @@ def validate(root: str) -> tuple[bool, list[str]]:
     elif is_v2:
         problems.append("manifest_version 2 but rowgroup_index is empty")
 
+    # ---- 6. history (docs/m4-contracts.md section 4.3) --------------------------
+    if man.history:
+        _validate_history(con, root_path, man, problems, info)
+
     con.close()
     ok = not problems
     summary = [f"osmpq validate: {root}", f"generation: {man.generation}  manifest_version: {man.manifest_version}"]
@@ -238,6 +243,81 @@ def validate(root: str) -> tuple[bool, list[str]]:
         summary.append(f"FAIL: {len(problems)} problem(s) found")
         summary.extend(f"  - {p}" for p in problems)
     return ok, summary
+
+
+_HISTORY_TYPES = ("node", "way", "relation")
+
+
+def _validate_history(con, root_path: Path, man: manifest_mod.Manifest, problems: list[str], info: list[str]) -> None:
+    """docs/m4-contracts.md section 4.3: every path exists (covered by
+    check 1 via ``_paths_and_rows``); per type, the latest visible state of
+    a sample of ids present in the current byid copy matches the current
+    row's version; no row has ``valid_from > valid_to``; ``minor`` rows
+    share ``version``/``timestamp`` with their ``minor = 0`` row; the byid
+    and spatial copies have the same visible row count."""
+    h = man.history
+    for typ in _HISTORY_TYPES:
+        byid_parts = h.get("byid", {}).get(typ, [])
+        byid_paths = [str(root_path / p["path"]) for p in byid_parts if (root_path / p["path"]).exists()]
+        spatial_parts = [
+            str(root_path / p["path"])
+            for cell_parts in h.get("spatial", {}).get(typ, {}).values()
+            for p in cell_parts
+            if (root_path / p["path"]).exists()
+        ]
+        if not byid_paths:
+            continue
+
+        bad_order = con.execute(
+            f"SELECT count(*) FROM read_parquet({byid_paths!r}) WHERE valid_to IS NOT NULL AND valid_from > valid_to"
+        ).fetchone()[0]
+        if bad_order:
+            problems.append(f"history/{typ} byid: {bad_order} row(s) with valid_from > valid_to")
+
+        bad_minor = con.execute(f"""
+            SELECT count(*) FROM (
+                SELECT id, version, minor, timestamp,
+                       max(CASE WHEN minor = 0 THEN timestamp END) OVER (PARTITION BY id, version) AS own_ts
+                FROM read_parquet({byid_paths!r})
+            ) WHERE minor > 0 AND timestamp IS DISTINCT FROM own_ts
+        """).fetchone()[0]
+        if bad_minor:
+            problems.append(f"history/{typ} byid: {bad_minor} minor row(s) whose timestamp differs from their minor=0 row")
+
+        byid_visible = con.execute(f"SELECT count(*) FROM read_parquet({byid_paths!r}) WHERE visible").fetchone()[0]
+        if spatial_parts:
+            spatial_visible = con.execute(f"SELECT count(*) FROM read_parquet({spatial_parts!r}) WHERE visible").fetchone()[0]
+            if spatial_visible != byid_visible:
+                problems.append(
+                    f"history/{typ}: spatial visible row count ({spatial_visible}) != byid visible row count ({byid_visible})"
+                )
+
+        current_parts = man.byid.get(typ, [])
+        current_paths = [str(root_path / p["path"]) for p in current_parts if (root_path / p["path"]).exists()]
+        if current_paths:
+            sample_ids = [r[0] for r in con.execute(
+                f"SELECT id FROM read_parquet({current_paths!r}) USING SAMPLE 10000 ROWS"
+            ).fetchall()]
+            if sample_ids:
+                mismatches = con.execute(f"""
+                    WITH latest AS (
+                        SELECT id, version FROM (
+                            SELECT id, version, row_number() OVER (
+                                PARTITION BY id ORDER BY valid_from DESC, visible DESC, version DESC, minor DESC
+                            ) AS rn
+                            FROM read_parquet({byid_paths!r}) WHERE id IN ?
+                        ) WHERE rn = 1
+                    )
+                    SELECT count(*) FROM read_parquet({current_paths!r}) c
+                    JOIN latest l ON l.id = c.id AND l.version != c.version
+                    WHERE c.id IN ?
+                """, [sample_ids, sample_ids]).fetchone()[0]
+                if mismatches:
+                    problems.append(
+                        f"history/{typ}: {mismatches} of {len(sample_ids)} sampled id(s) have a latest history "
+                        "version that disagrees with the current table"
+                    )
+        info.append(f"checked history/{typ}")
 
 
 def _esc(path: Path) -> str:
@@ -271,4 +351,18 @@ def _paths_and_rows(man: manifest_mod.Manifest) -> list[tuple[str, int | None]]:
             out.append((way_index_entry["path"], way_index_entry.get("rows")))
         for entry in man.areas.get("cells", {}).values():
             out.append((entry["path"], entry.get("rows")))
+    if man.history:
+        for _typ, cells in man.history.get("spatial", {}).items():
+            for _cell, parts in cells.items():
+                for part in parts:
+                    out.append((part["path"], part.get("rows")))
+        for _typ, parts in man.history.get("byid", {}).items():
+            for part in parts:
+                out.append((part["path"], part.get("rows")))
+        for _tier, entry in man.history.get("tiers", {}).items():
+            for _typ, table_files in entry.get("files", {}).items():
+                if isinstance(table_files, dict):
+                    for _kind, p in table_files.items():
+                        if p:
+                            out.append((p, None))
     return out

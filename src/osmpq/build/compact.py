@@ -682,69 +682,25 @@ def _compact_areas(
 # fill `valid_to` for rows that now have a successor, hardlink the rest,
 # clear `history.tiers`, bump `history.generation`.
 #
-# `_history_write_spatial`/`_history_write_byid` below are a *local stub*
-# standing in for W1's `history/writer.py` (docs/m4-contracts.md section
-# 4.2: "write_spatial(con, root, gen, type, table, cells: Optional[set])" /
-# "write_byid(con, root, gen, type, table)", returning the section 2.3
-# manifest fragments) -- at merge time the coordinator can replace these
-# two functions' bodies with calls into the real module without touching
-# any of their callers, since the call signature already matches.
+# `_history_write_spatial`/`_history_write_byid` delegate to the shared
+# history writer (`osmpq.history.writer`, docs/m4-contracts.md section
+# 4.2) so compaction, the builder and the test fixtures write identical
+# files.
 # --------------------------------------------------------------------------
 
 
 def _history_write_spatial(
     con, root: Path, gen: str, typ: str, table: str, cells: Optional[set] = None,
 ) -> dict:
-    """Writes ``history/<gen>/spatial/<typ>/cell=<cell>/part-0.parquet`` for
-    each cell in ``cells`` (or every distinct cell present in ``table`` when
-    ``cells`` is None), sorted by ``(hilbert, id, valid_from)`` --
-    docs/m4-contracts.md section 2.2. `table` must already carry exactly the
-    rows to write (`SELECT *` is used verbatim). Returns the manifest
-    fragment ``{cell: [{"path","rows","bytes"}]}`` (section 2.3's
-    ``history.spatial.<type>`` shape). One part per cell, like this
-    module's existing way/relation spatial compaction (`_compact_flat_
-    spatial`) -- the ``<= 64MB, several parts`` split the contract allows
-    for a very large cell is not implemented here (never exercised at the
-    Bermuda/fixture scale this workstream tests at)."""
-    if cells is None:
-        cells = {r[0] for r in con.execute(f"SELECT DISTINCT cell FROM {table} WHERE cell IS NOT NULL").fetchall()}
-    out: dict = {}
-    for cell in sorted(cells):
-        rel = f"history/{gen}/spatial/{typ}/cell={cell}/part-0.parquet"
-        path = root / rel
-        cell_esc = cell.replace("'", "''")
-        sel = f"SELECT * FROM {table} WHERE cell = '{cell_esc}' ORDER BY hilbert, id, valid_from"
-        rows, size = common.copy_to_parquet(con, sel, path, row_group_size_bytes=1_000_000)
-        if rows == 0:
-            if path.exists():
-                path.unlink()
-            continue
-        out[cell] = [{"path": rel, "rows": rows, "bytes": size}]
-    return out
+    from osmpq.history import writer as history_writer
+
+    return history_writer.write_spatial(con, str(root), gen, typ, table, cells)
 
 
 def _history_write_byid(con, root: Path, gen: str, typ: str, table: str) -> list[dict]:
-    """Writes ``history/<gen>/byid/<typ>/part-<n>.parquet`` from ``table``,
-    sorted by ``(id, valid_from)``, split at ~4M rows -- section 2.2.
-    Returns the manifest fragment (list of part dicts) -- section 2.3's
-    ``history.byid.<type>`` shape."""
-    total = con.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-    out: list[dict] = []
-    if total == 0:
-        return out
-    for k, (lo, hi) in enumerate(common.range_bounds(con, table, "id", total)):
-        cond = common.range_cond("id", lo, hi)
-        rel = f"history/{gen}/byid/{typ}/part-{k:05d}.parquet"
-        path = root / rel
-        sel = f"SELECT * FROM {table} WHERE {cond} ORDER BY id, valid_from"
-        rows, size = common.copy_to_parquet(con, sel, path, row_group_size_bytes=1_000_000)
-        if rows == 0:
-            if path.exists():
-                path.unlink()
-            continue
-        min_id, max_id = _parquet_id_range(path)
-        out.append({"path": rel, "min_id": min_id, "max_id": max_id, "rows": rows, "bytes": size})
-    return out
+    from osmpq.history import writer as history_writer
+
+    return history_writer.write_byid(con, str(root), gen, typ, table)
 
 
 def _hardlink_history_spatial(root: Path, old_spatial: dict, new_generation: str, typ: str) -> tuple[dict, int]:
