@@ -196,7 +196,6 @@ def test_s3_store_write_bytes():
 def test_s3_store_exists_true_and_false():
     store, stubber = _stubbed_store()
     stubber.add_response("head_object", {}, {"Bucket": "my-bucket", "Key": "root/manifest/LATEST"})
-    from botocore.exceptions import ClientError
 
     stubber.add_client_error(
         "head_object", service_error_code="404", http_status_code=404,

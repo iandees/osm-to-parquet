@@ -1,6 +1,7 @@
 """Static file server with HTTP Range support that logs one line per request
 with the byte range served, to count object-store style range reads."""
-import sys, os, logging
+import sys
+import os
 from http.server import ThreadingHTTPServer
 from RangeHTTPServer import RangeRequestHandler
 

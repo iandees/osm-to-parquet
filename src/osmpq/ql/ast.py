@@ -17,7 +17,7 @@ Conventions
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Optional, Sequence
+from typing import Literal, Optional
 from typing import Union as TypingUnion
 
 ElementType = Literal["node", "way", "relation"]

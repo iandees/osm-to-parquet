@@ -11,21 +11,16 @@ from typing import Optional
 from osmpq.errors import RuntimeQueryError, UnsupportedError
 from osmpq.ql.ast import (
     AreaFilter,
-    AroundFilter,
     BboxFilter,
-    ChangedFilter,
     Difference,
     Foreach,
     IdFilter,
     If,
-    IfFilter,
     IsIn,
     Item,
     MapToArea,
-    NewerFilter,
     Out,
     PivotFilter,
-    PolyFilter,
     Query,
     Recurse,
     RecurseFilter,
@@ -34,10 +29,8 @@ from osmpq.ql.ast import (
     Statement,
     TagFilter,
     Timeline,
-    UidFilter,
     Union,
     Unsupported,
-    UserFilter,
 )
 
 from . import attic, catalog, hooks, idset, recurse, render, setops, sources

@@ -26,7 +26,6 @@ engine's delta read support is a different agent's concurrent work.
 """
 from __future__ import annotations
 
-import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -333,7 +332,6 @@ def test_moved_node_row_and_tombstone(root, run1, base_versions):
     row = rows[0]
     assert row["deleted"] is False
     assert row["lat_e7"] == 250000000 and row["lon_e7"] == -700000000
-    old = base_versions[f"node:{MOVE_NODE}"]
     assert row["prev_cell"] is not None
     # the node actually changed cell (moved far away): a tombstone must
     # shadow the old cell.

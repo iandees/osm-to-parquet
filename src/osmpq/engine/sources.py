@@ -656,7 +656,6 @@ def _relation_bbox_exact_filter(con, manifest: catalog.Manifest, cand_sql: str, 
             f"SELECT wb.id, wb.cell FROM read_parquet({_quote_list(way_byid_files)}) wb "
             f"JOIN {way_ids_tbl} c ON wb.id = c.id WHERE wb.cell IS NOT NULL"
         )
-        way_tc = manifest.table_cells("way")
         needed_cells = [r[0] for r in con.execute(f"SELECT DISTINCT cell FROM {way_cells_tbl}").fetchall()]
         spatial_files = _way_files(manifest, needed_cells)
         spatial_files = catalog.prune_files_by_bbox(manifest, "way", spatial_files, (we, se, ee, ne))

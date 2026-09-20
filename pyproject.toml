@@ -25,7 +25,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "ruff"]
 
 [project.scripts]
 osmpq = "osmpq.cli:main"
@@ -35,3 +35,14 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+src = ["src", "tools", "tests"]
+
+[tool.ruff.lint]
+# Correctness (pyflakes) and the pycodestyle errors; style-only rules the
+# codebase predates are left out on purpose.
+select = ["E", "F"]
+ignore = ["E501", "E702", "E741"]

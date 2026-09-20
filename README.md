@@ -1,103 +1,121 @@
 # osm-to-parquet
 
-**Goal:** an Overpass-API-compatible query service for the full OpenStreetMap
-planet whose data lives on cheap object storage (Cloudflare R2, S3) instead of
-a large local NVMe database, kept current with the minutely replication diffs.
+An Overpass-API-compatible query service for OpenStreetMap whose data lives
+on cheap object storage (Cloudflare R2, S3) instead of a large local
+database, kept current with the minutely replication diffs, with history.
 
 The public Overpass API is a great tool, but running your own instance means
-provisioning roughly 600+ GB of fast local SSD per server plus a single-writer
-update process, and every read replica repeats that cost. This project explores
-the opposite trade: put the planet in cloud-optimized columnar files on
-Cloudflare R2, use an embedded analytical engine (DuckDB) with HTTP range
-reads as the execution layer, and translate Overpass QL into queries against
-that layout. Queries mostly wait on I/O, so the query engine runs serverless
-(Cloudflare Workers in front of Cloudflare Containers that sleep when idle);
-the only always-on, stateful machine is the small updater.
+600+ GB of fast local SSD per server and a single-writer update process,
+repeated for every read replica. This project takes the opposite trade: the
+data sits in cloud-optimized Parquet files on R2, DuckDB reads them with
+HTTP range requests, and an Overpass QL front end translates each query into
+SQL over that layout. Queries mostly wait on I/O, so the query engine runs
+serverless (a Cloudflare Worker in front of Containers that sleep when
+idle); the only stateful process is a small, stateless-by-design updater.
 
-Decisions so far: R2 for storage; serverless query compute with containers
-that shut down quickly until there is real traffic; a public endpoint; the
-initial load runs on a laptop or a rented node while minutely updates run in
-a cloud container, which forces the updater to be stateless; "most real
-queries work" rather than byte-identical Overpass compatibility; full history
-back to 2012 and earlier as a real goal, prototyped on small regional history
-extracts first. See the decisions table at the top of the design document.
+Status: milestones M0-M4 are done on a Minnesota extract; the planet build
+and a real Cloudflare deploy have not been run yet. Details and what is
+left: [docs/progress.md](docs/progress.md).
 
-Status: **M4 done on Minnesota.** A Rust producer (`rust/osmpq-raw`)
-turns a PBF into the layout, a Python/DuckDB stage finishes it, a stateless
-updater keeps it current from minutely diffs (rolling delta tiers, periodic
-compaction), and a Python engine serves Overpass QL over it (local disk,
-HTTP, or R2) with tier-1 and tier-2 language support: recursion, areas,
-`around`, `poly`, `is_in`, meta filters, `foreach`/`if`, csv. The service
-has Overpass-shaped rate limits and status endpoints, a container image,
-and a Cloudflare Worker + Containers deployment with a Durable Object
-scheduler for the updater (`deploy/cloudflare`, `docs/m3-runbook.md`). The
-planet build has not been run yet (`docs/m1-runbook.md`). The repository
-name is historical and Parquet is a means, not the goal. M4 adds a history (attic) dataset kept current by the same updater, so `[date:]`, `retro`, `timeline`, `[diff:]`/`[adiff:]` and an exact `(changed:)` work from the extract's base timestamp on (`docs/m4-report.md`).
+## What works
 
-## Documents
+- **Overpass QL**: the tier-1 and tier-2 language — bbox, tag and id
+  filters, recursion (`>`, `<`, `>>`, `<<`, `(w)`, `(bn)`, ...), unions
+  and differences, `around`, `poly`, areas (`area[...]`, `(area)`,
+  `(pivot)`, `is_in`, `map_to_area`), `newer`/`changed`/`user`/`uid`,
+  `(if:)`, `foreach`, `if`, every `out` mode incl. `geom(bbox)`, JSON, XML
+  and csv output. See [docs/overpass-ql-support.md](docs/overpass-ql-support.md).
+- **History (attic)**: `[date:]`, `retro`, `timeline`, `[diff:]`/`[adiff:]`
+  and an exact `(changed:)`, from a history dataset the updater keeps
+  appending to.
+- **Compatibility**: graded query by query against a public Overpass
+  instance with [`tools/difftest.py`](tools/README.md); 77 of 89 corpus
+  rows match on Minnesota, the rest are documented differences.
+- **Operations**: `osmpq serve` with Overpass-shaped rate limits and status
+  endpoints; a stateless updater that applies minutely diffs to a root on
+  local disk or `s3://`; compaction and gc; a container image; a Cloudflare
+  Worker + Containers deployment with a Durable Object scheduler.
 
-| Document | What it covers |
+## Quick start
+
+Query the Minnesota dataset that already lives on R2 (you need read
+credentials for the bucket; the engine needs nothing on local disk):
+
+```
+git clone https://github.com/iandees/osm-to-parquet.git && cd osm-to-parquet
+uv sync                                   # Python 3.11+, https://docs.astral.sh/uv/
+export OSMPQ_ROOT=s3://osm-parquet/minnesota
+export OSMPQ_S3_KEY_ID=... OSMPQ_S3_SECRET=... OSMPQ_S3_ENDPOINT=<account>.r2.cloudflarestorage.com
+uv run osmpq serve --port 8080
+curl 'http://127.0.0.1:8080/api/interpreter' --data-urlencode \
+  'data=[out:json];node["amenity"="cafe"](44.97,-93.28,44.985,-93.255);out;'
+curl 'http://127.0.0.1:8080/api/interpreter' --data-urlencode \
+  'data=[out:json][date:"2026-09-19T06:00:00Z"];node["amenity"="cafe"](44.97,-93.28,44.985,-93.255);out meta;'
+```
+
+Point overpass turbo at `http://127.0.0.1:8080/api/` (Settings → Overpass
+API Server) and it works as a front end.
+
+Build your own dataset from a Geofabrik extract:
+
+```
+(cd rust/osmpq-raw && cargo build --release)          # Rust producer (optional: `osmpq build extract.osm.pbf root/` works without it)
+rust/osmpq-raw/target/release/osmpq-raw build minnesota-latest.osm.pbf raw/
+uv run osmpq build --raw raw/ root/                   # relations, indexes, areas, manifest
+uv run osmpq history init root/                       # start the history from the current tables
+uv run osmpq update root/ --source https://download.openstreetmap.fr/replication/north-america/us-midwest/minute --max-diffs 60
+uv run osmpq validate root/
+uv run osmpq serve --port 8080                        # OSMPQ_ROOT=root/
+```
+
+`uv run python tools/upload_root.py root/ s3://bucket/prefix` puts it on
+R2; [docs/m3-runbook.md](docs/m3-runbook.md) takes it from there to a
+public endpoint with minutely updates.
+
+## How it works
+
+1. **One snapshot, two copies.** Nodes, ways and relations as Parquet in a
+   spatial copy (adaptive quadtree cells, Hilbert-sorted, so a bbox query
+   touches a few files and row groups) and an id-sorted copy for id lookups
+   and for the updater. Ways and relations carry their resolved geometry
+   and bbox, so `out geom`, `around` and areas never join back to nodes over
+   the network; node references are kept so recursion works like Overpass.
+2. **Minutely updates as rolling deltas.** A stateless container fetches
+   the diffs, looks up the current state of what they touch from the
+   id-sorted copy, re-resolves geometry and rewrites hour/day/week delta
+   files that prune like the base. Deltas fold into a new base generation
+   at compaction. The same run appends every new state to the history.
+3. **Overpass QL → SQL.** A parser, a planner that turns each statement
+   into SQL over the manifest's files, DuckDB with the spatial extension,
+   and a renderer that produces the Overpass envelope. Attic queries flip
+   one switch in the scan layer to read the history at a point in time.
+4. **Serverless serving.** A Worker caches and rate-limits; containers run
+   the engine and sleep when idle; a Durable Object schedules the updater.
+
+The full design, cost model and roadmap: [docs/design.md](docs/design.md).
+
+## Documentation
+
+| | |
 | --- | --- |
-| [docs/prior-art.md](docs/prior-art.md) | Survey of existing projects (Overpass, Postpass, ohsome-planet, QLever, OSMExpress, GeoDesk, QuackOSM, osm-pds, DuckLake, R2 Data Catalog, ...) and what each one contributes or lacks |
-| [docs/design.md](docs/design.md) | Proposed architecture: storage layout, update pipeline, query translation, serving tier, cost model, roadmap, open questions |
-| [docs/overpass-ql-support.md](docs/overpass-ql-support.md) | Overpass QL feature matrix and the order we intend to implement it in |
-| [docs/m0-contracts.md](docs/m0-contracts.md), [docs/m0-report.md](docs/m0-report.md) | M0: exact layout, schemas, API and the Minnesota results of the first prototype |
-| [docs/m1-contracts.md](docs/m1-contracts.md), [docs/m1-report.md](docs/m1-report.md) | M1: Rust producer, layout v2 (restricted ancestor depths, row-group index, tuned encodings), engine caching, measurements |
-| [docs/m1-runbook.md](docs/m1-runbook.md) | How to build the planet on your own machine and publish it to R2 |
-| [docs/m2-contracts.md](docs/m2-contracts.md), [docs/m2-report.md](docs/m2-report.md) | M2: delta tiers, the stateless minutely updater, compaction, gc, diffcheck against the reference |
-| [docs/m3-contracts.md](docs/m3-contracts.md), [docs/m3-report.md](docs/m3-report.md) | M3: tier-2 language (areas, around, poly, is_in, meta filters, evaluators), service limits, image, updater on R2, Cloudflare deployment |
-| [docs/m4-contracts.md](docs/m4-contracts.md), [docs/m4-report.md](docs/m4-report.md) | M4: history dataset (`osmpq history init`/`build`, updater appends, compaction fold) and the attic language: `[date:]`, `retro`, `timeline`, `[diff:]`/`[adiff:]`, exact `(changed:)` |
-| [docs/m3-runbook.md](docs/m3-runbook.md) | From a built dataset on R2 to a public endpoint with minutely updates |
+| [docs/api.md](docs/api.md) | The HTTP API: endpoints, formats, limits, configuration |
+| [docs/cli.md](docs/cli.md) | Every `osmpq` and `osmpq-raw` command and the tools |
+| [docs/development.md](docs/development.md) | Setup, code map, tests, harness, conventions |
+| [docs/overpass-ql-support.md](docs/overpass-ql-support.md) | Overpass QL feature matrix and documented differences |
+| [docs/design.md](docs/design.md) | Architecture: layout, updates, query translation, serving, costs, roadmap |
+| [docs/prior-art.md](docs/prior-art.md) | Existing projects and what each contributes or lacks |
+| [docs/progress.md](docs/progress.md) | Milestone status, measurements, what is left |
+| [docs/m1-runbook.md](docs/m1-runbook.md), [docs/m3-runbook.md](docs/m3-runbook.md) | Building the planet; deploying to Cloudflare |
+| `docs/m0-` … `m4-contracts.md`, `-report.md` | Per-milestone contracts and reports |
 
-## Running it
+## Development
 
 ```
-pip install -e '.[dev]'                       # Python side (DuckDB 1.5, pyarrow, FastAPI)
-(cd rust/osmpq-raw && cargo build --release)  # Rust producer
-osmpq-raw build extract.osm.pbf raw/          # PBF -> raw layout
-osmpq build --raw raw/ root/                  # raw -> dataset root (relations, indexes, manifest)
-osmpq validate root/
-osmpq serve --port 8080                       # OSMPQ_ROOT=root/; /api/interpreter, /api/status, /healthz
-osmpq update root/ --once                     # apply pending minutely diffs (see docs/m2-contracts.md)
-curl 'http://127.0.0.1:8080/api/interpreter' --data-urlencode 'data=[out:json];node(44.97,-93.28,44.985,-93.255)["amenity"="cafe"];out;'
+uv sync --extra dev
+uv run ruff check src tools tests
+uv run pytest tests -q
 ```
 
-`osmpq build extract.osm.pbf root/` does the same without Rust (slower, and
-untagged nodes get no metadata). `tools/difftest.py` compares a server
-against a real Overpass instance over `tests/corpus`; `tools/remote_profile.py`
-counts range requests and bytes per query over HTTP.
-
-## Short version of the design
-
-1. **Base snapshot, two copies.** Convert the planet PBF into Parquet tables
-   for nodes, ways and relations in two sort orders: a spatial copy
-   (partitioned by adaptive quadtree cell, Hilbert-sorted inside each file, so
-   a bounding-box query touches a few files and a few row groups) and an
-   id-sorted copy that serves id lookups and replaces the local replication
-   store an updater would otherwise need. Plus reverse membership indexes and
-   derived areas.
-2. **Denormalized geometry.** Ways and relations carry their resolved
-   geometry and bounding box so the common case (`out geom`, `area`, `around`)
-   never has to join back to nodes over the network. Node references are kept
-   too, so `>` / `<` recursion still works exactly like Overpass.
-3. **Minutely updates as rolling deltas, from a stateless container.** A
-   scheduled container fetches the `.osc`, looks up the current state of
-   everything it touches from the id-sorted copy on R2, re-resolves geometry,
-   and rewrites three rolling delta files (hour, day, week) that prune like
-   the base. A cold reader needs one manifest fetch and then
-   reads base cells plus at most three delta files; last version wins.
-   Deltas fold into a new base generation weekly.
-4. **Overpass QL front end, serverless.** A Worker handles caching and rate
-   limits; a container runs the parser, a planner that turns each statement
-   into SQL over the lake, and DuckDB. Output is Overpass-shaped JSON/XML so
-   overpass turbo, JOSM and existing clients work for the common subset.
-5. **History as an Iceberg table.** An append-only history dataset on R2 Data
-   Catalog with `valid_from`/`valid_to` per element state (including minor
-   versions caused by node moves) backs `date:` / `retro` / `timeline` /
-   `diff` / `adiff`, loaded from the full-history planet in a later phase.
-
-Nobody appears to have built exactly this. The closest existing pieces are
-ohsome-planet (minutely-updated GeoParquet, no query language), Postpass
-(Overpass-like service over PostGIS with SQL instead of Overpass QL), and
-QLever's `osm-live-updates` (minutely planet updates into a SPARQL engine).
-See the prior-art document for details and links.
+CI runs lint, the tests, the Rust build and the Worker's typecheck and
+tests on every pull request. The repository name is historical: Parquet is
+a means, not the goal.

@@ -945,7 +945,6 @@ def build(
         }
 
     # ---------------------------------------------------------------- byid
-    node_to_cell = {n["id"]: n["cell"] for n in nodes}
     sorted_nodes = sorted(nodes, key=lambda n: n["id"])
     mid = len(sorted_nodes) // 2
     node_parts = [sorted_nodes[:mid], sorted_nodes[mid:]]

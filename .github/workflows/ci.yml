@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    name: lint and tests (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install
+        run: uv sync --extra dev --frozen
+      - name: Lint
+        run: uv run ruff check src tools tests
+      - name: Cache DuckDB extensions
+        uses: actions/cache@v4
+        with:
+          path: ~/.duckdb/extensions
+          key: duckdb-extensions-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+      - name: Tests
+        # The suites that need data/bermuda-latest.osm.pbf skip themselves
+        # when the file is absent (docs/development.md).
+        run: uv run pytest tests -q
+      - name: Corpus self-test
+        run: uv run python tests/corpus/selftest.py
+
+  rust:
+    name: build (Rust producer)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust/osmpq-raw
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/osmpq-raw
+      - run: cargo build --release --locked
+      - run: cargo test --release --locked
+
+  worker:
+    name: typecheck and tests (Cloudflare Worker)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: deploy/cloudflare
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: deploy/cloudflare/package-lock.json
+      - run: npm ci
+      - run: npm run cf-typegen
+      - run: npm run typecheck
+      - run: npm test

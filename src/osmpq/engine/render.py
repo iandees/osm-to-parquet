@@ -53,7 +53,6 @@ from typing import Optional
 from osmpq.ql.ast import Out
 
 from . import catalog, idset, sources
-from .schema import CANONICAL_COLUMNS
 
 MEMBER_TYPE_NAME = {"n": "node", "w": "way", "r": "relation"}
 

@@ -11,12 +11,15 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Only `pyproject.toml` + `src` are needed to `pip install .` -- see
+# Python dependencies come from `uv.lock` (uv is the project's package
+# manager); only `pyproject.toml`, `uv.lock` and `src` are needed -- see
 # .dockerignore for everything else (data/, the Rust target dir, the
 # corpus harness cache) that would otherwise bloat the build context.
-COPY pyproject.toml /app/pyproject.toml
+COPY --from=ghcr.io/astral-sh/uv:0.8 /uv /usr/local/bin/uv
+COPY pyproject.toml uv.lock /app/
 COPY src /app/src
-RUN pip install --no-cache-dir .
+RUN uv sync --frozen --no-dev --no-editable
+ENV PATH="/app/.venv/bin:$PATH"
 
 # Install the `spatial`/`httpfs` DuckDB extensions *now*, into this image's
 # HOME (root's -- a small, single-purpose service image, so no dedicated

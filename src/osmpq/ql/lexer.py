@@ -19,7 +19,7 @@ whitespace between them (see ``Parser.parse_bare_or_string``).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 from osmpq.errors import ParseError
 

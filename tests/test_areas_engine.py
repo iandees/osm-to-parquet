@@ -210,7 +210,7 @@ def test_area_query_by_tag_building_only_excluded(engine_v4, fixture_v4):
     """A building-only closed way (101) is not found by `area[...]` (no
     way-index qualifying key), even though it's still an area for
     is_in/(area)/(pivot)/map_to_area (9 fact 1)."""
-    r = engine_v4.run(f'[out:json]; area[building="yes"]; out;')
+    r = engine_v4.run('[out:json]; area[building="yes"]; out;')
     assert fixture_v4.closed_way_id not in _ids(r)
 
 

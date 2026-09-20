@@ -5,7 +5,12 @@ scratchpad/range_server.py (one line per request: METHOD PATH bytes=a-b STATUS).
 Usage: python tools/remote_profile.py --root http://127.0.0.1:8090 --log <range_server.log> \
            --corpus tests/corpus --bbox-name downtown_minneapolis [--repeat 2] [--json out.json]
 """
-import argparse, glob, json, os, re, sys, time
+import argparse
+import glob
+import json
+import os
+import re
+import time
 from pathlib import Path
 
 from osmpq.engine import Engine

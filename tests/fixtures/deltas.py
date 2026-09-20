@@ -378,7 +378,6 @@ def write_deltas(
         for etype, id_, spec in entries:
             row_seq = seq
             seq += 1
-            ts = f"2026-09-19T01:00:00Z"  # placeholder overwritten below via minute offset
             minutes = row_seq - seq_start
             ts_literal = f"TIMESTAMP '{base_timestamp[:19].replace('T',' ')}' + INTERVAL ({minutes}) MINUTE"
             # Materialize the actual timestamp string via DuckDB so row dicts
@@ -522,7 +521,6 @@ def write_deltas(
                 relation_byid.append(_relation_byid_live(new_row, prev_cell, row_seq, promoted_keys))
 
         seq_to = seq - 1
-        tier_dir = root_path / "delta" / generation / tier / str(version)
 
         def _write(rows: list[str], rel_path: str) -> str:
             sql = " UNION ALL ".join(rows) if rows else None

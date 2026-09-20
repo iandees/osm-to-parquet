@@ -48,7 +48,6 @@ docs/m3-contracts.md section 5.2).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 from osmpq.errors import ParseError
 
