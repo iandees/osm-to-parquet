@@ -447,6 +447,11 @@ def _classify_element_problems(
     return tag_mismatches, other_mismatches
 
 
+# Set from --history-since: reference timeline states that expired at or
+# before this instant predate the local history and are not expected.
+HISTORY_SINCE: Optional[str] = None
+
+
 def compare_timeline(ref_elements: list[dict[str, Any]], local_elements: list[dict[str, Any]]) -> Comparison:
     """`timeline(...)` results are compared as a set of tag dicts, ignoring
     the synthetic per-query `id` (docs/m4-contracts.md section 7): the
@@ -456,7 +461,13 @@ def compare_timeline(ref_elements: list[dict[str, Any]], local_elements: list[di
     refversion, created, expired) fully describe the state, so a multiset
     of tag dicts is the right comparison -- a Counter in case two states
     ever come out with identical tags."""
-    ref_counter = Counter(frozenset((e.get("tags") or {}).items()) for e in ref_elements if e.get("type") == "timeline")
+    since = HISTORY_SINCE
+    ref_counter = Counter(
+        frozenset((e.get("tags") or {}).items())
+        for e in ref_elements
+        if e.get("type") == "timeline"
+        and not (since and (e.get("tags") or {}).get("expired") and (e.get("tags") or {})["expired"] <= since)
+    )
     local_counter = Counter(
         frozenset((e.get("tags") or {}).items()) for e in local_elements if e.get("type") == "timeline"
     )
@@ -741,6 +752,8 @@ def _run_csv_task(
         # implement `[date:]` (attic) queries at all.
         ref_query = prepend_date(ref_query, args.date)
     local_query = substituted
+    if args.local_date and should_apply_date(local_query):
+        local_query = prepend_date(local_query, args.local_date)
 
     key = cache_key(qfile.name, bbox_name, ref_query)
     cpath = cache_path(corpus_dir, key)
@@ -828,6 +841,8 @@ def _run_diff_task(
     if args.date and should_apply_date(ref_query):
         ref_query = prepend_date(ref_query, args.date)
     local_query = force_out_xml(substituted)
+    if args.local_date and should_apply_date(local_query):
+        local_query = prepend_date(local_query, args.local_date)
 
     key = cache_key(qfile.name, bbox_name, ref_query)
     cpath = cache_path(corpus_dir, key)
@@ -968,6 +983,8 @@ def run(args: argparse.Namespace) -> int:
                 if args.date and should_apply_date(ref_query):
                     ref_query = prepend_date(ref_query, args.date)
                 local_query_json = force_out_json(substituted)
+                if args.local_date and should_apply_date(local_query_json):
+                    local_query_json = prepend_date(local_query_json, args.local_date)
 
                 key = cache_key(qfile.name, bbox_name, ref_query)
                 cpath = cache_path(corpus_dir, key)
@@ -1262,6 +1279,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--corpus", default=DEFAULT_CORPUS, help="Directory of *.overpassql files")
     p.add_argument("--bboxes", default=DEFAULT_BBOXES, help="Path to bboxes.json")
     p.add_argument("--date", default=None, help='Value for [date:"..."], reference side only')
+    p.add_argument(
+        "--local-date", default=None,
+        help='Value for [date:"..."] on the local side: grades a local dataset that has moved past the cached '
+        "reference answers by asking it for the state at the reference's date (needs history in the dataset)",
+    )
+    p.add_argument(
+        "--history-since", default=None,
+        help="ISO instant the local history starts at: reference timeline entries that expired at or before it "
+        "are not expected locally",
+    )
     p.add_argument("--only", default=None, help="Glob to filter corpus file names")
     p.add_argument("--bbox-name", default=None, help="Run every query against just this bbox")
     p.add_argument("--json", default=None, help="Write the full report to this JSON file")
@@ -1279,6 +1306,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Only call --local, comparing against previously cached reference responses",
     )
     args = p.parse_args(argv)
+    global HISTORY_SINCE
+    HISTORY_SINCE = args.history_since
 
     if args.local_only and args.reference_only:
         p.error("--reference-only and --local-only are mutually exclusive")
