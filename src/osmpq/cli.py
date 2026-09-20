@@ -245,7 +245,10 @@ def main(argv: list[str] | None = None) -> int:
         from osmpq.build.gc import gc_main
         return gc_main(argv[1:])
 
-    parser = argparse.ArgumentParser(prog="osmpq")
+    parser = argparse.ArgumentParser(
+        prog="osmpq",
+        epilog="also: `osmpq compact <root>` and `osmpq gc <root>` (each has its own --help); docs/cli.md lists everything",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_raw = sub.add_parser("raw-py", help="produce raw/ from a PBF with DuckDB (no Rust binary needed)")
