@@ -212,6 +212,38 @@ def raw_state_row(con, manifest: catalog.Manifest, element_type: str, element_id
     return dict(zip(cols, row))
 
 
+def raw_state_rows(con, manifest: catalog.Manifest, element_type: str, ids: list[int], t: datetime) -> dict[int, dict]:
+    """`raw_state_row` for many ids in one scan: (id) -> the history row
+    that is the state of `(element_type, id)` at `t`, filters ignored. One
+    pass over the byid history files (plus tiers) for the whole id list,
+    instead of one per id -- diff/adiff's stubs need it for every
+    one-sided id, and a wide bbox has hundreds of them."""
+    ids = sorted(set(int(i) for i in ids))
+    if not ids:
+        return {}
+    t_sql = _t_sql(t)
+    base_files = [manifest.path(p["path"]) for p in manifest.history_byid_parts(element_type)]
+    tier_files = manifest.history_tier_byid_files(element_type)
+    if not base_files and not tier_files:
+        return {}
+    id_pred = f"id IN ({','.join(str(i) for i in ids)})"
+    parts = []
+    if base_files:
+        parts.append(
+            f"SELECT * FROM read_parquet({_quote_list(base_files)}, union_by_name=true)\n"
+            f"WHERE ({id_pred}) AND {hschema.validity_predicate(t_sql)}"
+        )
+    if tier_files:
+        parts.append(
+            f"SELECT * FROM read_parquet({_quote_list(tier_files)}, union_by_name=true)\n"
+            f"WHERE ({id_pred}) AND {hschema.validity_predicate(t_sql, with_valid_to=False)}"
+        )
+    inner_sql = "\nUNION ALL BY NAME\n".join(parts)
+    cur = con.execute(hschema.state_at_sql(inner_sql, t_sql))
+    cols = [d[0] for d in cur.description]
+    return {row[cols.index("id")]: dict(zip(cols, row)) for row in cur.fetchall()}
+
+
 def history_way_geometry_by_id(con, manifest: catalog.Manifest, ids: list[int], t: datetime) -> dict[int, str]:
     """(way id) -> WKT geometry at `t`, resolved from the history byid
     files (which, like the current byid copy, carry no `geometry` column
@@ -682,6 +714,26 @@ def build_diff_actions(
                 return True
         return old != new
 
+    # adiff: one batched raw-state lookup per type and endpoint for every
+    # one-sided id (a per-id lookup costs a scan of the byid history each).
+    raw_at_a: dict[tuple, dict] = {}
+    raw_at_b: dict[tuple, dict] = {}
+    if augmented:
+        only_b: dict[str, list[int]] = {}
+        only_a: dict[str, list[int]] = {}
+        for key in by_key_b:
+            if key not in by_key_a:
+                only_b.setdefault(key[0], []).append(key[1])
+        for key in by_key_a:
+            if key not in by_key_b:
+                only_a.setdefault(key[0], []).append(key[1])
+        for typ, ids in only_b.items():
+            for i, row in raw_state_rows(con, manifest, typ, ids, t_a).items():
+                raw_at_a[(typ, i)] = row
+        for typ, ids in only_a.items():
+            for i, row in raw_state_rows(con, manifest, typ, ids, t_b).items():
+                raw_at_b[(typ, i)] = row
+
     actions: list[dict] = []
     seen: set[tuple] = set()
     for el in pass_b.elements:
@@ -692,7 +744,7 @@ def build_diff_actions(
         old = by_key_a.get(key)
         if old is None:
             if augmented:
-                raw = raw_state_row(con, manifest, key[0], key[1], t_a)
+                raw = raw_at_a.get(key)
                 if raw is not None:
                     actions.append({"action": "modify", "type": key[0], "id": key[1],
                                      "old": stub_element(key[0], raw, show_visible=False), "new": el})
@@ -711,7 +763,7 @@ def build_diff_actions(
             continue
         action: dict = {"action": "delete", "type": key[0], "id": key[1], "old": el}
         if augmented:
-            raw = raw_state_row(con, manifest, key[0], key[1], t_b)
+            raw = raw_at_b.get(key)
             if raw is not None:
                 action["new"] = stub_element(key[0], raw, show_visible=True)
         actions.append(action)

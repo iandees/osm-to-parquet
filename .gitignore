@@ -4,3 +4,4 @@ __pycache__/
 .pytest_cache/
 tests/corpus/.cache/
 rust/osmpq-raw/target/
+.tmp/

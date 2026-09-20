@@ -406,6 +406,13 @@ class Engine:
         # in this module's docstring.
         self._db.execute("SET enable_object_cache=true")
         self._db.execute("SET enable_http_metadata_cache=true")
+        # An in-memory DuckDB spills to `<cwd>/.tmp` by default, which two
+        # engines in the same directory (a server and a script) would
+        # share and corrupt for each other; give each engine its own.
+        import tempfile
+
+        self._temp_dir = tempfile.mkdtemp(prefix="osmpq-duckdb-")
+        self._db.execute(f"SET temp_directory='{self._temp_dir}'")
 
         threads = self.duckdb_config.get("threads")
         if threads:
