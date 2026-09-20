@@ -69,6 +69,30 @@ Code:
   chunked sort for a root-level way cell (M1 caveat) is implemented but
   untested at actual planet scale (no real planet-scale run has happened
   yet -- see docs/m1-report.md).
+- ~~`--node-store auto` picked `dense-file` for a country-scale extract and
+  tried to allocate ~113.6 GB~~ found and fixed attempting a real whole-US
+  build (Geofabrik's combined US extract, 1.596B nodes, max id 14.2B, so
+  only ~11.2% id density): `dense-file` sizes its file by `max_id`, not
+  actual node count, and -- a separate finding -- isn't meaningfully sparse
+  on disk at any density measured here (planet's ~70% density still leaves
+  every 4 KiB block touched); it filled a 107 GB-free disk in ~14 minutes.
+  Added a third node-store mode, `sorted-file` (an mmap-backed sorted
+  array sized by actual node count, ~25.6 GB for this input, vs.
+  `sorted-mem`'s same-sized hard RAM commitment or `dense-file`'s
+  oversized disk file); `--node-store auto` now picks between the three
+  by comparing real disk cost (`docs/m1-contracts.md` section 3.1).
+  Validated against the real whole-US PBF: the node store itself
+  populated correctly and reached its exact target size across several
+  attempts, once the machine had enough free RAM (the same Mac had ~30 GB
+  already committed to other running applications at one point, which is
+  a real-world constraint, not a flaw in the fix). **Separately found,
+  not yet fixed**: per-cell node spill (same spill-then-sort mechanism as
+  the way-cell fix above) reached 78+ GB and was still growing at 84% of
+  the node pass on this input -- true peak is likely 90-100+ GB on top of
+  the 25.6 GB store, i.e. whole-US's node pass alone needs on the order of
+  130-150 GB peak disk, which didn't fit this laptop's available disk.
+  The whole-US build was not completed locally; `docs/m1-runbook.md`'s
+  "Suggested cloud instance" (3.75 TB NVMe) has no such constraint.
 - **Language**: `compare`, `for`, `complete`, `make`/`convert`, `local`,
   `popup`/`custom` outputs, `way_cnt`/`way_link`; `retro` with evaluator
   arguments beyond the M3 subset.

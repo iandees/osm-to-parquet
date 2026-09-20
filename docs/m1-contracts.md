@@ -112,16 +112,46 @@ INT64. `hilbert UINT64`. Column names and order exactly as the M0 schemas.
 ### 3.1 Node location store
 
 `--node-store auto` picks `sorted-mem` when the pass-1 node count is below
-`--sorted-mem-max` (default 400M) and `dense-file` otherwise.
+`--sorted-mem-max` (default 400M); above that, it picks `dense-file` when
+`max_id + 1 <= 4 * node_count` (id density >= 25%) and `sorted-file`
+otherwise. The threshold compares each mode's disk footprint
+(`8*(max_id+1)` vs `16*node_count`) rather than always preferring one --
+see the code comment at the selection site in `main.rs` for the derivation.
 
 - `sorted-mem`: a `Vec<(i64, i32, i32)>` appended in id order during pass 2,
   binary-searched in pass 3. 16 bytes per node; Minnesota ≈ 0.9 GB.
 - `dense-file`: a file of `[i32 lat_e7, i32 lon_e7]` indexed by node id
   (`--flat-nodes`, default `<tmpdir>/nodes.flat`), written with sparse
-  seeks, read through mmap in pass 3. Planet ≈ 8 bytes × max id ≈ 110 GB of
-  sparse file, the same approach as osm2pgsql's `--flat-nodes` and
-  osmium's `dense_file_array`; needs a machine whose page cache can hold most
-  of it. An unset entry (both zero, or a sentinel `i32::MIN`) means missing.
+  seeks, read through mmap in pass 3, the same approach as osm2pgsql's
+  `--flat-nodes` and osmium's `dense_file_array`; needs a machine whose page
+  cache can hold most of it. An unset entry (both zero, or a sentinel
+  `i32::MIN`) means missing. Sized `8*(max_id+1)` bytes -- correct only
+  when density is high enough that most 4 KiB blocks end up touched anyway
+  (see the `sorted-file` note below for why "sparse" is not actually
+  accurate at any density this project has measured).
+- `sorted-file`: same sorted `(id: i64, lat_e7: i32, lon_e7: i32)` layout
+  and append-in-id-order/binary-search approach as `sorted-mem`, but
+  backed by an mmap'd file (`--flat-nodes`, same flag `dense-file` uses)
+  sized `16 * node_count` bytes -- the pass-1 histogram's exact count, not
+  the id range -- instead of a `Vec` held in process RAM. For a country
+  extract (global OSM ids scattered thinly across the full id range, not
+  clustered), `dense-file`'s nominal sparse-file size is dominated by
+  `max_id`, which can be far larger than the actual node count; `dense-file`
+  is also not meaningfully sparse *on disk* at any density found here --
+  with ids landing roughly uniformly, the probability that a 4 KiB block
+  (512 entries) stays untouched is `(1-density)^512`, which is
+  indistinguishable from zero at both whole-US density (~11.2%: 1.6B
+  nodes, max id 14.2B) and planet density (~70%: ~10B nodes, similar max
+  id) -- i.e. `dense-file` ends up fully realized on disk either way, and
+  its "sparse" framing in this doc and `docs/m1-runbook.md` is inaccurate;
+  it is still the right planet-scale choice because its *nominal* size
+  wins outright at that density (no id stored per entry), not because it
+  stays sparse. Found and fixed after `--node-store auto` picked
+  `dense-file` for a real whole-US build (Geofabrik's combined US extract,
+  1.596B nodes, max id 14.2B) and tried to allocate a ~113.6 GB file,
+  filling a 107 GB-free disk in ~14 minutes; `sorted-file` needs ~25.6 GB
+  for the same input. See `docs/progress.md` for the full incident and
+  validation notes.
 
 ### 3.2 Spill and sort
 

@@ -125,14 +125,35 @@ fn run_build(args: BuildArgs) -> Result<()> {
     let leaf_index = cells::LeafIndex::new(&leaves, args.max_depth);
 
     // ---- node location store selection -------------------------------------
+    //
+    // `auto`'s "many nodes" branch picks between `dense-file` and
+    // `sorted-file` by comparing their disk footprints rather than always
+    // preferring one: `dense-file` costs `8 * (max_id + 1)` bytes (no id
+    // stored, indexed directly), `sorted-file` costs `16 * node_count`
+    // bytes (id + lat + lon, exact count). `dense-file` is worth its
+    // simplicity/O(1) lookup only when it isn't *meaningfully larger* than
+    // `sorted-file` would be -- i.e. when id density (node_count / max_id)
+    // is high enough. Requiring `dense_file_bytes <= 2 * sorted_file_bytes`
+    // (within a 2x factor) works out to `max_id + 1 <= 4 * node_count`, a
+    // simple threshold on max_id alone. At whole-US extract density
+    // (~11.2%: 1.6B nodes, max id 14.2B -- global ids scattered thinly
+    // across a country-sized subset), max_id is ~8.9x node_count, so this
+    // picks `sorted-file`; at planet density (~70%: ~10B nodes against a
+    // max id around 14.2B, since a planet dump keeps nearly every live
+    // global id), max_id is ~1.4x node_count, so this still picks
+    // `dense-file`, matching `docs/m1-runbook.md`'s existing planet
+    // recommendation.
     let node_store_kind = match args.node_store.as_str() {
         "sorted-mem" => "sorted-mem",
         "dense-file" => "dense-file",
+        "sorted-file" => "sorted-file",
         "auto" => {
             if hist.node_count < args.sorted_mem_max {
                 "sorted-mem"
-            } else {
+            } else if (hist.max_id as u64).saturating_add(1) <= hist.node_count.saturating_mul(4) {
                 "dense-file"
+            } else {
+                "sorted-file"
             }
         }
         other => anyhow::bail!("unknown --node-store {other}"),
@@ -143,6 +164,10 @@ fn run_build(args: BuildArgs) -> Result<()> {
         "dense-file" => {
             let path = args.flat_nodes.clone().unwrap_or_else(|| tmpdir.join("nodes.flat"));
             store::NodeStoreBuilder::dense_file(&path, hist.max_id)?
+        }
+        "sorted-file" => {
+            let path = args.flat_nodes.clone().unwrap_or_else(|| tmpdir.join("nodes.flat"));
+            store::NodeStoreBuilder::sorted_file(&path, hist.node_count)?
         }
         _ => unreachable!(),
     };

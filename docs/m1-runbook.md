@@ -14,6 +14,20 @@ first run.
 | Disk | 1.5 TB NVMe | 2 TB NVMe |
 | Cores | 8 | 16-32 (PBF decoding and per-cell sorting parallelize; DuckDB stages too) |
 
+The "110 GB flat-node file" above is `dense-file`'s nominal size
+(`8*(max_id+1)`), not a truly sparse file in practice: at planet density
+(~10B nodes against a max id around 14.2B, ~70%), the probability that any
+4 KiB block (512 entries) stays untouched is indistinguishable from zero,
+so the file ends up essentially fully realized on disk -- budget the full
+~110 GB, not "mostly holes". `dense-file` is still the right choice for the
+planet specifically because its nominal size is smaller than the
+alternative (`sorted-file`, `16*node_count` ≈ 160 GB) at this density, not
+because it stays sparse. See `docs/m1-contracts.md` section 3.1 for the
+full node-store comparison, and `docs/progress.md` for where this was
+found (a real whole-US build, a much lower-density case where `dense-file`
+actually does the wrong thing and `sorted-file` -- a new node-store mode
+sized by actual node count -- is the fix).
+
 ### Suggested cloud instance
 
 Not yet run at planet scale; this is an estimate, not a measurement. Primary

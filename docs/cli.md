@@ -253,8 +253,8 @@ passes 1-5: node histogram, nodes, ways, relations, summary). Faster than
 | `--max-depth` | `13` | Maximum quadtree depth. |
 | `--threads` | all cores | Rayon thread pool size. |
 | `--promoted-keys` | the built-in 12-key list | Comma-separated tag keys to promote. |
-| `--node-store` | `auto` | `sorted-mem`, `dense-file`, or `auto` (picks `sorted-mem` under `--sorted-mem-max` nodes, else `dense-file`). |
-| `--flat-nodes` | `<tmpdir>/nodes.flat` | Backing file for `dense-file` node storage. |
+| `--node-store` | `auto` | `sorted-mem`, `dense-file`, `sorted-file`, or `auto` (picks `sorted-mem` under `--sorted-mem-max` nodes; above that, `dense-file` when id density >= 25%, else `sorted-file` -- see `docs/m1-contracts.md` section 3.1). |
+| `--flat-nodes` | `<tmpdir>/nodes.flat` | Backing file for `dense-file` or `sorted-file` node storage. |
 | `--tmpdir` | `<rawdir>/_tmp` | Scratch directory. |
 | `--bbox` | none | `S,W,N,E` cut bbox. |
 | `--sorted-mem-max` | `400000000` | Node-count threshold for the `auto` node-store choice. |
