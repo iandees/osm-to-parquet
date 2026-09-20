@@ -52,8 +52,10 @@ Code:
   current-table scans (4x cost today).
 - **Way-area index by name** for planet-scale `area[name=...]` lookups on
   closed ways (M3 follow-up); relation areas at an extract's edge.
-- **Rust producer**: chunked sort for a root-level way cell at planet scale
-  (M1 caveat); compaction rewrites the way-area index in full.
+- **Rust producer**: compaction rewrites the way-area index in full; the
+  chunked sort for a root-level way cell (M1 caveat) is implemented but
+  untested at actual planet scale (no real planet-scale run has happened
+  yet -- see docs/m1-report.md).
 - **Language**: `compare`, `for`, `complete`, `make`/`convert`, `local`,
   `popup`/`custom` outputs, `way_cnt`/`way_link`; `retro` with evaluator
   arguments beyond the M3 subset.

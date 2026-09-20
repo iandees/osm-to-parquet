@@ -35,9 +35,12 @@ per-cell sorting parallelize, so 16 cores should land well under that. Two
 caveats: the `dense-file` node store (a 110 GB sparse file, since node ids
 already reach 14.2 billion) is slower than the in-memory store unless the
 page cache holds most of it, and a root-level way cell at planet scale may
-need the chunked sort the contract allows for and the Rust code does not yet
-implement. The way pass, not the node pass, is where a 32 GB machine will
-hurt.
+need the chunked sort the contract allows for -- now implemented (chunk the
+spill file into sorted runs on disk, k-way merge them with one decoded row
+per run held in memory; see `ways.rs`'s `spill_to_sorted_runs`/
+`WayRunMerge`), but only exercised by synthetic unit tests, not by an actual
+planet-scale run in this sandbox. The way pass, not the node pass, is where
+a 32 GB machine will hurt.
 
 ## Layout v2 effect on queries (downtown Minneapolis bbox, cold DuckDB, HTTP range reads)
 

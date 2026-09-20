@@ -131,6 +131,20 @@ cell, the sort happens in memory (a leaf holds ≤ max-nodes-per-cell nodes);
 if a way cell exceeds a few GB (root-level cells can), sort in chunks and
 merge. Use `rayon` for the per-cell stage with a `--threads` bound.
 
+Implementation note (not a deviation, just specifics the contract leaves
+open): the chunked path triggers per cell once its spill file is ≥ 512 MiB
+on disk (`ways.rs`'s `WAY_CHUNK_SORT_THRESHOLD_BYTES`, chosen with headroom
+for decoded `WaySpillRow`s running several times larger than their encoded
+bytes -- see the comment there), below which the simple in-memory path
+above still runs unchanged. Above it, the spill file is streamed into
+sorted "run" files (same length-prefixed `WaySpillRow` encoding, ~512 MiB
+of encoded rows per run) written alongside it in `<tmpdir>/spill/way/`,
+then merged with a `BinaryHeap`-based k-way merge that holds one decoded
+row per run at a time -- bounded by run count, not total row count. This is
+still per-cell, sequential work inside the existing `rayon` per-cell
+closure, so it adds no parallelism beyond the `--threads` bound already in
+place for the per-cell stage.
+
 ### 3.3 node_way index
 
 `osmpq-raw node-way-index <rawdir>`: reads `rawdir/way/part-*.parquet`,
