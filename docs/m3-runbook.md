@@ -40,6 +40,34 @@ rclone ls r2:osm-planet/current/manifest/LATEST
 Record the path you synced to (`s3://osm-planet/current` here) — it's
 `OSMPQ_ROOT` below.
 
+## 2a. History (M4): give the root an attic before syncing
+
+A root gets its history dataset in two steps (`docs/m4-contracts.md`
+sections 2 and 5; `tools/m4_dataset.sh` is the scripted version):
+
+```
+osmpq history init /fast/root --threads 4 --memory-limit 6GB --tmpdir /fast/tmp
+osmpq update /fast/root --source <replication url> --max-diffs 60   # repeat until current
+osmpq compact /fast/root && osmpq gc /fast/root --keep 1
+osmpq validate /fast/root
+```
+
+`history init` turns every current row into its first state (one Parquet
+file at a time, flat memory: 70 s and 2.6 GB for Minnesota); every later
+`osmpq update` run appends the new versions, minor versions and
+tombstones to the rolling history tiers, and `osmpq compact` folds them
+into the base history. `[date:]`, `retro`, `timeline`, `[diff:]`/`[adiff:]`
+and exact `(changed:)` then work from the base timestamp on. Without a
+`history` section in the manifest those settings return the "no history"
+error and nothing else changes.
+
+`tools/upload_root.py /fast/root s3://<bucket>/<prefix>` uploads exactly
+the files the latest manifest references (manifest last), resuming where
+it left off; it reads the same `OSMPQ_S3_*` variables as the engine.
+Minnesota with history (5.3 GB, 1,333 files) took 102 s to R2 from the
+development sandbox. The engine and the updater then take the `s3://`
+root directly (`OSMPQ_ROOT`, or `osmpq update s3://... --source ...`).
+
 ## 3. Install and configure `deploy/cloudflare`
 
 ```

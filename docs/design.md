@@ -650,9 +650,12 @@ and copy no code; this project can be Apache-2/MIT.
 - Tier-2 features (areas, around, poly, is_in, changed/newer/user,
   foreach/if), rate limits, status endpoints, monitoring, docs.
 
-**M4: history**
-- Regional history extract → Iceberg history table → `[date:]`/`retro`/
-  `timeline`/`diff`/`adiff`; then the full-history planet load.
+**M4: history** (done on Minnesota; see `docs/m4-report.md`)
+- History dataset under the manifest (section 4.5 amendment), started from
+  the current tables and appended by the updater; `[date:]`/`retro`/
+  `timeline`/`diff`/`adiff`/exact `changed`. The full-history planet load
+  (`osmpq history build --osh`) needs the chunked node pass noted in the
+  report before it fits a 15 GB machine.
 
 **M5: extras** — CSV/popup/custom outputs, evaluators/`make`/`convert`,
 DuckDB-Wasm browser mode.
