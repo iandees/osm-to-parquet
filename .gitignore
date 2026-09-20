@@ -6,3 +6,4 @@ tests/corpus/.cache/
 rust/osmpq-raw/target/
 .tmp/
 .venv/
+.env
