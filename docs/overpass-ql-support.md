@@ -12,6 +12,19 @@ goals; differences are documented rather than chased.
 Legend: T1 = milestone 0/1 (must have for overpass turbo and JOSM to work),
 T2 = milestone 3, T3 = milestone 5, T4 = attic (milestone 4), N = not planned.
 
+## Status after M4
+
+The T4 (attic) rows below are implemented in M4 on a history dataset
+that starts at the extract's base timestamp (`docs/m4-report.md`).
+Documented differences: `timeline` lists only the versions the history
+knows (a regional dataset knows nothing before its base timestamp);
+`[date:]` before the history's start answers from the earliest known
+state with a `remark`; `(changed:)` cannot be graded against the
+reference (it runs out of memory there); areas are not versioned, so
+area filters under `[date:]` use the current areas; JSON output for
+`[diff:]`/`[adiff:]` is an extension (the reference only renders XML);
+`compare` is not implemented.
+
 ## Status after M3
 
 Everything marked T1 and T2 below is implemented and graded against a
@@ -51,8 +64,8 @@ differences from the reference:
 | `[timeout:n]` | T1 | Cancels the DuckDB query; Overpass-style runtime error remark |
 | `[maxsize:n]` | T1 | Maps to DuckDB memory limit for the query |
 | `[bbox:s,w,n,e]` | T1 | Global bbox applied to every query statement |
-| `[date:"..."]` | T4 | History table, `valid_from <= t < valid_to` |
-| `[diff:"a","b"]`, `[adiff:"a","b"]` | T4 | Attic |
+| `[date:"..."]` | T4 | Done in M4: state at `t` from the history dataset (`docs/m4-contracts.md` 3.1) |
+| `[diff:"a","b"]`, `[adiff:"a","b"]` | T4 | Done in M4: two snapshot passes, XML actions as the reference; JSON is our extension |
 
 ## Query statements and filters
 
@@ -70,7 +83,7 @@ differences from the reference:
 | `(poly:"lat lon ...")` | T2 | |
 | `(area)`, `(area.set)`, `(area:id)` | T2 | Node: point in polygon; way: any vertex inside; relation: any member vertex inside |
 | `(pivot)`, `(pivot.set)` | T2 | |
-| `(newer:"ts")`, `(changed:"a")`, `(changed:"a","b")` | T2 | Meta columns; `changed` with a range needs history (T4) for exactness, T2 uses the current version's timestamp |
+| `(newer:"ts")`, `(changed:"a")`, `(changed:"a","b")` | T2/T4 | Exact from the history rows when the dataset has history (M4); meta columns otherwise |
 | `(user:"name")`, `(uid:n)` | T2 | |
 | `(if: expr)` | T2 | Element-scoped evaluator subset compiled to SQL (done in M3) |
 | `way_cnt`, `way_link` | T3 | Node-degree filters; needs node→way index or a scan |
@@ -85,7 +98,7 @@ differences from the reference:
 | `>` , `>>` , `<` , `<<` | T1 | Core recursion |
 | `is_in`, `is_in(lat,lon)` | T2 | |
 | `map_to_area` | T2 | Set of ways/relations → area ids |
-| `timeline` | T4 | Attic |
+| `timeline` | T4 | Done in M4: one entry per own version known to the history |
 | `local` | T3 | Localized geometry representation; rarely used |
 | `convert`, `make` | T3 | Requires evaluators |
 
@@ -100,7 +113,8 @@ differences from the reference:
 | `foreach { }`, `foreach.a->.b { }` | T2 | Planner loop |
 | `for (expr) { }` | T3 | |
 | `complete { }` | T3 | Fixed-point loop |
-| `retro (ts) { }`, `compare (delta: ...) { }` | T4 | Attic |
+| `retro (ts) { }` | T4 | Done in M4: block-local snapshot, block-local sets (as the reference) |
+| `compare (delta: ...) { }` | T4 | Not implemented |
 
 ## Evaluators
 

@@ -22,7 +22,7 @@ queries work" rather than byte-identical Overpass compatibility; full history
 back to 2012 and earlier as a real goal, prototyped on small regional history
 extracts first. See the decisions table at the top of the design document.
 
-Status: **M3 done on Minnesota.** A Rust producer (`rust/osmpq-raw`)
+Status: **M4 done on Minnesota.** A Rust producer (`rust/osmpq-raw`)
 turns a PBF into the layout, a Python/DuckDB stage finishes it, a stateless
 updater keeps it current from minutely diffs (rolling delta tiers, periodic
 compaction), and a Python engine serves Overpass QL over it (local disk,
@@ -32,7 +32,7 @@ has Overpass-shaped rate limits and status endpoints, a container image,
 and a Cloudflare Worker + Containers deployment with a Durable Object
 scheduler for the updater (`deploy/cloudflare`, `docs/m3-runbook.md`). The
 planet build has not been run yet (`docs/m1-runbook.md`). The repository
-name is historical and Parquet is a means, not the goal.
+name is historical and Parquet is a means, not the goal. M4 adds a history (attic) dataset kept current by the same updater, so `[date:]`, `retro`, `timeline`, `[diff:]`/`[adiff:]` and an exact `(changed:)` work from the extract's base timestamp on (`docs/m4-report.md`).
 
 ## Documents
 
@@ -46,6 +46,7 @@ name is historical and Parquet is a means, not the goal.
 | [docs/m1-runbook.md](docs/m1-runbook.md) | How to build the planet on your own machine and publish it to R2 |
 | [docs/m2-contracts.md](docs/m2-contracts.md), [docs/m2-report.md](docs/m2-report.md) | M2: delta tiers, the stateless minutely updater, compaction, gc, diffcheck against the reference |
 | [docs/m3-contracts.md](docs/m3-contracts.md), [docs/m3-report.md](docs/m3-report.md) | M3: tier-2 language (areas, around, poly, is_in, meta filters, evaluators), service limits, image, updater on R2, Cloudflare deployment |
+| [docs/m4-contracts.md](docs/m4-contracts.md), [docs/m4-report.md](docs/m4-report.md) | M4: history dataset (`osmpq history init`/`build`, updater appends, compaction fold) and the attic language: `[date:]`, `retro`, `timeline`, `[diff:]`/`[adiff:]`, exact `(changed:)` |
 | [docs/m3-runbook.md](docs/m3-runbook.md) | From a built dataset on R2 to a public endpoint with minutely updates |
 
 ## Running it

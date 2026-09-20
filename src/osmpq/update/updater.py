@@ -449,6 +449,7 @@ def _run_once_impl(
         replication_source=source,
         deltas=new_deltas,
         history=new_history,
+        areas=man.areas,
     )
     # `opts.root`, not `root` (the local write target above, a staging dir
     # for `s3://`): this is the actual root string, and

@@ -582,6 +582,57 @@ def _relation_bbox_exact_filter(con, manifest: catalog.Manifest, cand_sql: str, 
     )
 
     node_hits = idset.fresh_table_name("relnodehits")
+    way_hits = idset.fresh_table_name("relwayhits")
+    if catalog.SNAPSHOT.get() is not None:
+        # docs/m4-contracts.md 3.1: under a snapshot the member lookups go
+        # through the history-aware row sources (state at t), never the
+        # current byid/spatial files.
+        n_nodes = con.execute(f"SELECT count(*) FROM {node_ids_tbl}").fetchone()[0]
+        if n_nodes:
+            node_sql, extra = byid_current_rows(
+                con, manifest, "node", [], {"id": "id", "lat_e7": "lat_e7", "lon_e7": "lon_e7"},
+                f"id IN (SELECT id FROM {node_ids_tbl})", "TRUE",
+            )
+            files_read += extra
+            con.execute(
+                f"CREATE TEMP TABLE {node_hits} AS SELECT id FROM ({node_sql}) nb "
+                f"WHERE nb.lat_e7 BETWEEN {se} AND {ne} AND nb.lon_e7 BETWEEN {we} AND {ee}"
+            )
+        else:
+            con.execute(f"CREATE TEMP TABLE {node_hits} (id BIGINT)")
+        n_ways = con.execute(f"SELECT count(*) FROM {way_ids_tbl}").fetchone()[0]
+        made_way_hits = False
+        if n_ways:
+            way_sql, extra = byid_current_rows(
+                con, manifest, "way", [], {"id": "id", "cell": "cell"},
+                f"id IN (SELECT id FROM {way_ids_tbl})", "TRUE",
+            )
+            files_read += extra
+            way_cells_tbl = idset.fresh_table_name("relwaycells")
+            con.execute(f"CREATE TEMP TABLE {way_cells_tbl} AS SELECT id, cell FROM ({way_sql}) wb WHERE cell IS NOT NULL")
+            needed_cells = [r[0] for r in con.execute(f"SELECT DISTINCT cell FROM {way_cells_tbl}").fetchall()]
+            if needed_cells:
+                way_rows_sql, extra = current_rows(
+                    con, manifest, "way", needed_cells, [], {"id": "id", "geometry": "geometry"},
+                    f"id IN (SELECT id FROM {way_cells_tbl})",
+                )
+                files_read += extra
+                con.execute(
+                    f"CREATE TEMP TABLE {way_hits} AS SELECT id FROM ({way_rows_sql}) ws "
+                    f"WHERE ST_Intersects(ws.geometry, ST_MakeEnvelope({w}, {s}, {e}, {n}))"
+                )
+                made_way_hits = True
+        if not made_way_hits:
+            con.execute(f"CREATE TEMP TABLE {way_hits} (id BIGINT)")
+        passing = idset.fresh_table_name("relpass")
+        con.execute(
+            f"CREATE TEMP TABLE {passing} AS "
+            f"SELECT DISTINCT c.id FROM {cand} c, UNNEST(c.members) AS t(m) "
+            f"WHERE (m.type = 'n' AND m.ref IN (SELECT id FROM {node_hits})) "
+            f"   OR (m.type = 'w' AND m.ref IN (SELECT id FROM {way_hits}))"
+        )
+        return f"SELECT * FROM {cand} WHERE id IN (SELECT id FROM {passing})", files_read
+
     lo, hi, n_nodes = con.execute(f"SELECT min(id), max(id), count(*) FROM {node_ids_tbl}").fetchone()
     node_files = [manifest.path(p["path"]) for p in catalog.byid_parts_for_range(manifest, "node", lo, hi)] if n_nodes else []
     if node_files:
@@ -595,7 +646,6 @@ def _relation_bbox_exact_filter(con, manifest: catalog.Manifest, cand_sql: str, 
     else:
         con.execute(f"CREATE TEMP TABLE {node_hits} (id BIGINT)")
 
-    way_hits = idset.fresh_table_name("relwayhits")
     lo_w, hi_w, n_ways = con.execute(f"SELECT min(id), max(id), count(*) FROM {way_ids_tbl}").fetchone()
     way_byid_files = [manifest.path(p["path"]) for p in catalog.byid_parts_for_range(manifest, "way", lo_w, hi_w)] if n_ways else []
     if way_byid_files:
@@ -689,17 +739,13 @@ def build_relation_spatial_select(
     }
     sql, extra_files = current_rows(con, manifest, "relation", cells, files, cols, where_sql)
     nfiles = len(files) + extra_files
-    if bbox is not None and snap is None:
+    if bbox is not None:
         # The coarse test above is the union-of-members AABB (contract
         # section 4); it can pass while no individual member actually
         # falls in the bbox (e.g. an L-shaped union of two far-apart member
         # ways). Re-check exactly, only resolving the members of whatever
-        # survived the coarse prune. Skipped under a snapshot (docs/m4-
-        # contracts.md section 3.1): the member-node/way lookups this uses
-        # are current-only, so re-checking exactly against them at an
-        # attic date could wrongly drop a relation whose members have
-        # since moved -- the coarse AABB test above is kept as the
-        # (slightly looser) selection instead.
+        # survived the coarse prune; under a snapshot the member lookups
+        # are history-aware (state at t) inside `_relation_bbox_exact_filter`.
         sql, extra_files = _relation_bbox_exact_filter(con, manifest, sql, bbox)
         nfiles += extra_files
     return sql, nfiles

@@ -13,7 +13,7 @@
 #   history   `osmpq history build minnesota-h1 --pbf data/minnesota.osm.pbf
 #             --osc osc-midwest` -- needs W1's history builder
 #             (src/osmpq/history/build.py); not runnable until that lands
-#   update    catch `minnesota-h1` up with `osmpq update --max-diffs 240`,
+#   update    catch `minnesota-h1` up with `osmpq update --max-diffs 60`,
 #             looped until its manifest's replication_sequence reaches the
 #             last fetched sequence, then `osmpq validate`
 #   curcheck  the same catch-up loop on a *plain* hardlink copy
@@ -86,13 +86,16 @@ stage_fetch() {
 }
 
 stage_history() {
-    # Section 4 of docs/m4-contracts.md; W1 owns src/osmpq/history/build.py.
-    # This is the exact invocation the rest of the pipeline assumes -- run
-    # it once that command exists.
-    timed history osmpq history build "$H1_ROOT" --pbf "$BASE_PBF" --osc "$OSC_DIR"
+    # docs/m4-contracts.md sections 2 and 5: start the history from the
+    # root's current tables (one Parquet file at a time, flat memory) and
+    # let the M2 updater append every later version with its minor
+    # versions and tombstones. `osmpq history build --pbf ... --osc ...`
+    # (section 4) recomputes the same states from the raw object stream
+    # and needs more memory than this sandbox has for a 55M-node extract.
+    timed history osmpq history init "$H1_ROOT" --threads 4 --memory-limit 6GB --tmpdir "$SCRATCH/m4-init-tmp"
 }
 
-# catch_up <root> <label> -- loops `osmpq update <root> --max-diffs 240`
+# catch_up <root> <label> -- loops `osmpq update <root> --max-diffs 60`
 # until its manifest's replication_sequence reaches the last fetched
 # sequence in $OSC_DIR, logging each batch and the total.
 catch_up() {
@@ -104,11 +107,11 @@ catch_up() {
         return 1
     fi
     cur=$(manifest_seq "$root")
-    log "$label: catching up $root from seq $cur to $target (--max-diffs 240 per batch)"
+    log "$label: catching up $root from seq $cur to $target (--max-diffs 60 per batch: fewer versions collapse inside a batch)"
     t0=$(date +%s)
     while [ "$cur" -lt "$target" ]; do
         timed "$label(seq=$cur)" osmpq update "$root" --source "$REPL_SOURCE" \
-            --max-diffs 240 --tmpdir "$OSC_DIR"
+            --max-diffs 60 --tmpdir "$OSC_DIR"
         cur=$(manifest_seq "$root")
     done
     t1=$(date +%s)
