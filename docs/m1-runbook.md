@@ -14,6 +14,45 @@ first run.
 | Disk | 1.5 TB NVMe | 2 TB NVMe |
 | Cores | 8 | 16-32 (PBF decoding and per-cell sorting parallelize; DuckDB stages too) |
 
+### Suggested cloud instance
+
+Not yet run at planet scale; this is an estimate, not a measurement. Primary
+pick: `i4i.8xlarge` in `us-west-2` (32 vCPU, 256 GiB RAM, 3.75 TB local NVMe,
+one volume). 256 GiB clears the "comfortable" RAM line with margin, so the
+~110 GB flat-nodes file plus OS page cache should mostly keep the way pass
+CPU-bound rather than disk-latency-bound; 32 cores sits at the top of the
+comfortable range for the parallelized PBF-decode/per-cell-sort and DuckDB
+stages; the single 3.75 TB NVMe volume covers the full transient disk budget
+(up to ~1.5 TB without the optional node_way index) on one filesystem, which
+`--link` requires for `/fast/raw` and `/fast/root`. On-demand price in
+`us-west-2` is $2.746/hr (AWS EC2 pricing via cloudprice.net, checked
+2026-09-19). For an assumed 12-24h job (download + raw pass + build pass +
+validate + R2 sync): ~$33-66 in instance-hours, plus ~$40-54 for the ~450-600
+GB upload to R2 over the internet at AWS's $0.09/GB data-transfer-out rate
+(same egress cost regardless of instance choice; pulling the planet PBF from
+`s3://osm-planet-us-west-2` costs nothing extra since it's a same-region
+S3-to-EC2 transfer). Instance-store data is ephemeral: a stop or reboot
+loses everything under `/fast` mid-build. Given the job is a few hours and
+cheaply restartable from the source PBF, that risk is accepted rather than
+engineered around — just don't stop/hibernate the instance while it's
+running. The NVMe volume comes pre-initialized (no TRIM step) but still
+needs `mkfs`+mount at first boot.
+
+Fallbacks: `i4i.4xlarge` (16 vCPU, 128 GiB RAM, 3.75 TB NVMe, $1.373/hr
+on-demand) meets "comfortable" RAM/disk exactly but sits at the bottom of
+the comfortable core range, and has less page-cache headroom if the OS and
+DuckDB working set eat into the 128 GB budget — roughly half the compute
+cost of the 8xlarge. `r7i.4xlarge` + a 2 TB `gp3` EBS volume (16 vCPU, 128
+GiB RAM, $1.0584/hr on-demand, gp3 at ~$0.08/GB-month) survives a
+stop/reboot, removing the ephemeral-storage risk, but gp3's baseline
+throughput (125 MB/s/volume unless extra IOPS/throughput is provisioned) is
+well below local NVMe and risks making the mmap-heavy way pass more
+disk-bound than the RAM-driven page-cache story above assumes; pick this
+only if restart-safety matters more than raw speed, and provision extra gp3
+throughput/IOPS (or use `io2`) if so. Spot pricing for `i4i.8xlarge` runs
+roughly half of on-demand but isn't worth the interruption risk for a
+one-time, non-checkpointed job.
+
 Disk budget for a planet run (rough): planet PBF 90 GB, flat-node file up to
 110 GB (sparse; allocated pages depend on id density), node spill ~250 GB,
 way spill ~250 GB (deleted after their pass), raw output ~450 GB, plus the
