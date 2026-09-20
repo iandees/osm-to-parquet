@@ -1,3 +1,12 @@
+"""osmpq's exception hierarchy, shared by the parser, the engine and
+``osmpq.server``. Each subclass maps to a specific HTTP behavior there:
+``ParseError`` and ``UnsupportedError`` become an HTTP 400 response with
+the Overpass-shaped HTML error page, while ``RuntimeQueryError`` (and a
+timeout or cancellation) becomes an Overpass ``remark`` with HTTP 200 --
+see docs/api.md for the exact response shapes.
+"""
+
+
 class OsmpqError(Exception):
     """Base class."""
 
