@@ -318,7 +318,15 @@ async def _handle_interpreter(request: Request, data: Optional[str]) -> Response
     )
     resp = Response(content=body_text, media_type=content_type, status_code=status_code)
     resp.headers["X-OSMPQ-Manifest"] = str(_manifest_number(engine))
-    resp.headers["Cache-Control"] = "public, max-age=60"
+    # A `remark` (timeout, `kill_my_queries` cancellation, or any other
+    # runtime error -- see `Engine.run_program`'s `duckdb.InterruptException`/
+    # `RuntimeQueryError` handling) means `elements` isn't the real,
+    # complete result, so it must never be cached -- a 200 status alone
+    # (Overpass's own convention for these) isn't a safe cacheability
+    # signal, and the Worker's cache layer (`handleInterpreter` in
+    # `deploy/cloudflare/src/index.ts`) relies on this header rather than
+    # re-deriving the same judgment from the response body.
+    resp.headers["Cache-Control"] = "no-store" if result.remark else "public, max-age=60"
     return resp
 
 

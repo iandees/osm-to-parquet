@@ -108,11 +108,18 @@ async function handleInterpreter(
   const container = await getRandom(env.ENGINE, instances);
   const response = await container.containerFetch(request, 8080);
 
-  if (response.ok) {
-    // `cache.put` reads `Cache-Control` off the response itself; the
-    // container already sets `public, max-age=60` (contract section 6.1
-    // of `docs/m3-contracts.md`), so nothing further to set here. Cache
-    // a clone; the original body still needs to go back to the client.
+  // A timeout/cancellation/runtime error still comes back as `200 OK`
+  // with a `remark` field (Overpass's own convention), so `response.ok`
+  // alone can't tell a real result from a failed one -- the container
+  // sets `Cache-Control: no-store` on those (`src/osmpq/server.py`)
+  // instead of the usual `public, max-age=60`. Check for that explicitly
+  // rather than relying on `cache.put` to no-op gracefully on a
+  // `no-store` response -- its documented behavior there isn't precise
+  // enough to trust for "never caches a timed-out query result".
+  const cacheControl = response.headers.get("Cache-Control") ?? "";
+  if (response.ok && !cacheControl.includes("no-store")) {
+    // Cache a clone; the original body still needs to go back to the
+    // client.
     await cache.put(cacheKey, response.clone());
   }
   return withAttribution(response);
