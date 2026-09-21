@@ -102,6 +102,16 @@ class Manifest:
         # run: each thread/run sees only its own value.
         self._rowgroup_cache: dict[str, Optional["RowGroupIndex"]] = {}
         self._rowgroup_lock = threading.Lock()
+        # - `_delta_layer_cache`: same idea as `_rowgroup_cache`, for a
+        #   materialized delta-tier file (`sources._load_or_cache`) --
+        #   keyed by absolute path, values are `pyarrow.Table`s. Scoped to
+        #   this Manifest instance (not a DuckDB connection) so it's
+        #   reused across every `Engine.run()` call until the next
+        #   manifest refresh swaps in a fresh Manifest with an empty
+        #   cache -- a whole-region hourly delta tier is too big to want
+        #   to re-fetch from object storage on every request.
+        self._delta_layer_cache: dict[str, object] = {}
+        self._delta_layer_lock = threading.Lock()
         self._db = None
 
     @property

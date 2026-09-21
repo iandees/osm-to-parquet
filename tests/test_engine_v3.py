@@ -414,14 +414,19 @@ def test_stats_delta_rows_and_shadowed_present(engine_v3, fixture_v3):
 # `byid_current_rows` used to reissue `read_parquet(tier_file)` (plus a
 # fresh `QUALIFY row_number()` re-rank) on *every* cell-scoped/by-id call
 # within one query, even though a tier's whole file is small enough to load
-# once and reuse. `sources._load_or_cache` is the cache that fixes that
-# (keyed on the DuckDB connection, so it is scoped to one `Engine.run()`);
-# `sources.DELTA_WHOLE_LOAD_MAX_BYTES`/`_tier_too_large` is the planet-scale
-# guard that keeps an oversized tier from being loaded whole at all.
+# once and reuse. `sources._load_or_cache` is the cache that fixes that.
+# It's scoped to the `Manifest` instance (not the DuckDB connection), so a
+# whole-region delta tier is fetched from object storage at most once per
+# manifest refresh and reused across every `Engine.run()` call -- not
+# just within one -- via `con.register()` of the cached `pyarrow.Table`,
+# which is cheap even across different connections since it never re-reads
+# the Parquet file. `sources.DELTA_WHOLE_LOAD_MAX_BYTES`/`_tier_too_large`
+# is the planet-scale guard that keeps an oversized tier from being loaded
+# whole at all.
 # --------------------------------------------------------------------------
 
 
-def test_load_or_cache_reuses_temp_table_across_calls_same_connection(fixture_v3):
+def test_load_or_cache_reuses_across_calls_and_connections_same_manifest(fixture_v3):
     import duckdb
 
     manifest = catalog.load_manifest(fixture_v3.root)
@@ -430,21 +435,29 @@ def test_load_or_cache_reuses_temp_table_across_calls_same_connection(fixture_v3
 
     con = duckdb.connect()
     try:
-        src1, nfiles1 = sources._load_or_cache(con, path, too_large=False)
-        src2, nfiles2 = sources._load_or_cache(con, path, too_large=False)
+        src1, nfiles1 = sources._load_or_cache(con, manifest, path, too_large=False)
+        src2, nfiles2 = sources._load_or_cache(con, manifest, path, too_large=False)
         assert nfiles1 == 1  # first call: one real Parquet read (the load)
         assert nfiles2 == 0  # second call on the same connection: reused, no read
-        assert src1 == src2  # same cached TEMP TABLE name
         assert con.execute(f"SELECT count(*) FROM {src1}").fetchone()[0] > 0
+        assert con.execute(f"SELECT count(*) FROM {src2}").fetchone()[0] > 0
 
-        # A different connection gets its own cache -- no cross-connection
-        # leakage, and no reuse across what would be two different runs.
+        # A *different* connection on the same manifest also reuses the
+        # already-fetched data (no second Parquet read) -- the whole point
+        # of scoping the cache to the manifest rather than the connection.
         con2 = duckdb.connect()
         try:
-            src3, nfiles3 = sources._load_or_cache(con2, path, too_large=False)
-            assert nfiles3 == 1
+            src3, nfiles3 = sources._load_or_cache(con2, manifest, path, too_large=False)
+            assert nfiles3 == 0
+            assert con2.execute(f"SELECT count(*) FROM {src3}").fetchone()[0] > 0
         finally:
             con2.close()
+
+        # A *different* manifest instance (e.g. after a manifest refresh)
+        # gets its own empty cache -- no stale cross-manifest reuse.
+        manifest2 = catalog.load_manifest(fixture_v3.root)
+        src4, nfiles4 = sources._load_or_cache(con, manifest2, path, too_large=False)
+        assert nfiles4 == 1
     finally:
         con.close()
 
@@ -470,8 +483,8 @@ def test_load_or_cache_too_large_falls_back_to_uncached_read_parquet(fixture_v3)
 
     con = duckdb.connect()
     try:
-        src1, nfiles1 = sources._load_or_cache(con, path, too_large=True)
-        src2, nfiles2 = sources._load_or_cache(con, path, too_large=True)
+        src1, nfiles1 = sources._load_or_cache(con, manifest, path, too_large=True)
+        src2, nfiles2 = sources._load_or_cache(con, manifest, path, too_large=True)
         # Every call re-reads the raw file -- the old, pre-cache behavior
         # -- instead of ever materializing it into a TEMP TABLE.
         assert nfiles1 == 1 and nfiles2 == 1

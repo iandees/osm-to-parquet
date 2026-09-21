@@ -5,7 +5,7 @@ contract section 8: spatial bbox scan, byid id lookup, and set-sourced
 """
 from __future__ import annotations
 
-import weakref
+import threading
 from typing import Optional
 
 from osmpq.ql.ast import TagFilter
@@ -51,37 +51,33 @@ def _quote_str_list(values: list[str]) -> str:
 # functions degrades to exactly the pre-M2 SQL with zero extra files read
 # and zero extra queries executed -- the "no extra scans" requirement.
 #
-# Per-run whole-tier cache (performance follow-up to the section above): a
-# query like the water bbox hydrates node/way/relation members through
-# several separate cell-scoped hops (member nodes, member ways, the
-# relation's own bbox-exact-filter pass, ...), and *every one* of those
-# used to call `spatial_delta_layer`/`byid_current_rows` again, each
-# reissuing `read_parquet(tier_file) WHERE cell IN (...)` (or `WHERE
-# id_pred`) plus a fresh `QUALIFY row_number()` re-rank against the file
-# straight off disk/network -- 5-6+ redundant rereads of the same
-# few-hundred-row tier files for one query, each paying its own round trip
-# when the root is remote. Since a tier is small by design (contract
-# sections 3/5: "they are small"), a tier's spatial/byid/tombstones file is
-# instead loaded *whole*, unfiltered and unranked, into a TEMP TABLE once
-# per DuckDB connection (`_load_or_cache` below) and reused by every later
-# call on that connection: cell/id filtering and the rank-and-dedupe
-# `QUALIFY` still happen in SQL, exactly as before, just against that
-# already-resident TEMP TABLE instead of a fresh Parquet scan -- so this is
-# a pure caching change, not a semantics change (same filter, same rank,
-# same result), and it also means two different tables that read the same
-# tombstones.parquet (every type does, contract section 3) now share one
-# cached copy instead of re-reading it once per type.
-#
-# The cache is keyed on the DuckDB connection object itself, via a
-# `WeakKeyDictionary`: `Engine.run_program` opens a fresh cursor per run
-# (executor.py's module docstring), so this is automatically scoped to one
-# run and self-cleans when that cursor is closed/GC'd -- no ContextVar
-# plumbing needed, and a direct (non-Engine) caller/test that passes its
-# own `duckdb.connect()` still gets first-call-loads-it, later-calls-reuse
-# semantics, scoped to that connection's own lifetime.
+# Whole-tier cache (performance follow-up to the section above): a query
+# like the water bbox hydrates node/way/relation members through several
+# separate cell-scoped hops (member nodes, member ways, the relation's own
+# bbox-exact-filter pass, ...), and *every one* of those used to call
+# `spatial_delta_layer`/`byid_current_rows` again, each reissuing
+# `read_parquet(tier_file) WHERE cell IN (...)` (or `WHERE id_pred`) plus a
+# fresh `QUALIFY row_number()` re-rank against the file straight off
+# disk/network. A tier is "small" at the Minnesota scale the contract's
+# "they are small" framing was written against, but a whole-region tier
+# (a single busy hour's worth of edits across the whole US, say) is not --
+# hundreds of thousands of rows, expensive to refetch from object storage
+# even once per request, let alone 5-6+ times per query. So a tier's
+# spatial/byid/tombstones file is instead fetched *whole*, unfiltered and
+# unranked, as a `pyarrow.Table` at most once per `Manifest` instance
+# (`_load_or_cache` below, cached on `Manifest._delta_layer_cache` --
+# keyed by path, dies with the Manifest at the next manifest refresh, so a
+# stale tier is never served past that) and `con.register()`ed into
+# whichever connection asks for it: cell/id filtering and the
+# rank-and-dedupe `QUALIFY` still happen in SQL, exactly as before, just
+# against that already-resident table instead of a fresh Parquet scan --
+# so this is a pure caching change, not a semantics change (same filter,
+# same rank, same result). It also means two different tables that read
+# the same tombstones.parquet (every type does, contract section 3) share
+# one cached copy instead of re-reading it once per type, and -- unlike a
+# cache scoped to one DuckDB connection -- every request against the same
+# manifest reuses it, not just repeated calls within one `Engine.run()`.
 # --------------------------------------------------------------------------
-
-_RUN_DELTA_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 
 # Planet-scale guard (docs/m2-contracts.md section 4 follow-up): the whole
 # point of the cache above is that a replication tier is small enough to
@@ -101,12 +97,20 @@ DELTA_WHOLE_LOAD_MAX_BYTES = 256 * 1024 * 1024
 DELTA_WHOLE_LOAD_EST_BYTES_PER_ROW = 150
 
 
-def _run_cache(con) -> dict:
-    cache = _RUN_DELTA_CACHE.get(con)
+def _manifest_delta_cache(manifest: catalog.Manifest) -> dict:
+    cache = getattr(manifest, "_delta_layer_cache", None)
     if cache is None:
         cache = {}
-        _RUN_DELTA_CACHE[con] = cache
+        manifest._delta_layer_cache = cache
     return cache
+
+
+def _manifest_delta_lock(manifest: catalog.Manifest) -> threading.Lock:
+    lock = getattr(manifest, "_delta_layer_lock", None)
+    if lock is None:
+        lock = threading.Lock()
+        manifest._delta_layer_lock = lock
+    return lock
 
 
 def _tier_too_large(tier: dict, *tables: str) -> bool:
@@ -125,26 +129,38 @@ def _tier_too_large(tier: dict, *tables: str) -> bool:
     return total * DELTA_WHOLE_LOAD_EST_BYTES_PER_ROW > DELTA_WHOLE_LOAD_MAX_BYTES
 
 
-def _load_or_cache(con, path: str, too_large: bool) -> tuple[str, int]:
+def _load_or_cache(con, manifest: catalog.Manifest, path: str, too_large: bool) -> tuple[str, int]:
     """Return (FROM-able SQL source for the whole contents of `path`,
     files_read_this_call). When `too_large` (the planet-scale guard
     tripped), returns a raw, uncached ``read_parquet('path')`` -- one
     Parquet read every call, exactly the pre-cache behavior -- so an
     oversized tier is still read correctly, just never materialized whole.
-    Otherwise returns the name of a per-connection-cached TEMP TABLE
-    holding `SELECT * FROM read_parquet('path')`: 1 file read the first
-    time (the load), 0 on every later call for the same `path` on this
-    connection (`_RUN_DELTA_CACHE`, keyed on `con`)."""
+    Otherwise fetches `path` into memory as a `pyarrow.Table` at most once
+    per `manifest` (`Manifest._delta_layer_cache`, keyed by path -- reused
+    across every `Engine.run()` call, not just within one, since a
+    whole-region delta tier is too expensive to refetch from object
+    storage on every request; the cache dies with the Manifest instance
+    at the next manifest refresh, so a stale tier is never served past
+    that), then `con.register()`s it under a fresh name for *this*
+    connection -- cheap and zero-copy even on a cache hit, since
+    `register` just binds an already-in-memory Arrow table, unlike the
+    Parquet read a `CREATE TEMP TABLE ... FROM read_parquet(...)` would
+    redo per connection."""
     if too_large:
         return f"read_parquet('{_q1(path)}')", 1
-    cache = _run_cache(con)
-    name = cache.get(path)
-    if name is not None:
-        return name, 0
+    cache = _manifest_delta_cache(manifest)
+    table = cache.get(path)
+    files_read = 0
+    if table is None:
+        with _manifest_delta_lock(manifest):
+            table = cache.get(path)
+            if table is None:
+                table = con.execute(f"SELECT * FROM read_parquet('{_q1(path)}')").to_arrow_table()
+                cache[path] = table
+                files_read = 1
     name = idset.fresh_table_name("dfull")
-    con.execute(f"CREATE TEMP TABLE {name} AS SELECT * FROM read_parquet('{_q1(path)}')")
-    cache[path] = name
-    return name, 1
+    con.register(name, table)
+    return name, files_read
 
 
 def spatial_delta_layer(con, manifest: catalog.Manifest, table: str, cells: list[str]) -> Optional[dict]:
@@ -181,7 +197,7 @@ def spatial_delta_layer(con, manifest: catalog.Manifest, table: str, cells: list
     for tier in tiers:
         sp = tier["files"].get(table, {}).get("spatial")
         if sp:
-            src, nfiles = _load_or_cache(con, sp, _tier_too_large(tier, table))
+            src, nfiles = _load_or_cache(con, manifest, sp, _tier_too_large(tier, table))
             files += nfiles
             cand_parts.append(
                 f"SELECT *, {tier['rank']} AS __rank FROM {src} "
@@ -195,7 +211,7 @@ def spatial_delta_layer(con, manifest: catalog.Manifest, table: str, cells: list
             # every table's `spatial_delta_layer` call for this tier (same
             # `tp` path -> same cache key) instead of being reloaded once
             # per table.
-            src_t, nfiles_t = _load_or_cache(con, tp, _tier_too_large(tier, "node", "way", "relation"))
+            src_t, nfiles_t = _load_or_cache(con, manifest, tp, _tier_too_large(tier, "node", "way", "relation"))
             files += nfiles_t
             tomb_parts.append(
                 f"SELECT id FROM {src_t} "
@@ -359,7 +375,7 @@ def byid_current_rows(
         bp = tier["files"].get(element_type, {}).get("byid")
         if not bp:
             continue
-        src, nfiles = _load_or_cache(con, bp, _tier_too_large(tier, element_type))
+        src, nfiles = _load_or_cache(con, manifest, bp, _tier_too_large(tier, element_type))
         files += nfiles
         cand_parts.append(f"SELECT *, {tier['rank']} AS __rank FROM {src} WHERE {id_pred_sql}")
     if not cand_parts:
@@ -1351,7 +1367,7 @@ def delta_way_ids_by_ref(con, manifest: catalog.Manifest, node_ids_source_sql: s
         bp = tier["files"].get("way", {}).get("byid")
         if not bp:
             continue
-        src, _nfiles = _load_or_cache(con, bp, _tier_too_large(tier, "way"))
+        src, _nfiles = _load_or_cache(con, manifest, bp, _tier_too_large(tier, "way"))
         parts.append(f"SELECT *, {tier['rank']} AS __rank FROM {src}")
     if not parts:
         return None
@@ -1385,7 +1401,7 @@ def delta_relation_ids_by_member(
         bp = tier["files"].get("relation", {}).get("byid")
         if not bp:
             continue
-        src, _nfiles = _load_or_cache(con, bp, _tier_too_large(tier, "relation"))
+        src, _nfiles = _load_or_cache(con, manifest, bp, _tier_too_large(tier, "relation"))
         parts.append(f"SELECT *, {tier['rank']} AS __rank FROM {src}")
     if not parts:
         return None
