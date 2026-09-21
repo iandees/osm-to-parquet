@@ -5,6 +5,12 @@
   "compatibility_date": "2026-09-01",
   "compatibility_flags": ["nodejs_compat"],
 
+  // `mapki.com` is already an active zone on this account; wrangler
+  // provisions the DNS record + SSL for this hostname on deploy.
+  "routes": [
+    { "pattern": "osmpq.mapki.com", "custom_domain": true }
+  ],
+
   // Non-secret config. `OSMPQ_S3_KEY_ID`, `OSMPQ_S3_SECRET`,
   // `OSMPQ_S3_ENDPOINT` and `ADMIN_TOKEN` are secrets (see README) and are
   // never set here.
@@ -12,9 +18,9 @@
     // Root of the dataset the engine and updater read/write, as an
     // `s3://` URL (R2 bucket + prefix) once a real dataset is synced; see
     // `docs/m3-runbook.md`.
-    "OSMPQ_ROOT": "s3://CHANGE_ME/current",
+    "OSMPQ_ROOT": "s3://osm-parquet/us",
     // Shown verbatim in `/api/status`; set to the public URL clients use.
-    "OSMPQ_ANNOUNCED_ENDPOINT": "https://osmpq.example.org/api/interpreter",
+    "OSMPQ_ANNOUNCED_ENDPOINT": "https://osmpq.mapki.com/api/interpreter",
     // Minutely-replication source the updater polls (osmium/osmosis
     // state-file style base URL), e.g. the OSM planet replication server
     // or a regional mirror.
