@@ -247,7 +247,7 @@ def raw_build(opts: RawBuildOptions) -> dict:
         # .filled(nan) (not a bare cast, which would silently substitute 0
         # for NULL) plus the mask is how we detect "no resolvable geometry".
         if isinstance(col, np.ma.MaskedArray):
-            return col.filled(np.nan).astype("float64"), np.ma.getmaskarray(col)
+            return col.astype("float64").filled(np.nan), np.ma.getmaskarray(col)
         arr = np.asarray(col, dtype="float64")
         return arr, np.zeros(len(arr), dtype=bool)
 

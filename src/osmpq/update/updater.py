@@ -827,7 +827,7 @@ def _filled_i64(col) -> tuple[np.ndarray, np.ndarray]:
     numpy array from ``fetchnumpy()`` -- see ``osmpq.build.raw`` for the
     original of this helper."""
     if isinstance(col, np.ma.MaskedArray):
-        return col.filled(np.nan).astype("float64"), np.ma.getmaskarray(col)
+        return col.astype("float64").filled(np.nan), np.ma.getmaskarray(col)
     arr = np.asarray(col, dtype="float64")
     return arr, np.zeros(len(arr), dtype=bool)
 
