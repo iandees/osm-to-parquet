@@ -11,6 +11,12 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# pyosmium's compiled extensions link against the system libexpat at
+# runtime (unlike its bundled libbz2/liblz4) and python:3.12-slim's
+# Debian base doesn't include it.
+RUN apt-get update && apt-get install -y --no-install-recommends libexpat1 \
+    && rm -rf /var/lib/apt/lists/*
+
 # Python dependencies come from `uv.lock` (uv is the project's package
 # manager); only `pyproject.toml`, `uv.lock` and `src` are needed -- see
 # .dockerignore for everything else (data/, the Rust target dir, the
