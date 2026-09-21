@@ -72,12 +72,23 @@ root directly (`OSMPQ_ROOT`, or `osmpq update s3://... --source ...`).
 
 ```
 cd deploy/cloudflare
+nvm use 22            # or any current Node; the deploy tooling needs npm's
+                       # arborist to not be a very old release (see below)
 npm install
 npm run cf-typegen   # generates worker-configuration.d.ts; needs the
                       # repo-root Dockerfile to already exist (W4)
 npm run typecheck
 npm test
 ```
+
+`npm install` needs `deploy/cloudflare/.npmrc`'s `legacy-peer-deps=true`
+(already committed) to avoid a real npm/Arborist crash
+(`Cannot read properties of null (reading 'edgesOut')` in
+`#loadPeerSet`) hit while resolving `vitest`'s large optional-peer graph
+on this project's dependency set -- without it, `npm install` fails
+outright and nothing gets installed, which then surfaces downstream as a
+confusing `Could not resolve "@cloudflare/containers"` bundling error
+from `wrangler deploy`/`typecheck` rather than the real npm failure.
 
 Edit `wrangler.jsonc`'s `vars`:
 
