@@ -85,14 +85,33 @@ Code:
   populated correctly and reached its exact target size across several
   attempts, once the machine had enough free RAM (the same Mac had ~30 GB
   already committed to other running applications at one point, which is
-  a real-world constraint, not a flaw in the fix). **Separately found,
-  not yet fixed**: per-cell node spill (same spill-then-sort mechanism as
-  the way-cell fix above) reached 78+ GB and was still growing at 84% of
-  the node pass on this input -- true peak is likely 90-100+ GB on top of
-  the 25.6 GB store, i.e. whole-US's node pass alone needs on the order of
-  130-150 GB peak disk, which didn't fit this laptop's available disk.
-  The whole-US build was not completed locally; `docs/m1-runbook.md`'s
-  "Suggested cloud instance" (3.75 TB NVMe) has no such constraint.
+  a real-world constraint, not a flaw in the fix). Locally, per-cell node
+  spill (same spill-then-sort mechanism as the way-cell fix above) reached
+  78+ GB and was still growing at 84% of the node pass, and didn't fit this
+  laptop's available disk. That was resolved by completing the build on a
+  rented instance instead (`i4i.2xlarge`, 8 vCPU / 61 GiB / 1.7 TB NVMe,
+  `us-west-2`, $0.686/hr): the real observed peak during the node pass was
+  ~92 GB, below the ~130-150 GB extrapolated locally, and per-cell spill
+  cleanup worked as designed once given room -- the laptop run's spill
+  growth wasn't a leak, just a large transient that hadn't finished
+  clearing when the disk ran out. **The whole-US raw + build pass now
+  completes and validates cleanly end to end**: `osmpq-raw build` in
+  3580 s (1.596B nodes, 161.7M ways, 1.607M relations, 4176 leaves), then
+  `osmpq build --raw` in 942.6 s (relations + 186,440 relation areas +
+  2.77M way areas indexed), `osmpq validate` passing every check, 59 GB
+  root output. Two more real bugs turned up only at this scale and are
+  now fixed: Ubuntu's default 1024 open-file soft limit crashes
+  `osmpq-raw`'s spill mechanism (4176 leaf cells each open a spill file)
+  with `TooManyOpenFiles` -- raise it (`ulimit -n 1048576`, comfortably
+  under Ubuntu's 1M hard limit) before running on Linux; and relation/way
+  bbox-centroid SQL in the Python build path
+  (`src/osmpq/build/builder.py`, `src/osmpq/build/raw.py`) summed two
+  `INT32` `*_e7` columns before dividing, which overflows for any bbox
+  spanning far enough into negative (western) longitudes -- true for much
+  of the western US and Alaska, never triggered by Minnesota or
+  us-midwest's narrower extents. Fixed by widening to `BIGINT` before the
+  add, matching how the Rust producer already did this for ways
+  (`rust/osmpq-raw/src/ways.rs`).
 - **Language**: `compare`, `for`, `complete`, `make`/`convert`, `local`,
   `popup`/`custom` outputs, `way_cnt`/`way_link`; `retro` with evaluator
   arguments beyond the M3 subset.

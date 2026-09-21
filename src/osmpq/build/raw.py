@@ -219,9 +219,9 @@ def raw_build(opts: RawBuildOptions) -> dict:
                g.xmin_e7, g.ymin_e7, g.xmax_e7, g.ymax_e7, g.geometry,
                (coalesce(len(w.refs), 0) >= 4 AND w.refs[1] = w.refs[len(w.refs)]) AS is_closed,
                CASE WHEN g.xmin_e7 IS NULL THEN NULL
-                    ELSE CAST(round((g.ymin_e7 + g.ymax_e7) / 2.0) AS INTEGER) END AS centroid_lat_e7,
+                    ELSE CAST(round((g.ymin_e7::BIGINT + g.ymax_e7) / 2.0) AS INTEGER) END AS centroid_lat_e7,
                CASE WHEN g.xmin_e7 IS NULL THEN NULL
-                    ELSE CAST(round((g.xmin_e7 + g.xmax_e7) / 2.0) AS INTEGER) END AS centroid_lon_e7
+                    ELSE CAST(round((g.xmin_e7::BIGINT + g.xmax_e7) / 2.0) AS INTEGER) END AS centroid_lon_e7
         FROM way0 w JOIN way_geom g ON g.id = w.id
     """)
     con.execute("ALTER TABLE way1 ADD COLUMN is_area BOOLEAN")

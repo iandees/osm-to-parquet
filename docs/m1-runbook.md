@@ -84,6 +84,13 @@ python3 -m venv .venv && . .venv/bin/activate && pip install -e '.[dev]'
 rclone version   # https://rclone.org/install/
 ```
 
+On Linux, raise the open-file limit before running `osmpq-raw build`: its
+per-cell spill mechanism opens one file per leaf cell (thousands at
+country/planet scale), well past Ubuntu's default 1024 soft limit, which
+crashes the run with `TooManyOpenFiles`. `ulimit -n 1048576` in the same
+shell that launches the build (comfortably under Ubuntu's 1M hard limit)
+fixes it; check `ulimit -Hn` first if the hard limit is lower.
+
 ## 3. Get the planet
 
 The OSMF buckets are public and fast:

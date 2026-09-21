@@ -563,9 +563,9 @@ def _build_relations(
                r.version, r.changeset, r.timestamp, r.uid, r."user",
                b.xmin_e7, b.ymin_e7, b.xmax_e7, b.ymax_e7,
                CASE WHEN b.xmin_e7 IS NULL THEN NULL
-                    ELSE CAST(round((b.ymin_e7 + b.ymax_e7) / 2.0) AS INTEGER) END AS centroid_lat_e7,
+                    ELSE CAST(round((b.ymin_e7::BIGINT + b.ymax_e7) / 2.0) AS INTEGER) END AS centroid_lat_e7,
                CASE WHEN b.xmin_e7 IS NULL THEN NULL
-                    ELSE CAST(round((b.xmin_e7 + b.xmax_e7) / 2.0) AS INTEGER) END AS centroid_lon_e7
+                    ELSE CAST(round((b.xmin_e7::BIGINT + b.xmax_e7) / 2.0) AS INTEGER) END AS centroid_lon_e7
         FROM relation0 r JOIN relation_bbox1 b ON b.id = r.id
     """)
     con.execute("DROP TABLE relation_bbox1")
