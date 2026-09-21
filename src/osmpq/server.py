@@ -18,6 +18,10 @@ cached at import time) so tests can `monkeypatch.setenv` per-test:
 - `OSMPQ_MANIFEST_REFRESH_SECONDS` (60): passed through to `Engine` --
   see `osmpq.engine.executor.Engine.refresh_manifest_if_due`.
 - `OSMPQ_LOG_QUERIES` (0): include the query text in the request log.
+- `OSMPQ_DUCKDB_THREADS` (16): DuckDB's `SET threads`, read by `Engine`
+  itself (`osmpq.engine.executor.Engine._setup_database`) -- deliberately
+  decoupled from the container's actual vCPU count, since a wide bbox's
+  multi-file `s3://` scan is network-latency-bound, not CPU-bound.
 """
 from __future__ import annotations
 

@@ -414,7 +414,22 @@ class Engine:
         self._temp_dir = tempfile.mkdtemp(prefix="osmpq-duckdb-")
         self._db.execute(f"SET temp_directory='{self._temp_dir}'")
 
-        threads = self.duckdb_config.get("threads")
+        # DuckDB defaults `threads` to the CPU core count, which badly
+        # underparallelizes a multi-file `read_parquet(...)` scan over
+        # `s3://` -- fetching each file has real network latency that has
+        # nothing to do with CPU work, so a bbox wide enough to touch
+        # hundreds of leaf-cell files (routine at country/planet scale)
+        # serializes almost entirely on a small core count. Measured on a
+        # real whole-US query touching 226 files: 2 threads (this
+        # container's own vCPU count) took 90s, 8 threads 25s, 16 threads
+        # 17s -- diminishing returns past that. Default well above the
+        # container's vCPU count for exactly this reason; explicit
+        # `duckdb_config={"threads": ...}` (tests, CLI) still wins.
+        try:
+            _env_threads = int(os.environ.get("OSMPQ_DUCKDB_THREADS", "16"))
+        except (TypeError, ValueError):
+            _env_threads = 16
+        threads = self.duckdb_config.get("threads") or _env_threads
         if threads:
             self._db.execute(f"SET threads={int(threads)}")
         memory_limit = self.duckdb_config.get("memory_limit")

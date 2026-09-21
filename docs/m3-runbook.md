@@ -125,6 +125,45 @@ reports that `namespace_id: "1001"` (the placeholder committed in
 directs (or via the dashboard's Rate Limiting product) and put the real id
 in `wrangler.jsonc`, then redeploy.
 
+### Known gotchas
+
+- **`wrangler deploy` can silently skip rebuilding the image.** Observed
+  live: a source-only change under `src/` (the Dockerfile itself
+  untouched) sometimes produced `no changes osmpq-engine` and left the
+  previously-deployed digest running, with no error. After any deploy
+  meant to ship a code change, confirm the *application's* image digest
+  actually moved (`wrangler containers instances <app-id>`, or the
+  Containers API's `GET .../applications/<id>`) rather than trusting the
+  CLI's own diff output. If it didn't move, force a real rebuild and push
+  explicitly and point `wrangler.jsonc`'s `image` at that exact digest for
+  one deploy:
+  ```
+  docker build --no-cache --platform linux/amd64 -t osmpq-manual .
+  docker tag osmpq-manual registry.cloudflare.com/<account-id>/osmpq-engine:manual
+  docker tag osmpq-manual registry.cloudflare.com/<account-id>/osmpq-updater:manual
+  npx wrangler containers push registry.cloudflare.com/<account-id>/osmpq-engine:manual
+  npx wrangler containers push registry.cloudflare.com/<account-id>/osmpq-updater:manual
+  # then set both containers[].image in wrangler.jsonc to the printed
+  # @sha256:... digest, `wrangler deploy`, and switch back to
+  # "../../Dockerfile" once confirmed live.
+  ```
+- **A `wrangler deploy` alone doesn't restart already-running instances.**
+  Both the Worker-script-only case (secrets, `pingEndpoint`) and the
+  image-changed case leave an already-warm container instance running
+  whatever it started with; only a fresh instance start (natural
+  `sleepAfter` idle-out, or a cold request after one) picks up the
+  change. `wrangler containers instances <app-id>` shows each instance's
+  `started_at`/image -- if it predates your deploy, don't trust a test
+  against it. Repeatedly polling/testing resets the idle timer and can
+  make an instance look "stuck" on old code indefinitely; stop hitting it
+  entirely for a full `sleepAfter` window, then test once.
+- **SSH access** (`wrangler containers ssh <instance-id>`, or `-- <cmd>`
+  for one-off commands without an interactive shell) needs an
+  `authorized_keys` entry under the specific `containers[]` block in
+  `wrangler.jsonc` (not nested under `ssh`) -- `ssh-ed25519` only. Useful
+  for exactly this kind of "why is production slower than local"
+  debugging; add a key, `wrangler deploy`, then `wrangler containers ssh`.
+
 ## 5. Secrets
 
 ```

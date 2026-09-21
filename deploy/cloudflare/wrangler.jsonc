@@ -40,7 +40,14 @@
       // classes below.
       "image": "../../Dockerfile",
       "instance_type": "standard-3",
-      "max_instances": 2
+      "max_instances": 2,
+      // For `wrangler containers ssh <instance-id>` debugging (used to
+      // find the DuckDB thread-count issue in docs/progress.md). The
+      // matching private key is local to whoever generated it; rotate or
+      // remove this entry if that access is no longer wanted.
+      "authorized_keys": [
+        { "name": "osmpq-container-debug", "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINLZDVpLFXiQZuVgpsumW9JKwaOLawO2gmbFCYx2egtv osmpq-container-debug" }
+      ]
     },
     {
       "name": "osmpq-updater",
