@@ -25,6 +25,9 @@ export class UpdaterContainer extends Container<UpdaterEnv> {
   // only pays off if the instance survives between runs. Ten minutes
   // comfortably spans the one-run-per-minute schedule.
   sleepAfter = "10m";
+  // See the matching note in `engine.ts`: the base class's default
+  // startup readiness probe (`/ping`) doesn't exist on this app.
+  pingEndpoint = "healthz";
 
   // See the matching note in `engine.ts`: typed explicitly as a plain
   // string map so it structurally matches the base class's `envVars`.

@@ -23,6 +23,11 @@ export class EngineContainer extends Container<EngineEnv> {
   // Short by default (see the runbook for lengthening this once there is
   // steady traffic worth keeping an instance warm for).
   sleepAfter = "2m";
+  // The base class's own readiness probe during startup defaults to
+  // `/ping`, which this app doesn't have; point it at the real liveness
+  // route instead, or every start fails with "Container crashed while
+  // checking for ports" even though the app is up and healthy.
+  pingEndpoint = "healthz";
 
   // Typed as a plain string map (matching `Container['envVars']`) rather
   // than left to inference, since the object literal below has optional
