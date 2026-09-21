@@ -8,12 +8,15 @@ from __future__ import annotations
 import argparse
 import sys
 
-from osmpq.build.builder import BuildFromRawOptions, BuildOptions, build, build_from_raw
-from osmpq.build.raw import RawBuildOptions, raw_build
 from osmpq.layout import cells as cells_mod
 from osmpq.layout import manifest as manifest_mod
-from osmpq.update.updater import UpdateOptions
-from osmpq.update.updater import run as update_run
+
+# `osmpq.build.builder`/`osmpq.build.raw`/`osmpq.update.updater` pull in
+# numpy/shapely/duckdb-spatial/pyosmium -- real weight `osmpq serve`'s
+# hot cold-start path (docs/m3-contracts.md section 6.1) shouldn't pay
+# for, so their handlers import lazily (matching `_cmd_areas`/
+# `_cmd_history_build` below) instead of importing them here at module
+# scope.
 
 
 def _parse_bbox(s: str) -> tuple[float, float, float, float]:
@@ -25,6 +28,8 @@ def _parse_bbox(s: str) -> tuple[float, float, float, float]:
 
 
 def _cmd_raw_py(args: argparse.Namespace) -> int:
+    from osmpq.build.raw import RawBuildOptions, raw_build
+
     promoted_keys = None
     if args.promoted_keys:
         promoted_keys = [k.strip() for k in args.promoted_keys.split(",") if k.strip()]
@@ -52,6 +57,8 @@ def _copy_mode(args: argparse.Namespace) -> str:
 
 
 def _cmd_build(args: argparse.Namespace) -> int:
+    from osmpq.build.builder import BuildFromRawOptions, BuildOptions, build, build_from_raw
+
     if args.raw:
         opts = BuildFromRawOptions(
             rawdir=args.input,
@@ -155,6 +162,9 @@ def _cmd_manifest(args: argparse.Namespace) -> int:
 
 
 def _cmd_update(args: argparse.Namespace) -> int:
+    from osmpq.update.updater import UpdateOptions
+    from osmpq.update.updater import run as update_run
+
     opts = UpdateOptions(
         root=args.root,
         source=args.source,
