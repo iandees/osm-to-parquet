@@ -148,10 +148,17 @@ Create a bucket (say `osm-planet`) and an API token with object read/write.
 
 ```
 rclone config create r2 s3 provider=Cloudflare access_key_id=$R2_KEY secret_access_key=$R2_SECRET \
-    endpoint=https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com acl=private
+    endpoint=https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com
 rclone sync /fast/root r2:osm-planet/current --transfers 32 --checkers 64 --s3-chunk-size 64M --fast-list -P
 rclone check /fast/root r2:osm-planet/current --one-way --size-only
 ```
+
+Do not set `acl` on the remote (not even `acl=private`, which looks like a
+safe default): R2 does not implement S3 object ACLs at all, and rclone
+sends an `x-amz-acl` header on every `PutObject` when an acl is configured,
+which R2 rejects with `501 NotImplemented`. Access to R2 objects is
+controlled entirely by the bucket's own settings and the API token's
+permissions, not per-object ACLs.
 
 `manifest/LATEST` must be uploaded last if you sync incrementally into a
 bucket that is already being read; `rclone sync` orders by path, so upload
